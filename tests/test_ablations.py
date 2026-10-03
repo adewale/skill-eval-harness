@@ -5,24 +5,28 @@ test_roadmap_features, test_followup_features, test_external_review_gaps,
 test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
-import argparse
+import contextlib
+import functools
 import hashlib
+import io
 import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 
 from helpers import (
+    FakeJettyClient,
+    assert_dies,
     load_example_module,
     make_eval_repo,
+    run_cli,
 )
 
 import ablation_model as am
-import run_pi_trigger_eval as tr
 import run_trigger_matrix as tm
 import skill_benchmark as sb
+from manifest_contracts import CasePopulation
 
 ROOT = Path(__file__).resolve().parents[1]
 smoke = load_example_module("run_pi_smoke", "examples/adewale-workspace/run_pi_smoke.py")
@@ -64,6 +68,9 @@ Revert the fix mentally and re-run.
 
 Pick a verdict. See [the severity guide](references/severity.md).
 """
+SEVERITY_GUIDE = "# Severity\n\nBlocking, Minor, Clean.\n"
+# The one case a materialization test needs: ablation tests grade nothing.
+ANY_CASE = {"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}
 
 
 FAKE_PI = '''#!/usr/bin/env python3
@@ -93,6 +100,17 @@ def _is_subsequence(small: bytes, big: bytes) -> bool:
     return all(ch in it for ch in small)
 
 
+def pi_mount(manifest_path: Path, manifest: dict, workspace: Path, ablation: str | None):
+    """Mount the trigger tree the matrix builds (canonical, or the materialized
+    ablation) where the Pi adapter mounts it; return (copied paths, provenance)."""
+    tree, _, provenance = tm.trigger_tree_for_manifest(
+        sb.repo_root_for_manifest(manifest_path), manifest, workspace / "_trees", ablation)
+    # The Pi home sits beside the workspace, so mount one level down to keep it
+    # inside the caller's temporary directory.
+    (workspace / "ws").mkdir()
+    return tm.PiAdapter().mount(tree, workspace / "ws"), provenance
+
+
 def _tree_files(d: Path) -> dict[str, bytes]:
     return {p.relative_to(d).as_posix(): p.read_bytes() for p in sorted(d.rglob("*")) if p.is_file()}
 
@@ -102,23 +120,9 @@ CORPUS_DIR = ROOT / "tests" / "corpus"
 
 class SkillAblationTests(unittest.TestCase):
     def build(self, root: Path, *, skill_paths=None, ablations=None) -> Path:
-        repo = root / "repo"
-        skill_dir = repo / "skills" / "good-pr"
-        (skill_dir / "references").mkdir(parents=True, exist_ok=True)
-        (skill_dir / "SKILL.md").write_text(SKILL_FIXTURE, encoding="utf-8")
-        (skill_dir / "references" / "severity.md").write_text("# Severity\n\nBlocking, Minor, Clean.\n", encoding="utf-8")
-        (repo / "evals").mkdir(exist_ok=True)
-        manifest = {
-            "version": 1,
-            "skill_name": "good-pr",
-            "skill_paths": skill_paths or ["skills/good-pr/SKILL.md"],
-            "variants": ["with_skill", "without_skill"],
-            "cases": [{"id": "c1", "split": "tune", "prompt": "Review.", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}],
-            "ablations": ablations if ablations is not None else [],
-        }
-        path = repo / "evals" / "shared-benchmark.json"
-        path.write_text(json.dumps(manifest), encoding="utf-8")
-        return path
+        return make_eval_repo(root, skill_name="good-pr", skill_text=SKILL_FIXTURE, skill_paths=skill_paths,
+                              references={"references/severity.md": SEVERITY_GUIDE},
+                              cases=[ANY_CASE], ablations=ablations)
 
     def materialize_one(self, root: Path, ablation: dict, out_name="out") -> dict:
         path = self.build(root, ablations=[ablation])
@@ -161,14 +165,14 @@ class SkillAblationTests(unittest.TestCase):
             text = self.skill_text(res)
             self.assertNotIn("](references/severity.md)", text)
             self.assertIn("the severity guide", text)   # visible text kept; no new prose
-            self.assertTrue((Path(res["dir"]) / "skills_good-pr_SKILL.md" / "references" / "severity.md").exists())
+            self.assertTrue((Path(res["dir"]) / "good-pr" / "references" / "severity.md").exists())
 
     def test_reference_content_deletes_file_keeps_pointer(self):
         with tempfile.TemporaryDirectory() as td:
             res = self.materialize_one(Path(td), {"id": "no-sev-file", "removed_component": "severity ref", "mechanism": "reference", "target": {"path": "references/severity.md", "remove": "content"}})
             text = self.skill_text(res)
             self.assertIn("](references/severity.md)", text)
-            self.assertFalse((Path(res["dir"]) / "skills_good-pr_SKILL.md" / "references" / "severity.md").exists())
+            self.assertFalse((Path(res["dir"]) / "good-pr" / "references" / "severity.md").exists())
 
     def test_patch_deletion_only_ok_and_plus_rejected(self):
         with tempfile.TemporaryDirectory() as td:
@@ -186,7 +190,7 @@ class SkillAblationTests(unittest.TestCase):
             res = sb.materialize_ablation(sb.repo_root_for_manifest(path), manifest, ab, root / "out")
             self.assertNotIn("Revert the fix mentally", self.skill_text(res))
             # a '+'-bearing patch is a swap, not an ablation
-            with self.assertRaises(sb.AblationError):
+            with self.assertRaisesRegex(sb.AblationError, r"deletion-only; '\+' lines indicate a swap"):
                 sb.patch_delete_ops(SKILL_FIXTURE, f"@@ -{n},1 +{n},1 @@\n-Revert the fix mentally and re-run.\n+Optionally revert.\n")
 
     def _patch_ablation(self, root: Path, patch_text: str, *, cls=None):
@@ -279,13 +283,11 @@ class SkillAblationTests(unittest.TestCase):
         # field and allowed it; structural ownership attributes them to description.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            repo = root / "repo"; sd = repo / "skills" / "good-pr"; sd.mkdir(parents=True)
             skill = ("---\nname: good-pr\ndescription: >\n  first line of the description\n"
                      "  second line of the description\nallowed-tools: Read\n---\n\n# Body\n\nText.\n")
-            (sd / "SKILL.md").write_text(skill, encoding="utf-8")
-            (repo / "evals" / "ablations").mkdir(parents=True)
-            m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": []}
-            p = repo / "evals" / "shared-benchmark.json"; p.write_text(json.dumps(m), encoding="utf-8")
+            p = make_eval_repo(root, skill_name="good-pr", skill_text=skill, cases=[ANY_CASE])
+            repo = p.parents[1]
+            (repo / "evals" / "ablations").mkdir()
             lines = skill.split("\n")
             n = lines.index("  first line of the description") + 1
             (repo / "evals" / "ablations" / "p.patch").write_text(
@@ -333,11 +335,11 @@ class SkillAblationTests(unittest.TestCase):
             manifest = sb.validate_manifest(path)
             repo_root = sb.repo_root_for_manifest(path)
             skill_dir = repo_root / "skills" / "good-pr"
-            with self.assertRaises(sb.AblationError):                 # equal to a skill root
+            with self.assertRaisesRegex(sb.AblationError, "is a source skill root"):                 # equal to a skill root
                 sb.materialize_ablation(repo_root, manifest, ab, skill_dir)
-            with self.assertRaises(sb.AblationError):                 # inside a skill root
+            with self.assertRaisesRegex(sb.AblationError, "is inside source skill root"):                 # inside a skill root
                 sb.materialize_ablation(repo_root, manifest, ab, skill_dir / "out")
-            with self.assertRaises(sb.AblationError):                 # contains a skill root
+            with self.assertRaisesRegex(sb.AblationError, "contains source skill root"):                 # contains a skill root
                 sb.materialize_ablation(repo_root, manifest, ab, repo_root)
             # a sibling output dir is fine
             res = sb.materialize_ablation(repo_root, manifest, ab, root / "safe-out")
@@ -356,8 +358,8 @@ class SkillAblationTests(unittest.TestCase):
             skill_dir = repo_root / "skills" / "good-pr"
             before = {p.relative_to(skill_dir).as_posix() for p in skill_dir.rglob("*")}
             bad_out = skill_dir / "_ablations"                 # inside a source skill root
-            with self.assertRaises(SystemExit):
-                sb.materialize_declared_ablations(repo_root, manifest, bad_out)
+            assert_dies(self, lambda: sb.materialize_declared_ablations(repo_root, manifest, bad_out),
+                        "is inside source skill root")
             self.assertFalse(bad_out.exists())                 # never created
             self.assertEqual({p.relative_to(skill_dir).as_posix() for p in skill_dir.rglob("*")}, before)
 
@@ -374,8 +376,9 @@ class SkillAblationTests(unittest.TestCase):
             (bad_out / sb._ABLATION_MARKER).write_text("owned\n", encoding="utf-8")
             sentinel = bad_out / "keep.txt"
             sentinel.write_text("precious", encoding="utf-8")
-            with self.assertRaises(SystemExit):
-                sb.materialize_ablations(argparse.Namespace(manifest=str(path), out_dir=str(bad_out), out=None))
+            code, _, stderr = run_cli("materialize-ablations", path, "--out-dir", bad_out)
+            self.assertEqual(code, 1)
+            self.assertIn("is inside source skill root", stderr)
             self.assertTrue(sentinel.exists())                 # not cleared before reject
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "precious")
 
@@ -384,21 +387,16 @@ class SkillAblationTests(unittest.TestCase):
         # copying the ancestor would include an UNABLATED duplicate of the audit skill.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            repo = root / "repo"
-            (repo / "skills" / "audit").mkdir(parents=True)
-            (repo / "SKILL.md").write_text("---\nname: top\ndescription: Top. Use for top.\n---\n\n# Top\n\n## A\n\nbody\n", encoding="utf-8")
-            (repo / "skills" / "audit" / "SKILL.md").write_text("---\nname: audit\ndescription: Audit. Use for audits.\n---\n\n# Audit\n\n## A\n\nx\n", encoding="utf-8")
-            (repo / "evals").mkdir()
-            m = {"version": 1, "skill_name": "top", "skill_paths": ["SKILL.md", "skills/audit/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": []}
-            p = repo / "evals" / "shared-benchmark.json"
-            p.write_text(json.dumps(m), encoding="utf-8")
+            p = make_eval_repo(root, skill_name="top", skill_paths=["SKILL.md", "skills/audit/SKILL.md"],
+                               skill_text="---\nname: top\ndescription: Top. Use for top.\n---\n\n# Top\n\n## A\n\nbody\n",
+                               cases=[ANY_CASE])
             manifest = sb.validate_manifest(p)
             repo_root = sb.repo_root_for_manifest(p)
             ab = {"id": "x", "removed_component": "audit-a", "mechanism": "section", "class": "instructions", "target": {"skill_root": "skills/audit/SKILL.md", "heading": "## A"}}
             with self.assertRaises(sb.AblationError) as cm:
                 sb.materialize_ablation(repo_root, manifest, ab, root / "out")
             self.assertIn("ancestor", str(cm.exception))
-            with self.assertRaises(sb.AblationError):   # the canonical with_skill tree rejects too
+            with self.assertRaisesRegex(sb.AblationError, "is an ancestor of skill root"):   # the canonical with_skill tree rejects too
                 sb.build_canonical_skill_tree(repo_root, manifest, root / "wst")
 
     def test_multi_component_is_order_independent(self):
@@ -414,19 +412,14 @@ class SkillAblationTests(unittest.TestCase):
 
     def test_overlapping_components_refused(self):
         with tempfile.TemporaryDirectory() as td:
-            with self.assertRaises(sb.AblationError):
+            with self.assertRaisesRegex(sb.AblationError, "components overlap"):
                 self.materialize_one(Path(td), {"id": "overlap", "removed_component": "x", "components": [
                     {"mechanism": "section", "class": "instructions", "target": {"heading": "## Review checklist"}},
                     {"mechanism": "list_item", "class": "instructions", "target": {"section": "## Review checklist", "contains": ["Naming"]}},
                 ]})
 
-    def test_required_field_preservation_blocks_description_removal(self):
-        with tempfile.TemporaryDirectory() as td:
-            with self.assertRaises(sb.AblationError):
-                self.materialize_one(Path(td), {"id": "no-desc", "removed_component": "desc", "mechanism": "frontmatter_field", "class": "discovery", "target": {"field": "description"}})
-
     def test_layer_cohesion_refuses_discovery_plus_answer(self):
-        with self.assertRaises(sb.AblationError):
+        with self.assertRaisesRegex(sb.AblationError, "layer cohesion"):
             sb.derived_population([
                 {"mechanism": "frontmatter_field", "target": {"field": "when_to_use"}},
                 {"mechanism": "section", "target": {"heading": "## x"}},
@@ -445,28 +438,28 @@ class SkillAblationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             path = self.build(root, ablations=[{"id": "x", "removed_component": "y"}])
-            with self.assertRaises(sb.AblationError):
+            with self.assertRaisesRegex(sb.AblationError, "declares no removal"):
                 sb.materialize_ablation(sb.repo_root_for_manifest(path), sb.validate_manifest(path), {"id": "x", "removed_component": "y"}, root / "out")
 
-    def test_validate_rejects_bad_and_duplicate_ids(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(self.build(root, ablations=[{"id": "Bad_ID", "removed_component": "x"}]))
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(self.build(root, ablations=[{"id": "dup", "removed_component": "x"}, {"id": "dup", "removed_component": "y"}]))
-
-    def test_validate_rejects_path_traversal_and_missing_skill_root(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(self.build(root, ablations=[{"id": "esc", "removed_component": "x", "mechanism": "reference", "target": {"path": "../../etc/passwd", "remove": "content"}}]))
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(self.build(root, skill_paths=["SKILL.md", "skills/audit/SKILL.md"], ablations=[{"id": "noroot", "removed_component": "x", "mechanism": "section", "target": {"heading": "## X"}}]))
+    def test_validate_rejects_malformed_ablation_declarations(self):
+        rejected = {
+            # label: (ablations, skill_paths, the validator's message)
+            "an id that is not a slug": (
+                [{"id": "Bad_ID", "removed_component": "x"}], None, "id must be a slug"),
+            "a repeated id": (
+                [{"id": "dup", "removed_component": "x"}, {"id": "dup", "removed_component": "y"}], None,
+                "ablation id 'dup' is not unique"),
+            "a path that escapes the skill": (
+                [{"id": "esc", "removed_component": "x", "mechanism": "reference", "target": {"path": "../../etc/passwd", "remove": "content"}}],
+                None, "unsafe path (absolute or traversal)"),
+            "a component with no skill_root among several": (
+                [{"id": "noroot", "removed_component": "x", "mechanism": "section", "target": {"heading": "## X"}}],
+                ["SKILL.md", "skills/audit/SKILL.md"], "component target missing skill_root"),
+        }
+        for label, (ablations, skill_paths, message) in rejected.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as td:
+                path = self.build(Path(td), skill_paths=skill_paths, ablations=ablations)
+                assert_dies(self, functools.partial(sb.validate_manifest, path), message)
 
 
 class AblationRunnerIntegrationTests(unittest.TestCase):
@@ -475,24 +468,11 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
     SIM_ABL = {"id": "sim", "removed_component": "something"}
 
     def repo(self, root: Path, ablations: list) -> Path:
-        repo = root / "repo"
-        sd = repo / "skills" / "good-pr"
-        (sd / "references").mkdir(parents=True, exist_ok=True)
-        (sd / "SKILL.md").write_text(SKILL_FIXTURE, encoding="utf-8")
-        (sd / "references" / "severity.md").write_text("# Severity\n\nBlocking.\n", encoding="utf-8")
-        (repo / "evals").mkdir(exist_ok=True)
-        manifest = {
-            "version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"],
-            "variants": ["with_skill", "without_skill"],
-            "cases": [
-                {"id": "ans", "split": "tune", "kind": "behavior", "prompt": "Review.", "assertions": [{"name": "a", "type": "contains", "value": "x"}]},
-                {"id": "trig", "split": "tune", "kind": "trigger", "should_trigger": True, "prompt": "Trigger decision eval. User prompt: review my PR", "expected_behavior": ["should trigger"], "assertions": []},
-            ],
-            "ablations": ablations,
-        }
-        p = repo / "evals" / "shared-benchmark.json"
-        p.write_text(json.dumps(manifest), encoding="utf-8")
-        return p
+        return make_eval_repo(root, skill_name="good-pr", skill_text=SKILL_FIXTURE,
+                              references={"references/severity.md": SEVERITY_GUIDE}, ablations=ablations, cases=[
+            {"id": "ans", "split": "tune", "kind": "behavior", "prompt": "Review.", "assertions": [{"name": "a", "type": "contains", "value": "x"}]},
+            {"id": "trig", "split": "tune", "kind": "trigger", "should_trigger": True, "prompt": "Trigger decision eval. User prompt: review my PR", "expected_behavior": ["should trigger"], "assertions": []},
+        ])
 
     def test_pi_smoke_mounts_materialized_tree_not_original(self):
         with tempfile.TemporaryDirectory() as td:
@@ -518,34 +498,23 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
                 self.assertIn("simulate this ablation", instr)   # the directive from variant_instruction (the owner)
                 self.assertIn("Regression-proof requirement", Path(skill_args[skill_args.index("--skill") + 1]).read_text(encoding="utf-8"))
 
-    def test_pi_smoke_materialized_arm_is_blind_no_path_leak(self):
-        # The materialized arm must be indistinguishable from with_skill: same
-        # mount paths, same instruction, and NOTHING in the model-visible
-        # workspace, mount path, or prompt that names the ablation id.
+    def test_pi_smoke_arms_mount_neutral_roots_and_differ_only_by_the_edit(self):
+        # Blinding of every model-visible channel is owned by
+        # test_materialized_ablation_is_blind_across_every_runner. This pins the
+        # Pi smoke mount itself: both arms mount under neutral skills/root-N
+        # names, only the ablation arm's mounted bytes lack the removed section,
+        # and the harness still receives the materialized provenance.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            p = self.repo(root, [self.SECTION_ABL])   # id "no-rp"
+            p = self.repo(root, [self.SECTION_ABL])
             manifest = sb.validate_manifest(p)
             repo_root = sb.repo_root_for_manifest(p)
             with tempfile.TemporaryDirectory() as wd_w, tempfile.TemporaryDirectory() as wd_a:
-                instr_w, args_w, _, paths_w, _ = smoke.materialize_runtime_workspace(manifest, repo_root, manifest["cases"][0], "with_skill", Path(wd_w))
-                instr_a, args_a, _, paths_a, prov = smoke.materialize_runtime_workspace(manifest, repo_root, manifest["cases"][0], "ablation:no-rp", Path(wd_a))
-                # identical workspace-relative mount names
-                rel_w = [str(Path(x).relative_to(wd_w)) for x in paths_w]
-                rel_a = [str(Path(x).relative_to(wd_a)) for x in paths_a]
-                self.assertEqual(rel_w, rel_a)
-                self.assertTrue(all(r.startswith("skills/root-") for r in rel_a))
-                # ablated content actually reaches the runner
-                self.assertNotIn("Regression-proof requirement", Path(args_a[args_a.index("--skill") + 1]).read_text(encoding="utf-8"))
+                _, args_w, _, _, _ = smoke.materialize_runtime_workspace(manifest, repo_root, manifest["cases"][0], "with_skill", Path(wd_w))
+                _, args_a, _, paths_a, prov = smoke.materialize_runtime_workspace(manifest, repo_root, manifest["cases"][0], "ablation:no-rp", Path(wd_a))
+                self.assertTrue(all(str(Path(x).relative_to(wd_a)).startswith("skills/root-") for x in paths_a))
                 self.assertIn("Regression-proof requirement", Path(args_w[args_w.index("--skill") + 1]).read_text(encoding="utf-8"))
-                # the model-visible instruction is byte-identical (blinding)
-                self.assertEqual(instr_w, instr_a)
-                # no ablation id leaks into the prompt, mount path, or workspace tree
-                self.assertNotIn("no-rp", instr_a)
-                self.assertNotIn("no-rp", " ".join(rel_a))
-                tree = [str(q.relative_to(wd_a)) for q in Path(wd_a).rglob("*")]
-                self.assertFalse(any("no-rp" in entry for entry in tree), f"ablation id leaked into workspace: {tree}")
-                # provenance is still returned for the harness-only record
+                self.assertNotIn("Regression-proof requirement", Path(args_a[args_a.index("--skill") + 1]).read_text(encoding="utf-8"))
                 self.assertEqual(prov["mode"], "materialized")
 
     def test_pi_trigger_mounts_materialized_discovery_skill(self):
@@ -554,7 +523,7 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             p = self.repo(root, [self.DISCO_ABL])
             manifest = sb.validate_manifest(p)
             with tempfile.TemporaryDirectory() as cd:
-                copied, prov = tr.copy_skill_to_config(p, manifest, Path(cd), ablation_id="no-wtu")
+                copied, prov = pi_mount(p, manifest, Path(cd), "no-wtu")
                 self.assertIn("skill_hash", prov)               # provenance returned for the run record (#9)
                 self.assertIn("parent_skill_hash", prov)        # canonical hash for same-revision pairing
                 self.assertIn("components", prov)               # components recorded for the run record (#8)
@@ -584,16 +553,19 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             p = self.repo(root, [self.DISCO_ABL])
             manifest = sb.validate_manifest(p)
             with tempfile.TemporaryDirectory() as cb, tempfile.TemporaryDirectory() as ca:
-                base_copied, base_prov = tr.copy_skill_to_config(p, manifest, Path(cb))
-                abl_copied, abl_prov = tr.copy_skill_to_config(p, manifest, Path(ca), ablation_id="no-wtu")
+                base_copied, base_prov = pi_mount(p, manifest, Path(cb), None)
+                abl_copied, abl_prov = pi_mount(p, manifest, Path(ca), "no-wtu")
 
-                def rel_files(cfg):
-                    sd = Path(cfg) / "skills"
+                def skills_dir(workspace):
+                    return tm.PiAdapter._pi_home(Path(workspace) / "ws") / "skills"
+
+                def rel_files(workspace):
+                    sd = skills_dir(workspace)
                     return {q.relative_to(sd).as_posix() for q in sd.rglob("*") if q.is_file()}
 
                 # identical mount dir names and identical relative file trees
-                self.assertEqual({d.name for d in (Path(cb) / "skills").iterdir()},
-                                 {d.name for d in (Path(ca) / "skills").iterdir()})
+                self.assertEqual({d.name for d in skills_dir(cb).iterdir()},
+                                 {d.name for d in skills_dir(ca).iterdir()})
                 self.assertEqual(rel_files(cb), rel_files(ca))
                 # the references file survives in BOTH arms (the old ad-hoc copier path is gone)
                 self.assertTrue(any(f.endswith("references/severity.md") for f in rel_files(cb)))
@@ -661,16 +633,25 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             leaks["jetty_request"] = json.dumps(payload["jetty_request"])
             leaks["jetty_upload_names"] = json.dumps([{"p": f.get("placeholder"), "h": f.get("remote_path_hint")} for f in payload["upload_plan"]["files"]])
 
-            # The ablation id leaks into NONE of the model-visible channels.
+            # Neither the ablation id nor the word "ablation" leaks into ANY of the
+            # model-visible channels.
             for channel, blob in leaks.items():
                 self.assertNotIn(ID, blob, f"ablation id leaked via {channel}: {blob[:200]}")
+                self.assertNotIn("ablation", blob.lower(), f"ablation named via {channel}: {blob[:200]}")
             # And the harness still records the truth out of the model's sight.
             self.assertEqual(payload["harness"]["variant"], "ablation:no-rp")
 
     def test_every_runner_emits_the_same_minimum_provenance_schema(self):
         # Invariant: every provenance source records the same minimum schema, so the
         # report's verifier can rely on it uniformly regardless of which runner ran.
-        REQUIRED = am.Provenance.SCHEMA_KEYS
+        # The verifier's strict parser is the schema: a missing, null or mistyped
+        # field is rejected there.
+        def assert_records_provenance(record, source):
+            try:
+                am.Provenance.from_dict(record)
+            except ValueError as exc:
+                self.fail(f"{source} records incomplete provenance: {exc}")
+
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             p = self.repo(root, [self.SECTION_ABL])
@@ -679,29 +660,29 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
 
             # Source A: materialize_ablation (consumed by Pi smoke and Pi trigger).
             res = sb.materialize_ablation(repo_root, manifest, self.SECTION_ABL, root / "abl")
-            self.assertTrue(REQUIRED.issubset(res), f"materialize missing {REQUIRED - set(res)}")
+            assert_records_provenance(res, "materialize")
 
             # Source B: prepared rows (consumed by codex and Jetty). The ablation arm
             # carries the full schema; both skill-bearing arms carry skill_tree_hash.
             rows = sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "abl2")
             arow = next(r for r in rows if r["variant"] == "ablation:no-rp")
             wrow = next(r for r in rows if r["variant"] == "with_skill")
-            self.assertTrue(REQUIRED.issubset(arow["ablation"]), f"prepared row missing {REQUIRED - set(arow['ablation'])}")
+            assert_records_provenance(arow["ablation"], "prepared row")
             self.assertIn("skill_tree_hash", arow)
             self.assertIn("skill_tree_hash", wrow)
 
             # Jetty harness record carries the same ablation provenance + canonical hash.
             arm = sb.materialize(sb.ValidatedAblation.validate(repo_root, manifest, self.SECTION_ABL), root / "jabl")
             payload = sb.build_jetty_payload(sb.PreparedTask.from_row(arow), manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", ablation_trees={"no-rp": arm})
-            self.assertTrue(REQUIRED.issubset(payload["harness"]["ablation"]))
+            assert_records_provenance(payload["harness"]["ablation"], "jetty harness record")
             self.assertIn("skill_tree_hash", payload["harness"])
 
             # Source C: Pi trigger adapter (discovery ablation).
             pd = self.repo(root / "disc", [self.DISCO_ABL])
             dm = sb.validate_manifest(pd)
             with tempfile.TemporaryDirectory() as cd:
-                _, tprov = tr.copy_skill_to_config(pd, dm, Path(cd), ablation_id="no-wtu")
-            self.assertTrue(REQUIRED.issubset(tprov), f"pi-trigger missing {REQUIRED - set(tprov)}")
+                _, tprov = pi_mount(pd, dm, Path(cd), "no-wtu")
+            assert_records_provenance(tprov, "pi-trigger")
 
     def test_recorded_provenance_is_a_provenance_value_object(self):
         # The recorded provenance IS Provenance.as_dict(), not a coincidentally-shaped
@@ -716,7 +697,6 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             expected = am.Provenance.from_dict(res).as_dict()
             arow = next(r for r in sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "abl2") if r["variant"] == "ablation:no-rp")
             self.assertEqual(arow["ablation"], expected)                     # one schema, end to end
-            self.assertEqual(set(arow["ablation"]), am.Provenance.SCHEMA_KEYS)
 
     def test_prepare_skips_discovery_ablations_for_generic_runners(self):
         # Answer-population ablations are emitted for non-trigger cases; discovery
@@ -750,16 +730,17 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             root = Path(td)
             p = self.repo(root, [self.SECTION_ABL])   # answer-population (section/instructions)
             manifest = sb.validate_manifest(p)
-            with tempfile.TemporaryDirectory() as cd, self.assertRaises(RuntimeError) as cm:
-                tr.copy_skill_to_config(p, manifest, Path(cd), ablation_id="no-rp")
+            with tempfile.TemporaryDirectory() as cd, self.assertRaises(SystemExit) as cm:
+                pi_mount(p, manifest, Path(cd), "no-rp")
             self.assertIn("answer-population", str(cm.exception))
 
     def test_prepare_fails_without_ablation_dir_for_materialized(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             p = self.repo(root, [self.SECTION_ABL])
-            with self.assertRaises(SystemExit):  # must materialize, never label original skill materialized
-                sb.prepared_task_rows(p, sb.validate_manifest(p), include_ablations=True)
+            # must materialize, never label the original skill materialized
+            assert_dies(self, lambda: sb.prepared_task_rows(p, sb.validate_manifest(p), include_ablations=True),
+                        "materialized ablations require --ablation-dir")
 
     def test_prepare_ablation_dir_points_rows_at_altered_tree(self):
         with tempfile.TemporaryDirectory() as td:
@@ -790,24 +771,6 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             self.assertEqual(payload["harness"]["variant"], "ablation:no-rp")           # truth in harness-only record
             self.assertEqual(payload["harness"]["ablation"]["mode"], "materialized")
 
-    def test_jetty_blinds_ablation_id_from_model_visible_names(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            p = self.repo(root, [self.SECTION_ABL])
-            manifest = sb.validate_manifest(p)
-            row = next(r for r in sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "abl") if r["variant"] == "ablation:no-rp")
-            trees = {"no-rp": sb.materialize(sb.ValidatedAblation.validate(sb.repo_root_for_manifest(p), manifest, self.SECTION_ABL), root / "jabl")}
-            payload = sb.build_jetty_payload(sb.PreparedTask.from_row(row), manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", ablation_trees=trees)
-            # What the model actually sees: the jetty request (runbook + jetty block,
-            # incl. file_paths and template_variables) and each upload's remote path.
-            model_visible = json.dumps(payload["jetty_request"]) + json.dumps(
-                [{"placeholder": f.get("placeholder"), "remote_path_hint": f.get("remote_path_hint")} for f in payload["upload_plan"]["files"]])
-            self.assertNotIn("no-rp", model_visible)
-            self.assertNotIn("ablation", model_visible.lower())
-            # the harness-only record still carries the truth
-            self.assertEqual(payload["harness"]["variant"], "ablation:no-rp")
-            self.assertEqual(payload["harness"]["ablation"]["mode"], "materialized")
-
     def test_export_jetty_command_materializes_declared_ablation(self):
         # Regression guard: export-jetty used to call prepared_task_rows WITHOUT
         # an ablation dir, so a declared-removal ablation tripped the prepare-or-fail
@@ -817,17 +780,12 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             root = Path(td)
             p = self.repo(root, [self.SECTION_ABL])
             out = root / "jetty.jsonl"
-            args = SimpleNamespace(
-                manifest=str(p), split=None, runs_per_variant=1,
-                include_old_skill=False, include_ablations=True, allow_missing_prompts=False,
-                jetty_collection="skill-evals", jetty_task_prefix=None,
-                jetty_agent="claude-code", jetty_model="claude-sonnet-4-6",
-                jetty_model_provider="anthropic", jetty_snapshot="python312-uv",
-                use_trial_keys=False, out=str(out), dry_run=False,
-                ablation_dir=str(root / "abl"),
-            )
-            rc = sb.export_jetty(args)   # must NOT raise SystemExit
-            self.assertEqual(rc, 0)
+            rc, _, stderr = run_cli(
+                "export-jetty", p, "--include-ablations", "--jetty-collection", "skill-evals",
+                "--jetty-agent", "claude-code", "--jetty-model", "claude-sonnet-4-6",
+                "--jetty-model-provider", "anthropic", "--jetty-snapshot", "python312-uv",
+                "--out", out, "--ablation-dir", root / "abl")
+            self.assertEqual(rc, 0, stderr)   # must NOT die
             payloads = [json.loads(l) for l in out.read_text(encoding="utf-8").splitlines()]
             abl = [p for p in payloads if p["harness"]["variant"] == "ablation:no-rp"]
             withs = [p for p in payloads if p["harness"]["variant"] == "with_skill"]
@@ -911,55 +869,39 @@ class AblationRegressionReportTests(unittest.TestCase):
         self.assertEqual(reg["evidence"][0]["case"], "c1")
         self.assertEqual(reg["evidence"][0]["assertion"], "detect-weak")
 
-    def test_incomplete_grading_cannot_construct_confirmed_causal_evidence(self):
-        results = []
-        for run_number in range(1, 7):
-            results.append({
-                "case_id": "c1", "variant": "with_skill", "run_number": run_number,
-                "objective_pass_rate": 1.0, "grading_availability": "partial",
-                "assertions": [{"name": "detect-weak", "passed": True}],
-                "qualitative_assertions": [], **self.ws(),
-            })
-            results.append({
-                "case_id": "c1", "variant": "ablation:no-rp", "run_number": run_number,
-                "objective_pass_rate": 0.0, "grading_availability": "partial",
-                "assertions": [{"name": "detect-weak", "passed": False}],
-                "qualitative_assertions": [], **self.prov(),
-            })
-        entry = self.report(self.MANIFEST, results)[0]
-        regression = entry["regressions"][0]
-        self.assertEqual(entry["pairing"]["eligible_pairs"], 0)
-        self.assertEqual(
-            entry["pairing"]["blocked_reason_counts"],
-            {"grading_evidence_incomplete": 6},
-        )
-        self.assertEqual(regression["evidence_class"], "indeterminate")
-        self.assertIsNone(regression["expected_regression_confirmed"])
+    def _pairs(self, ablation_metadata, *, with_skill_metadata=None, ablation="no-rp"):
+        """One flipped, score-dropping with_skill/ablation pair per entry of
+        ablation_metadata (the metadata each ablation run recorded). Six good
+        pairs clear the paired sign-flip floor, so a pair set built here
+        confirms unless something else blocks it."""
+        rows = []
+        for run_number, metadata in enumerate(ablation_metadata, start=1):
+            rows.append({"case_id": "c1", "variant": "with_skill", "run_number": run_number,
+                         "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}],
+                         "qualitative_assertions": [],
+                         "metadata": with_skill_metadata or self.ws()["metadata"]})
+            rows.append({"case_id": "c1", "variant": f"ablation:{ablation}", "run_number": run_number,
+                         "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}],
+                         "qualitative_assertions": [], "metadata": metadata})
+        return rows
 
-    def test_missing_grading_status_cannot_default_to_complete_causal_evidence(self):
-        results = []
-        for run_number in range(1, 7):
-            results.append({
-                "case_id": "c1", "variant": "with_skill", "run_number": run_number,
-                "objective_pass_rate": 1.0,
-                "assertions": [{"name": "detect-weak", "passed": True}],
-                "qualitative_assertions": [], **self.ws(),
-            })
-            results.append({
-                "case_id": "c1", "variant": "ablation:no-rp", "run_number": run_number,
-                "objective_pass_rate": 0.0,
-                "assertions": [{"name": "detect-weak", "passed": False}],
-                "qualitative_assertions": [], **self.prov(),
-            })
-        entry = sb.build_ablation_regression_report(self.MANIFEST, results)[0]
-        regression = entry["regressions"][0]
-        self.assertEqual(entry["pairing"]["eligible_pairs"], 0)
-        self.assertEqual(
-            entry["pairing"]["blocked_reason_counts"],
-            {"grading_evidence_incomplete": 6},
-        )
-        self.assertEqual(regression["evidence_class"], "indeterminate")
-        self.assertIsNone(regression["expected_regression_confirmed"])
+    def test_grading_that_is_not_complete_cannot_confirm(self):
+        # A partial grade, or a row that never states its grading status, is
+        # not complete evidence; it must not default to complete.
+        provenance = self.prov()["metadata"]
+        for label, grading in (("partial", {"grading_availability": "partial"}),
+                               ("unstated", {})):
+            with self.subTest(grading=label):
+                results = [{**row, **grading} for row in self._pairs([provenance] * 6)]
+                entry = sb.build_ablation_regression_report(self.MANIFEST, results)[0]
+                regression = entry["regressions"][0]
+                self.assertEqual(entry["pairing"]["eligible_pairs"], 0)
+                self.assertEqual(
+                    entry["pairing"]["blocked_reason_counts"],
+                    {"grading_evidence_incomplete": 6},
+                )
+                self.assertEqual(regression["evidence_class"], "indeterminate")
+                self.assertIsNone(regression["expected_regression_confirmed"])
 
     def test_blocked_cited_repetition_prevents_answer_causal_confirmation(self):
         results = []
@@ -1029,30 +971,31 @@ class AblationRegressionReportTests(unittest.TestCase):
         self.assertEqual(reg["assertion_coverage_gaps"][0]["observed_pairs"], 1)
         self.assertEqual(reg["assertion_coverage_gaps"][0]["expected_pairs"], 6)
 
-    def test_four_matched_pairs_are_below_paired_significance_floor(self):
-        results = ([{"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0,
-                     "assertions": [{"name": "detect-weak", "passed": True}],
-                     "qualitative_assertions": [], **self.ws()} for _ in range(4)]
-                   + [{"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0,
-                       "assertions": [{"name": "detect-weak", "passed": False}],
-                       "qualitative_assertions": [], **self.prov()} for _ in range(4)])
-        reg = self.report(self.MANIFEST, results)[0]["regressions"][0]
-        self.assertIsNone(reg["expected_regression_confirmed"])
-        self.assertEqual(reg["significance"]["min_p_value"], 0.125)
-
-    def test_single_shot_regression_is_indeterminate_not_confirmed(self):
-        # Feature 1: one run per arm shows the drop but cannot rule out noise, so the
-        # verdict is INDETERMINATE (None), never confirmed — the n=5 walkthrough lesson.
-        results = [
-            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.ws()},
-            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": [], **self.prov()},
-        ]
-        reg = self.report(self.MANIFEST, results)[0]["regressions"][0]
-        self.assertIsNone(reg["expected_regression_confirmed"])
-        self.assertEqual(reg["evidence_class"], "indeterminate")
-        self.assertTrue(reg["confirmed_cases"])                        # the drop WAS observed
-        self.assertFalse(reg["significance"]["significant_at_0_05"])   # just not significant yet
-        self.assertIn("not significant", reg["note"])
+    def test_regressions_below_the_paired_significance_floor_stay_indeterminate(self):
+        # Feature 1: an observed drop confirms only once it clears the paired
+        # sign-flip floor (6 perfect pairs, p=2/2^6; see
+        # test_expected_regression_confirmed_when_named_assertion_flips). Below it
+        # the drop is seen but noise cannot be ruled out, so the verdict is
+        # INDETERMINATE, never confirmed and never REFUTED.
+        floor_rows = {
+            # label: (with_skill passes, ablation passes, min paired p)
+            "single shot": ([True], [False], 1.0),
+            "four perfect pairs": ([True] * 4, [False] * 4, 0.125),
+            "five perfect pairs": ([True] * 5, [False] * 5, 0.0625),
+            "six pairs, one contradictory each arm": (
+                [True] * 5 + [False], [False] * 5 + [True], 0.21875),
+        }
+        for label, (with_passes, ablation_passes, min_p) in floor_rows.items():
+            with self.subTest(label):
+                results = ([self._wrow(passed) for passed in with_passes]
+                           + [self._arow(passed) for passed in ablation_passes])
+                reg = self.report(self.MANIFEST, results)[0]["regressions"][0]
+                self.assertEqual(reg["confirmed_cases"], ["c1"])          # the drop WAS observed
+                self.assertIsNone(reg["expected_regression_confirmed"])
+                self.assertEqual(reg["evidence_class"], "indeterminate")
+                self.assertFalse(reg["significance"]["significant_at_0_05"])
+                self.assertEqual(reg["significance"]["min_p_value"], min_p)
+                self.assertIn("not significant", reg["note"])
 
     def test_multi_case_single_shot_does_not_confirm(self):
         # Soundness (audit fix): significance is per CASE, not pooled across cases.
@@ -1139,18 +1082,6 @@ class AblationRegressionReportTests(unittest.TestCase):
         self.assertTrue(reg["significance"]["significant_at_0_05"])
         self.assertLess(reg["significance"]["min_p_value"], 0.05)
 
-    def test_noisy_replicates_below_significance_are_indeterminate(self):
-        # Same shape but 6 runs/arm 5-1 vs 1-5: the drop is observed on every net
-        # measure yet the per-case permutation gives p~=0.078 -> INDETERMINATE, not
-        # confirmed. The gate refuses moderately-noisy, underpowered evidence.
-        results = ([self._wrow(True) for _ in range(5)] + [self._wrow(False)]
-                   + [self._arow(False) for _ in range(5)] + [self._arow(True)])
-        reg = self.report(self.MANIFEST, results)[0]["regressions"][0]
-        self.assertTrue(reg["confirmed_cases"])                       # the drop WAS observed
-        self.assertIsNone(reg["expected_regression_confirmed"])       # but not significant
-        self.assertEqual(reg["evidence_class"], "indeterminate")
-        self.assertFalse(reg["significance"]["significant_at_0_05"])
-
     def test_score_drop_without_named_flip_is_not_confirmed(self):
         # The named assertion still passes; an unrelated assertion fails and drags
         # the aggregate down. A score drop is necessary, not sufficient.
@@ -1184,15 +1115,18 @@ class AblationRegressionReportTests(unittest.TestCase):
         self.assertFalse(reg["expected_regression_confirmed"])
 
     def test_invalid_skill_never_confirms_behavioral_regression(self):
-        manifest = {"skill_name": "s", "skill_paths": ["x"], "ablations": [{"id": "no-desc", "invalid_skill": True, "removed_component": "d", "mechanism": "frontmatter_field", "class": "discovery", "target": {"field": "description"}, "expected_regressions": [{"summary": "x", "cases": ["c1"], "assertions": ["a"]}]}]}
-        results = [
-            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "a", "passed": True}], "qualitative_assertions": [], **self.ws()},
-            {"case_id": "c1", "variant": "ablation:no-desc", "objective_pass_rate": 0.0, "assertions": [{"name": "a", "passed": False}], "qualitative_assertions": [], **self.prov(manifest)},
-        ]
+        # Six verified, flipped, score-dropping pairs: a valid ablation with this
+        # evidence confirms, so only the invalid-skill rule can withhold it.
+        manifest = {"skill_name": "s", "skill_paths": ["x"], "ablations": [{"id": "no-desc", "invalid_skill": True, "removed_component": "d", "mechanism": "frontmatter_field", "class": "discovery", "target": {"field": "description"}, "expected_regressions": [{"summary": "x", "cases": ["c1"], "assertions": ["detect-weak"]}]}]}
+        results = self._pairs([self.prov(manifest)["metadata"]] * 6, ablation="no-desc")
         entry = self.report(manifest, results)[0]
+        self.assertTrue(entry["invalid_skill"])
         self.assertTrue(entry["provenance_verified"])             # invalid_skill mode verifies as such
         reg = entry["regressions"][0]
+        self.assertTrue(reg["significance"]["significant_at_0_05"])
+        self.assertEqual(reg["evidence_class"], "indeterminate")
         self.assertIsNone(reg["expected_regression_confirmed"])   # parser rejection != behavioral evidence
+        self.assertIn("invalid-skill experiment", reg["note"])
 
     def test_missing_output_ablation_row_never_confirms_regression(self):
         # The ablation arm produced NO output (the run failed/never ran). Its
@@ -1290,90 +1224,63 @@ class AblationRegressionReportTests(unittest.TestCase):
         self.assertEqual(reg["confirmed_cases"], [])              # but no single case had both
         self.assertFalse(reg["expected_regression_confirmed"])
 
-    def test_confirmation_blocked_when_provenance_missing(self):
-        # A genuine flip + score drop, but NO run recorded ablation provenance: we
-        # cannot prove a materialized tree was mounted, so we must not confirm.
-        results = [
-            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.ws()},
-            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": []},
-        ]
-        entry = self.report(self.MANIFEST, results)[0]
-        self.assertFalse(entry["provenance_verified"])
-        reg = entry["regressions"][0]
-        self.assertIsNone(reg["expected_regression_confirmed"])    # not confirmed despite the flip
-        self.assertIn("provenance unverified", reg["note"])
+    def test_unverified_provenance_blocks_an_otherwise_significant_confirmation(self):
+        # Six verified, flipped, score-dropping pairs confirm (the control). Each
+        # provenance defect alone must turn that into INDETERMINATE and name the
+        # verifier's reason. A single shot cannot confirm, so it cannot show a
+        # block either.
+        good = self.prov()["metadata"]
 
-    def test_confirmation_blocked_when_a_measured_run_lacks_provenance(self):
-        # One ablation run records provenance, a SECOND measured run does not. The
-        # unprovenanced run could be driving the rate, so confirmation is blocked.
-        results = [
-            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.ws()},
-            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": [], **self.prov()},
-            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": []},
-        ]
-        entry = self.report(self.MANIFEST, results)[0]
-        self.assertFalse(entry["provenance_verified"])
-        self.assertIn("recorded no provenance", entry["provenance_note"])
+        def recorded(**over):
+            return self.prov(**over)["metadata"]
 
-    def test_confirmation_blocked_when_recorded_mode_is_instruction_simulated(self):
-        # The run actually mounted the FULL skill (mode instruction_simulated), so a
-        # measured drop is not evidence the materialized ablation caused it.
-        results = [
-            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.ws()},
-            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": [], **self.prov(mode="instruction_simulated")},
-        ]
-        entry = self.report(self.MANIFEST, results)[0]
-        self.assertFalse(entry["provenance_verified"])
-        self.assertIn("mode", entry["provenance_note"])
-        self.assertIsNone(entry["regressions"][0]["expected_regression_confirmed"])
+        other_target = [{"class": "instructions", "mechanism": "section",
+                         "skill_root": "skills/good-pr/SKILL.md",
+                         "target": {"heading": "## A DIFFERENT SECTION"}}]
+        defects = {
+            # label: (each ablation run's metadata, with_skill metadata, reason)
+            "no run recorded provenance": (
+                [{}] * 6, None, "no run recorded ablation provenance"),
+            "one measured run recorded none": (
+                [good] * 5 + [{}], None, "1 of 6 measured ablation run(s) recorded no provenance"),
+            "an instruction-simulated record": (
+                [recorded(mode="instruction_simulated")] * 6, None, "malformed"),
+            "an invalid-skill record for a valid ablation": (
+                [recorded(mode="invalid_skill")] * 6, None,
+                "recorded mode 'invalid_skill' != expected 'materialized'"),
+            "a record without skill_hash": (
+                [recorded(skill_hash=None)] * 6, None, "malformed"),
+            "with_skill built from another revision": (
+                [good] * 6, {"skill_tree_hash": "OTHER-REVISION"}, "different skill revisions"),
+            "a different component target": (
+                [recorded(components=other_target)] * 6, None, "recorded components"),
+            "runs that mounted different trees": (
+                [recorded(skill_hash="AAA")] * 3 + [recorded(skill_hash="BBB")] * 3, None,
+                "skill_hash mismatch"),
+        }
+        control = self.report(self.MANIFEST, self._pairs([good] * 6))[0]
+        self.assertTrue(control["provenance_verified"])
+        self.assertTrue(control["regressions"][0]["expected_regression_confirmed"])
+        for label, (ablation_metadata, with_skill_metadata, reason) in defects.items():
+            with self.subTest(label):
+                entry = self.report(self.MANIFEST, self._pairs(
+                    ablation_metadata, with_skill_metadata=with_skill_metadata))[0]
+                reg = entry["regressions"][0]
+                self.assertFalse(entry["provenance_verified"])
+                self.assertIn(reason, entry["provenance_note"])
+                self.assertEqual(reg["note"], f"provenance unverified: {entry['provenance_note']}")
+                self.assertEqual(reg["evidence_class"], "indeterminate")
+                self.assertIsNone(reg["expected_regression_confirmed"])
 
-    def test_confirmation_blocked_when_recorded_provenance_is_malformed(self):
-        # A runner recorded an ablation provenance missing skill_hash. The strict
-        # JSON-boundary parser rejects it, but the report must DEGRADE (block the
-        # confirmation with a note) rather than crash with an unhandled parse error.
-        results = [
-            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.ws()},
-            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": [], **self.prov(skill_hash=None)},
-        ]
-        entry = self.report(self.MANIFEST, results)[0]
-        self.assertFalse(entry["provenance_verified"])
-        self.assertIn("malformed", entry["provenance_note"])
-        self.assertIsNone(entry["regressions"][0]["expected_regression_confirmed"])
-
-    def test_confirmation_blocked_when_with_skill_revision_differs(self):
-        # The with_skill arm recorded a DIFFERENT canonical hash than the ablation's
-        # parent: the two arms were built from different skill revisions.
-        results = [
-            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.ws(parent="OTHER-REVISION")},
-            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": [], **self.prov()},
-        ]
-        entry = self.report(self.MANIFEST, results)[0]
-        self.assertFalse(entry["provenance_verified"])
-        self.assertIn("different skill revisions", entry["provenance_note"])
-
-    def test_confirmation_blocked_when_component_target_differs(self):
-        # The recorded component targets a different heading than the manifest declares.
-        results = [
-            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.ws()},
-            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": [],
-             **self.prov(components=[{"class": "instructions", "mechanism": "section", "skill_root": "skills/good-pr/SKILL.md", "target": {"heading": "## A DIFFERENT SECTION"}}])},
-        ]
-        entry = self.report(self.MANIFEST, results)[0]
-        self.assertFalse(entry["provenance_verified"])
-        self.assertIn("components", entry["provenance_note"])
-
-    def test_confirmation_blocked_when_runs_disagree_on_tree(self):
-        # Two ablation runs report different skill_hash: they didn't mount the same
-        # tree, so the paired comparison is unsound.
-        results = [
-            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.ws()},
-            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": [], **self.prov(skill_hash="AAA")},
-            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": [], **self.prov(skill_hash="BBB")},
-        ]
-        entry = self.report(self.MANIFEST, results)[0]
-        self.assertFalse(entry["provenance_verified"])
-        self.assertIn("skill_hash mismatch", entry["provenance_note"])
-        self.assertIsNone(entry["regressions"][0]["expected_regression_confirmed"])
+    def test_regression_significance_names_the_replicate_pair_as_its_unit(self):
+        # The confirmation tests each case's matched repetitions, so its
+        # significance counts replicate pairs, not cases, and says so on the
+        # block and on each case's test, as every paired significance does.
+        entry = self.report(self.MANIFEST, self._pairs([self.prov()["metadata"]] * 6))[0]
+        significance = entry["regressions"][0]["significance"]
+        self.assertEqual(significance["unit"], "replicate_pair")
+        self.assertEqual(significance["by_case"]["c1"]["unit"], "replicate_pair")
+        self.assertEqual(significance["by_case"]["c1"]["p_value"], 0.03125)
 
 
 class AblationCoverageTests(unittest.TestCase):
@@ -1418,19 +1325,19 @@ class AblationCoverageTests(unittest.TestCase):
     def test_script_mechanism_removes_file(self):
         with tempfile.TemporaryDirectory() as td:
             res = self.materialize(Path(td), {"id": "no-script", "removed_component": "s", "mechanism": "script", "class": "resource", "target": {"skill_root": "skills/good-pr/SKILL.md", "path": "scripts/run.py"}})
-            base = Path(res["dir"]) / "skills_good-pr_SKILL.md"
+            base = Path(res["dir"]) / "good-pr"
             self.assertFalse((base / "scripts" / "run.py").exists())
 
     def test_asset_mechanism_removes_file(self):
         with tempfile.TemporaryDirectory() as td:
             res = self.materialize(Path(td), {"id": "no-asset", "removed_component": "a", "mechanism": "asset", "class": "resource", "target": {"skill_root": "skills/good-pr/SKILL.md", "path": "assets/tmpl.txt"}})
-            base = Path(res["dir"]) / "skills_good-pr_SKILL.md"
+            base = Path(res["dir"]) / "good-pr"
             self.assertFalse((base / "assets" / "tmpl.txt").exists())
 
     def test_reference_both_unlinks_and_deletes(self):
         with tempfile.TemporaryDirectory() as td:
             res = self.materialize(Path(td), {"id": "no-sev", "removed_component": "r", "mechanism": "reference", "class": "resource", "target": {"skill_root": "skills/good-pr/SKILL.md", "path": "references/severity.md", "remove": "both"}})
-            base = Path(res["dir"]) / "skills_good-pr_SKILL.md"
+            base = Path(res["dir"]) / "good-pr"
             self.assertFalse((base / "references" / "severity.md").exists())
             self.assertNotIn("](references/severity.md)", (base / "SKILL.md").read_text(encoding="utf-8"))
 
@@ -1441,8 +1348,8 @@ class AblationCoverageTests(unittest.TestCase):
                 {"mechanism": "frontmatter_field", "class": "runtime", "target": {"skill_root": "skills/audit/SKILL.md", "field": "allowed-tools"}},
             ]})
             d = Path(res["dir"])
-            pr = d / "skills_good-pr_SKILL.md"
-            au = d / "skills_audit_SKILL.md"
+            pr = d / "good-pr"
+            au = d / "audit"
             # both roots present and independently ablated
             self.assertNotIn("Regression-proof requirement", (pr / "SKILL.md").read_text(encoding="utf-8"))
             self.assertNotIn("allowed-tools", (au / "SKILL.md").read_text(encoding="utf-8"))
@@ -1460,7 +1367,7 @@ class AblationCoverageTests(unittest.TestCase):
             (Path(td) / "secret.txt").write_text("s", encoding="utf-8")
             link = base / "link"
             link.symlink_to(Path(td) / "secret.txt")
-            with self.assertRaises(sb.AblationError):
+            with self.assertRaisesRegex(sb.AblationError, "path escapes"):
                 sb._safe_under(base, link)   # resolves outside base
             (base / "ok.txt").write_text("x", encoding="utf-8")
             self.assertTrue(str(sb._safe_under(base, base / "ok.txt")).endswith("ok.txt"))
@@ -1468,15 +1375,9 @@ class AblationCoverageTests(unittest.TestCase):
     def test_preprocess_mechanism_removes_inline_command(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            repo = root / "repo"
-            sd = repo / "skills" / "good-pr"
-            sd.mkdir(parents=True)
-            (sd / "SKILL.md").write_text("---\nname: good-pr\ndescription: Review PRs. Use for PRs.\n---\n\n# PR\n\n## Gather\n\n!`git diff --stat`\n\nThen review.\n", encoding="utf-8")
-            (repo / "evals").mkdir()
             ablation = {"id": "no-pre", "removed_component": "diff preprocess", "mechanism": "preprocess", "class": "preprocess", "target": {"skill_root": "skills/good-pr/SKILL.md", "contains": ["git diff"]}}
-            manifest = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": [ablation]}
-            p = repo / "evals" / "shared-benchmark.json"
-            p.write_text(json.dumps(manifest), encoding="utf-8")
+            p = make_eval_repo(root, skill_name="good-pr", cases=[ANY_CASE], ablations=[ablation],
+                               skill_text="---\nname: good-pr\ndescription: Review PRs. Use for PRs.\n---\n\n# PR\n\n## Gather\n\n!`git diff --stat`\n\nThen review.\n")
             m = sb.validate_manifest(p)
             res = sb.materialize_ablation(sb.repo_root_for_manifest(p), m, ablation, root / "out")
             text = Path(res["skill_files"]["skills/good-pr/SKILL.md"]).read_text(encoding="utf-8")
@@ -1484,25 +1385,24 @@ class AblationCoverageTests(unittest.TestCase):
             self.assertIn("Then review.", text)
             self.assertEqual(res["population"], "answer")
 
-    def test_provenance_includes_diff_stat_and_hash(self):
+    def test_provenance_records_what_each_component_removed(self):
+        # removed_bytes is the diff stat a reader uses to judge isolation: the
+        # section's own length for an edit, the file's size for a deletion.
+        section = SKILL_FIXTURE[SKILL_FIXTURE.index("## Regression-proof requirement"):SKILL_FIXTURE.index("## Severity")]
         with tempfile.TemporaryDirectory() as td:
-            res = self.materialize(Path(td), {"id": "p", "removed_component": "s", "mechanism": "section", "class": "instructions", "target": {"skill_root": "skills/good-pr/SKILL.md", "heading": "## Regression-proof requirement"}})
-            self.assertIn("skill_hash", res)
-            self.assertTrue(all("removed_bytes" in c for c in res["components"]))
+            res = self.materialize(Path(td), {"id": "p", "removed_component": "s", "components": [
+                {"mechanism": "section", "class": "instructions", "target": {"skill_root": "skills/good-pr/SKILL.md", "heading": "## Regression-proof requirement"}},
+                {"mechanism": "script", "class": "resource", "target": {"skill_root": "skills/good-pr/SKILL.md", "path": "scripts/run.py"}},
+            ]})
+        self.assertEqual([c["removed_bytes"] for c in res["components"]],
+                         [len(section), len("print('hi')\n")])
 
 
 class AblationSpecCompletenessTests(unittest.TestCase):
     def repo(self, root: Path, ablations: list) -> Path:
-        repo = root / "repo"
-        sd = repo / "skills" / "good-pr"
-        (sd / "references").mkdir(parents=True, exist_ok=True)
-        (sd / "SKILL.md").write_text(SKILL_FIXTURE, encoding="utf-8")
-        (sd / "references" / "severity.md").write_text("# sev\n", encoding="utf-8")
-        (repo / "evals").mkdir(exist_ok=True)
-        manifest = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "ans", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": ablations}
-        p = repo / "evals" / "shared-benchmark.json"
-        p.write_text(json.dumps(manifest), encoding="utf-8")
-        return p
+        return make_eval_repo(root, skill_name="good-pr", skill_text=SKILL_FIXTURE,
+                              references={"references/severity.md": SEVERITY_GUIDE},
+                              cases=[ANY_CASE], ablations=ablations)
 
     def test_invalid_skill_mode_allows_required_field_removal(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1518,16 +1418,25 @@ class AblationSpecCompletenessTests(unittest.TestCase):
             root = Path(td)
             ab = {"id": "no-desc", "removed_component": "desc", "mechanism": "frontmatter_field", "class": "discovery", "target": {"field": "description"}}
             p = self.repo(root, [ab])
-            with self.assertRaises(sb.AblationError):
+            with self.assertRaisesRegex(sb.AblationError, "required frontmatter field"):
                 sb.materialize_ablation(sb.repo_root_for_manifest(p), sb.validate_manifest(p), ab, root / "out")
 
-    def test_isolation_warning_on_oversized_removal(self):
+    def isolation_warnings(self, heading: str) -> list:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            ab = {"id": "big", "removed_component": "most of body", "mechanism": "section", "class": "instructions", "target": {"heading": "# Good PR review"}}
+            ab = {"id": "cut", "removed_component": heading, "mechanism": "section", "class": "instructions", "target": {"heading": heading}}
             p = self.repo(root, [ab])
-            res = sb.materialize_ablation(sb.repo_root_for_manifest(p), sb.validate_manifest(p), ab, root / "out")
-            self.assertTrue(res["isolation_warnings"])
+            with contextlib.redirect_stderr(io.StringIO()):
+                res = sb.materialize_ablation(sb.repo_root_for_manifest(p), sb.validate_manifest(p), ab, root / "out")
+        return res["isolation_warnings"]
+
+    def test_isolation_warning_only_on_oversized_removal(self):
+        body = len(SKILL_FIXTURE) - SKILL_FIXTURE.index("# Good PR review")
+        warnings = self.isolation_warnings("# Good PR review")
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertTrue(warnings[0].startswith(
+            f"component #0 (section) removed {body}/{len(SKILL_FIXTURE)} bytes"), warnings[0])
+        self.assertEqual(self.isolation_warnings("## Severity"), [])
 
     def test_check_ablations_dry_run_pass_and_fail(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1552,10 +1461,6 @@ class AblationSpecCompletenessTests(unittest.TestCase):
             self.assertIn("ablation-no-expected-regression", kinds)
             self.assertIn("ablation-unknown-case", kinds)
             self.assertIn("ablation-unknown-assertion", kinds)
-
-    def test_regression_report_tags_invalid_skill(self):
-        manifest = {"skill_name": "s", "skill_paths": ["x"], "ablations": [{"id": "no-desc", "removed_component": "d", "invalid_skill": True, "mechanism": "frontmatter_field", "class": "discovery", "target": {"field": "description"}, "expected_regressions": []}]}
-        self.assertTrue(sb.build_ablation_regression_report(manifest, [])[0]["invalid_skill"])
 
 
 class AblationLiveExecutionTests(unittest.TestCase):
@@ -1600,7 +1505,7 @@ class AblationLiveExecutionTests(unittest.TestCase):
             meta = json.loads((root / "good-pr" / "eval-runs" / "run" / "ans" / "ablation:no-rp" / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["ablation"]["mode"], "materialized")   # provenance persisted on the run (#9)
             # the runner emits the full minimum provenance schema + canonical hash
-            self.assertTrue(am.Provenance.SCHEMA_KEYS.issubset(meta["ablation"]))
+            am.Provenance.from_dict(meta["ablation"])   # strict parse: every schema field present
             self.assertEqual(meta["skill_tree_hash"], meta["ablation"]["parent_skill_hash"])
             ws_meta = json.loads((root / "good-pr" / "eval-runs" / "run" / "ans" / "with_skill" / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(ws_meta["skill_tree_hash"], meta["ablation"]["parent_skill_hash"])   # both arms, same revision
@@ -1626,19 +1531,9 @@ class AblationReviewFixesTests(unittest.TestCase):
             merged["skill_tree_hash"] = merged["ablation"]["parent_skill_hash"]
         return sb.PreparedTask.from_row(merged)
 
-    def manifest(self, root: Path, ablations: list, skill_paths=None, second_root=False) -> Path:
-        repo = root / "repo"
-        sd = repo / "skills" / "good-pr"
-        sd.mkdir(parents=True)
-        (sd / "SKILL.md").write_text(self.MIN_SKILL, encoding="utf-8")
-        if second_root:
-            (repo / "skills" / "audit").mkdir(parents=True)
-            (repo / "skills" / "audit" / "SKILL.md").write_text("---\nname: audit\ndescription: Audit. Use for audits.\n---\n\n# Audit\n", encoding="utf-8")
-        (repo / "evals").mkdir()
-        m = {"version": 1, "skill_name": "good-pr", "skill_paths": skill_paths or ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": ablations}
-        p = repo / "evals" / "shared-benchmark.json"
-        p.write_text(json.dumps(m), encoding="utf-8")
-        return p
+    def manifest(self, root: Path, ablations: list, skill_paths=None) -> Path:
+        return make_eval_repo(root, skill_name="good-pr", skill_text=self.MIN_SKILL,
+                              skill_paths=skill_paths, cases=[ANY_CASE], ablations=ablations)
 
     # --- #7 parsing ---
     def test_block_scalar_with_blank_line_removed_cleanly(self):
@@ -1681,7 +1576,7 @@ class AblationReviewFixesTests(unittest.TestCase):
             (src / "SKILL.md").write_text(self.MIN_SKILL, encoding="utf-8")
             (root / "secret.txt").write_text("secret", encoding="utf-8")
             (src / "link").symlink_to(root / "secret.txt")
-            with self.assertRaises(sb.AblationError):
+            with self.assertRaisesRegex(sb.AblationError, "symlink escaping the root"):
                 sb._copy_skill_root(src, root / "dst")
 
     def test_ensure_ablation_dir_refuses_nonempty_unowned(self):
@@ -1689,30 +1584,20 @@ class AblationReviewFixesTests(unittest.TestCase):
             d = Path(td) / "user-data"
             d.mkdir()
             (d / "important.txt").write_text("keep", encoding="utf-8")
-            with self.assertRaises(SystemExit):
-                sb._ensure_ablation_dir(d)
+            assert_dies(self, lambda: sb._ensure_ablation_dir(d), "is non-empty and not a harness-created ablation dir")
             self.assertTrue((d / "important.txt").exists())   # never deleted
-
-    def test_execution_valid_flags_infrastructure_failures(self):
-        self.assertTrue(sb.execution_valid({"returncode": 0}, "a real answer"))
-        self.assertTrue(sb.execution_valid(None, "answer with no metadata"))
-        self.assertFalse(sb.execution_valid({"returncode": 1}, "x"))
-        self.assertFalse(sb.execution_valid({"timed_out": True}, "x"))
-        self.assertFalse(sb.execution_valid({"timeout": True}, "x"))
-        self.assertFalse(sb.execution_valid({}, "[CODEX FAILURE: returncode=1]\n\n"))
-        self.assertFalse(sb.execution_valid({}, "[JETTY FAILURE: trajectory failed before producing output]\n"))
-        self.assertFalse(sb.execution_valid({}, "[TIMEOUT: no final assistant message captured]"))
 
     # --- #6 gate soundness ---
     def test_validate_rejects_mechanism_class_mismatch(self):
-        with tempfile.TemporaryDirectory() as td:
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(self.manifest(Path(td), [{"id": "x", "removed_component": "x", "mechanism": "section", "class": "discovery", "target": {"heading": "## A"}}]))
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as td, contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+            sb.validate_manifest(self.manifest(Path(td), [{"id": "x", "removed_component": "x", "mechanism": "section", "class": "discovery", "target": {"heading": "## A"}}]))
+        self.assertIn("mechanism 'section' is incompatible with declared class 'discovery'", stderr.getvalue())
 
     def test_validate_rejects_resource_targeting_skill_md(self):
         with tempfile.TemporaryDirectory() as td:
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(self.manifest(Path(td), [{"id": "x", "removed_component": "x", "mechanism": "asset", "class": "resource", "target": {"path": "SKILL.md"}}]))
+            path = self.manifest(Path(td), [{"id": "x", "removed_component": "x", "mechanism": "asset", "class": "resource", "target": {"path": "SKILL.md"}}])
+            assert_dies(self, lambda: sb.validate_manifest(path), "asset may not target the skill's SKILL.md")
 
     def test_two_components_deleting_same_file_refused(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1724,7 +1609,7 @@ class AblationReviewFixesTests(unittest.TestCase):
                 {"mechanism": "script", "class": "resource", "target": {"path": "scripts/x.py"}},
                 {"mechanism": "asset", "class": "resource", "target": {"path": "scripts/x.py"}},
             ]}
-            with self.assertRaises(sb.AblationError):
+            with self.assertRaisesRegex(sb.AblationError, "both delete x.py"):
                 sb.materialize_ablation(sb.repo_root_for_manifest(p), sb.validate_manifest(p), ab, root / "out")
 
     # --- #3a all roots ---
@@ -1732,7 +1617,7 @@ class AblationReviewFixesTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             ab = {"id": "a-only", "removed_component": "x", "mechanism": "section", "class": "instructions", "target": {"skill_root": "skills/good-pr/SKILL.md", "heading": "## A"}}
-            p = self.manifest(root, [ab], skill_paths=["skills/good-pr/SKILL.md", "skills/audit/SKILL.md"], second_root=True)
+            p = self.manifest(root, [ab], skill_paths=["skills/good-pr/SKILL.md", "skills/audit/SKILL.md"])
             res = sb.materialize_ablation(sb.repo_root_for_manifest(p), sb.validate_manifest(p), ab, root / "out")
             self.assertEqual(set(res["skill_files"]), {"skills/good-pr/SKILL.md", "skills/audit/SKILL.md"})  # B not dropped
             self.assertTrue(Path(res["skill_files"]["skills/audit/SKILL.md"]).exists())
@@ -1794,26 +1679,6 @@ class AblationReviewFixesTests(unittest.TestCase):
         # blinded materialized prompt is identical to the with_skill prompt
         self.assertEqual(mat_prompt, with_prompt)
 
-    # --- #3b Jetty with_skill surface parity ---
-    def test_jetty_with_skill_uploads_tree_recursively(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            repo = root / "repo"
-            sd = repo / "skills" / "good-pr"
-            (sd / "references").mkdir(parents=True)
-            (sd / "SKILL.md").write_text("---\nname: good-pr\ndescription: d.\n---\n\n# B\n\nSee [g](references/g.md).\n", encoding="utf-8")
-            (sd / "references" / "g.md").write_text("guide\n", encoding="utf-8")
-            (repo / "evals").mkdir()
-            m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": []}
-            p = repo / "evals" / "shared-benchmark.json"
-            p.write_text(json.dumps(m), encoding="utf-8")
-            manifest = sb.validate_manifest(p)
-            row = next(r for r in sb.prepared_task_rows(p, manifest) if r["variant"] == "with_skill")
-            tree_dir = sb.build_canonical_skill_tree(sb.repo_root_for_manifest(p), manifest, root / "wst")
-            payload = sb.build_jetty_payload(sb.PreparedTask.from_row(row), manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", with_skill_tree_dir=tree_dir)
-            hints = [f["remote_path_hint"] for f in payload["upload_plan"]["files"] if f["role"] == "skill"]
-            self.assertTrue(any(h.endswith("references/g.md") for h in hints))  # recursive, matching the ablation arm
-
 
 class AblationDifferentialInvariantTests(unittest.TestCase):
     """Differential testing (testing-best-practices/references/differential-testing.md):
@@ -1832,20 +1697,12 @@ class AblationDifferentialInvariantTests(unittest.TestCase):
     )
 
     def repo(self, root: Path) -> Path:
-        sd = root / "repo" / "skills" / "good-pr"
-        (sd / "references").mkdir(parents=True)
-        (sd / "scripts").mkdir()
-        (sd / "assets").mkdir()
-        (sd / "SKILL.md").write_text(self.SKILL, encoding="utf-8")
-        (sd / "references" / "severity.md").write_text("# Severity\n\nBlocking, Minor, Clean.\n", encoding="utf-8")
-        (sd / "scripts" / "run.py").write_text("print('hi')\n", encoding="utf-8")
-        (sd / "assets" / "tmpl.txt").write_text("template\n", encoding="utf-8")
-        (sd / "NOTES.md").write_text("arbitrary extra file\n", encoding="utf-8")  # not in references/scripts/assets
-        (root / "repo" / "evals").mkdir()
-        m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": []}
-        p = root / "repo" / "evals" / "shared-benchmark.json"
-        p.write_text(json.dumps(m), encoding="utf-8")
-        return p
+        return make_eval_repo(root, skill_name="good-pr", skill_text=self.SKILL, cases=[ANY_CASE], references={
+            "references/severity.md": SEVERITY_GUIDE,
+            "scripts/run.py": "print('hi')\n",
+            "assets/tmpl.txt": "template\n",
+            "NOTES.md": "arbitrary extra file\n",   # not in references/scripts/assets
+        })
 
     def pair(self, root: Path, p: Path, ablation: dict, tag: str):
         manifest = sb.validate_manifest(p)
@@ -1951,19 +1808,6 @@ class AblationDifferentialInvariantTests(unittest.TestCase):
         with self.assertRaises(AssertionError):  # a substitution leaking through "removal-only"
             self.assertDiffersOnlyBy({"k/SKILL.md": b"hello world"}, {"k/SKILL.md": b"hello brave world"}, edited="k/SKILL.md")
 
-    # --- property: blinding invariant (model-visible instruction is identical across arms) ---
-    def test_materialized_instruction_is_identical_to_with_skill(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            p = self.repo(root)
-            manifest = sb.validate_manifest(p)
-            repo_root = sb.repo_root_for_manifest(p)
-            manifest = {**manifest, "ablations": [{"id": "x", "removed_component": "x", "mechanism": "section", "class": "instructions", "target": {"heading": "## Severity"}}]}
-            self.assertEqual(
-                sb.variant_instruction("ablation:x", manifest, repo_root),
-                sb.variant_instruction("with_skill", manifest, repo_root),
-            )
-
     def test_variant_instruction_is_path_neutral(self):
         # The instruction must never embed an absolute repo path: a repo-aware
         # runner would otherwise read the ORIGINAL skill and silently defeat a
@@ -2010,15 +1854,6 @@ class AblationParserExactnessTests(unittest.TestCase):
         s, e = sb.section_span(text, "Foo")   # no '#': first 'Foo' at any level
         self.assertTrue(text[s:e].startswith("### Foo"))
 
-    def test_reference_pointer_ignores_inline_code_sample(self):
-        # The real link is unlinked; a link literal shown inside inline code is not.
-        text = "See [guide](references/g.md) now.\n\nSyntax: `[guide](references/g.md)` shows a link.\n"
-        ops = sb.reference_pointer_ops(text, "references/g.md")
-        self.assertEqual(len(ops), 1)
-        s, _e, rep = ops[0]
-        self.assertEqual(rep, "guide")
-        self.assertLess(s, text.index("`"))    # the matched link precedes the inline-code span
-
     def test_list_item_continuation_includes_indented_code_block(self):
         # The targeted item contains an indented fenced code block; removing the
         # item must take the whole block, not stop at the fence.
@@ -2044,14 +1879,6 @@ class AblationParserExactnessTests(unittest.TestCase):
         s, e, _ = ops[0]
         self.assertIn("real item", text[s:e])
         self.assertNotIn("decoy", text[s:e])
-
-    def test_preprocess_skips_inline_code_example(self):
-        # A real preprocess command is removed; one shown inside inline code is not.
-        text = "Run !`deploy --prod` now.\n\nExample shown as code: `!`deploy --prod`` stays.\n"
-        ops = sb.preprocess_ops(text, ["deploy"])
-        self.assertEqual(len(ops), 1)
-        s, _e, _ = ops[0]
-        self.assertLess(s, text.index("Example"))   # only the first (real) command line
 
     def test_every_text_mechanism_ignores_code_and_layer_decoys(self):
         # The RULE behind the R3/R4 parser findings, applied to EVERY text-searching
@@ -2091,13 +1918,8 @@ class AblationParserExactnessTests(unittest.TestCase):
     def test_crlf_is_preserved_through_materialization(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            sd = root / "repo" / "skills" / "good-pr"
-            sd.mkdir(parents=True)
-            (sd / "SKILL.md").write_bytes(SKILL_FIXTURE.replace("\n", "\r\n").encode("utf-8"))
-            (root / "repo" / "evals").mkdir()
-            m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": []}
-            p = root / "repo" / "evals" / "shared-benchmark.json"
-            p.write_text(json.dumps(m), encoding="utf-8")
+            p = make_eval_repo(root, skill_name="good-pr", cases=[ANY_CASE])
+            (p.parents[1] / "skills" / "good-pr" / "SKILL.md").write_bytes(SKILL_FIXTURE.replace("\n", "\r\n").encode("utf-8"))
             manifest = sb.validate_manifest(p)
             ab = {"id": "x", "removed_component": "rp", "mechanism": "section", "class": "instructions", "target": {"heading": "## Regression-proof requirement"}}
             res = sb.materialize_ablation(sb.repo_root_for_manifest(p), manifest, ab, root / "out")
@@ -2144,8 +1966,6 @@ class SkillCorpusConformanceTests(unittest.TestCase):
 
     def test_differential_invariant_holds_on_a_real_skill(self):
         src = CORPUS_DIR / "good-pr.SKILL.md"
-        if not src.exists():
-            self.skipTest("good-pr corpus missing")
         text = src.read_text(encoding="utf-8")
         lines = text.split("\n")
         mask = sb._fenced_mask(lines)
@@ -2153,13 +1973,7 @@ class SkillCorpusConformanceTests(unittest.TestCase):
         self.assertIsNotNone(heading, "real skill should have a level-2 heading to ablate")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            sd = root / "repo" / "skills" / "good-pr"
-            sd.mkdir(parents=True)
-            (sd / "SKILL.md").write_text(text, encoding="utf-8")
-            (root / "repo" / "evals").mkdir()
-            m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": []}
-            p = root / "repo" / "evals" / "shared-benchmark.json"
-            p.write_text(json.dumps(m), encoding="utf-8")
+            p = make_eval_repo(root, skill_name="good-pr", skill_text=text, cases=[ANY_CASE])
             manifest = sb.validate_manifest(p)
             repo_root = sb.repo_root_for_manifest(p)
             with_dir = sb.build_canonical_skill_tree(repo_root, manifest, root / "w")
@@ -2180,16 +1994,11 @@ class P1_BomFrontmatterTests(unittest.TestCase):
 
     def test_bom_prefixed_skill_is_ablatable(self):
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td); rp = root / "repo"; sd = rp / "skills" / "good-pr"; sd.mkdir(parents=True)
+            root = Path(td)
             body = "---\nname: good-pr\ndescription: Review PRs. Use for PRs.\n---\n\n# G\n\n## Drop\n\ngone\n\n## Keep\n\nkeep\n"
-            (sd / "SKILL.md").write_bytes(b"\xef\xbb\xbf" + body.encode("utf-8"))   # UTF-8 BOM prefix
-            (rp / "evals").mkdir()
             abl = {"id": "d", "removed_component": "drop", "mechanism": "section", "class": "instructions", "target": {"heading": "## Drop"}}
-            m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"],
-                 "variants": ["with_skill", "without_skill"],
-                 "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}],
-                 "ablations": [abl]}
-            p = rp / "evals" / "shared-benchmark.json"; p.write_text(json.dumps(m), encoding="utf-8")
+            p = make_eval_repo(root, skill_name="good-pr", skill_text="\ufeff" + body,   # UTF-8 BOM prefix
+                               cases=[ANY_CASE], ablations=[abl])
             manifest = sb.validate_manifest(p); repo_root = sb.repo_root_for_manifest(p)
             arm = sb.materialize(sb.ValidatedAblation.validate(repo_root, manifest, abl), root / "abl")   # must not raise
             txt = Path(arm.skill_files["skills/good-pr/SKILL.md"]).read_text(encoding="utf-8-sig")
@@ -2198,26 +2007,42 @@ class P1_BomFrontmatterTests(unittest.TestCase):
 
 
 class P3_KeyCollisionTests(unittest.TestCase):
-    """Two distinct skill roots whose sanitized tree-key collides are rejected as an
-    AblationError, not an unwrapped FileExistsError mid-materialization."""
+    """Two distinct skill roots that would mount under the same directory name are
+    rejected: at validation (the user-facing error) and, for callers that skip
+    validation, as an AblationError rather than an unwrapped FileExistsError
+    mid-materialization."""
 
     def test_colliding_sanitized_roots_raise_ablation_error(self):
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td); rp = root / "repo"
-            for name in ("skill+x", "skill_x"):   # both sanitize to skill_x_SKILL.md
-                d = rp / name; d.mkdir(parents=True)
-                (d / "SKILL.md").write_text("---\nname: s\ndescription: d. Use it.\n---\n\n# A\n\n## S\n\nx\n", encoding="utf-8")
-            (rp / "evals").mkdir()
+            root = Path(td)
             abl = {"id": "a", "removed_component": "s", "mechanism": "section", "class": "instructions",
                    "target": {"skill_root": "skill+x/SKILL.md", "heading": "## S"}}
-            m = {"version": 1, "skill_name": "s", "skill_paths": ["skill+x/SKILL.md", "skill_x/SKILL.md"],
-                 "variants": ["with_skill", "without_skill"],
-                 "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}],
-                 "ablations": [abl]}
-            p = rp / "evals" / "shared-benchmark.json"; p.write_text(json.dumps(m), encoding="utf-8")
-            manifest = sb.validate_manifest(p); repo_root = sb.repo_root_for_manifest(p)
-            with self.assertRaises(sb.AblationError):
+            p = make_eval_repo(root, skill_name="s", skill_paths=["skill+x/SKILL.md", "skill_x/SKILL.md"],   # both mount as directory skill_x
+                               skill_text="---\nname: s\ndescription: d. Use it.\n---\n\n# A\n\n## S\n\nx\n",
+                               cases=[ANY_CASE], ablations=[abl])
+            manifest = json.loads(p.read_text(encoding="utf-8")); repo_root = sb.repo_root_for_manifest(p)
+            with self.assertRaisesRegex(sb.AblationError, "both mount as skill directory 'skill_x'"):
                 sb.ValidatedAblation.validate(repo_root, manifest, abl)
+
+    def test_two_roots_sharing_a_directory_name_fail_validation(self):
+        # An agent lists skills by directory name, so these would show the model
+        # two skills called `review`.
+        with tempfile.TemporaryDirectory() as td:
+            p = make_eval_repo(Path(td), skill_name="review", cases=[ANY_CASE],
+                               skill_paths=["team-a/review/SKILL.md", "team-b/review/SKILL.md"])
+            code, _, stderr = run_cli("validate", p)
+        self.assertEqual(code, 1)
+        self.assertIn("manifest.skill_paths: 'team-a/review/SKILL.md' and 'team-b/review/SKILL.md' "
+                      "both mount as skill directory 'review'", stderr)
+
+    def test_mount_key_is_the_skill_directory_name(self):
+        # The name a user's install shows (`.claude/skills/<dir>/`), never the
+        # flattened manifest path.
+        for rel, key in (("skills/tidy-commit/SKILL.md", "tidy-commit"), ("skills/reviewer", "reviewer"),
+                         ("skills/reviewer/", "reviewer"), ("./skills/demo/SKILL.md", "demo"),
+                         ("skills/my skill/SKILL.md", "my_skill"), ("SKILL.md", "SKILL.md")):
+            with self.subTest(rel=rel):
+                self.assertEqual(sb._skill_root_key(rel), key)
 
 
 class P5_PreprocessFenceTests(unittest.TestCase):
@@ -2240,16 +2065,12 @@ class R2_InstructionSimSurfaceTests(unittest.TestCase):
 
     def test_instruction_sim_matches_with_skill_surface(self):
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td); rp = root / "repo"; sd = rp / "skills" / "good-pr"; (sd / "references").mkdir(parents=True)
-            (sd / "SKILL.md").write_text("---\nname: good-pr\ndescription: d. Use it.\n---\n\n# B\n\nSee [g](references/g.md).\n\n## Sev\n\np\n", encoding="utf-8")
-            (sd / "references" / "g.md").write_text("guide\n", encoding="utf-8")
-            (rp / "evals").mkdir()
-            m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"],
-                 "variants": ["with_skill", "without_skill"],
-                 "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}],
-                 "ablations": [{"id": "mat", "removed_component": "sev", "mechanism": "section", "class": "instructions", "target": {"heading": "## Sev"}},
-                               {"id": "sim", "removed_component": "something"}]}
-            p = rp / "evals" / "shared-benchmark.json"; p.write_text(json.dumps(m), encoding="utf-8")
+            root = Path(td)
+            p = make_eval_repo(
+                root, skill_name="good-pr", references={"references/g.md": "guide\n"}, cases=[ANY_CASE],
+                skill_text="---\nname: good-pr\ndescription: d. Use it.\n---\n\n# B\n\nSee [g](references/g.md).\n\n## Sev\n\np\n",
+                ablations=[{"id": "mat", "removed_component": "sev", "mechanism": "section", "class": "instructions", "target": {"heading": "## Sev"}},
+                           {"id": "sim", "removed_component": "something"}])
             manifest = sb.validate_manifest(p); repo_root = sb.repo_root_for_manifest(p)
             trees = sb.materialize_declared_ablations(repo_root, manifest, root / "abl")
             wsdir = sb.build_canonical_skill_tree(repo_root, manifest, root / "abl" / "_ws")
@@ -2294,15 +2115,15 @@ class MaterializedArmTests(unittest.TestCase):
 
     def test_materialized_without_an_edit_is_unrepresentable(self):
         # The round-3 lie: "materialized" while the original tree is mounted.
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "must attest an edited tree"):
             am.MaterializedArm(arm=self.arm(edited="C"), dir="/x", skill_files={}, isolation_warnings=())
 
     def test_materialized_requires_provenance(self):
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "must carry provenance"):
             am.MaterializedArm(arm=self.arm(provenance=False), dir="/x", skill_files={}, isolation_warnings=())
 
     def test_materialized_arm_must_be_blind(self):
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "must be blind"):
             am.MaterializedArm(arm=self.arm(blind=False), dir="/x", skill_files={}, isolation_warnings=())
 
     def test_materialized_arm_identity_must_equal_provenance_identity(self):
@@ -2322,18 +2143,6 @@ class MaterializedArmTests(unittest.TestCase):
 
 
 class ValidatedAblationTests(unittest.TestCase):
-    def test_gate_pile_is_a_constructor(self):
-        # An invalid ablation cannot be validated — the gates are the constructor.
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            bad = {"id": "bad", "removed_component": "x", "mechanism": "section", "class": "discovery",
-                   "target": {"heading": "## Severity"}}   # section cannot be class discovery
-            p = repo(root, [])   # valid manifest; the bad ablation is validated directly below
-            manifest = sb.validate_manifest(p)
-            repo_root = sb.repo_root_for_manifest(p)
-            with self.assertRaises(sb.AblationError):
-                sb.ValidatedAblation.validate(repo_root, manifest, bad)
-
     def test_materialize_only_takes_a_validated_ablation_and_yields_an_arm(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -2341,23 +2150,11 @@ class ValidatedAblationTests(unittest.TestCase):
             manifest = sb.validate_manifest(p)
             repo_root = sb.repo_root_for_manifest(p)
             validated = sb.ValidatedAblation.validate(repo_root, manifest, SECTION_ABL)
-            self.assertIs(validated.population, am.Population.ANSWER)
+            self.assertIs(validated.population, CasePopulation.ANSWER)
             ma = sb.materialize(validated, root / "out")
             self.assertIsInstance(ma, am.MaterializedArm)
             self.assertTrue(ma.arm.identity.is_edited)             # a real edit happened
             self.assertEqual(ma.arm.provenance.mode, "materialized")
-
-    def test_typed_path_and_legacy_facade_agree(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            p = repo(root, [SECTION_ABL])
-            manifest = sb.validate_manifest(p)
-            repo_root = sb.repo_root_for_manifest(p)
-            typed = sb.materialize(sb.ValidatedAblation.validate(repo_root, manifest, SECTION_ABL), root / "a").as_legacy_dict()
-            legacy = sb.materialize_ablation(repo_root, manifest, SECTION_ABL, root / "b")
-            keys = ("id", "mode", "population", "skill_hash", "parent_skill_hash", "components")
-            self.assertEqual({k: typed[k] for k in keys}, {k: legacy[k] for k in keys})
-
 
 class AblationRecordTests(unittest.TestCase):
     """Move B: 'an ablation record on a row' is a CLOSED set of typed shapes, not an
@@ -2374,7 +2171,7 @@ class AblationRecordTests(unittest.TestCase):
         sim = am.ablation_record_from_dict({"id": "x", "mode": "instruction_simulated", "population": "answer"})
         self.assertIsInstance(mat, am.Provenance)
         self.assertIsInstance(sim, am.InstructionSimulated)
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "unknown ablation record mode"):
             am.ablation_record_from_dict({"id": "x", "mode": "make-believe"})   # no third inhabitant
 
     def test_instruction_simulated_is_not_a_provenance(self):
@@ -2391,104 +2188,6 @@ class AblationRecordTests(unittest.TestCase):
         # The prepared-row form is exactly {id, mode, population} — unchanged shape.
         self.assertEqual(am.InstructionSimulated(id="a", population="answer").as_dict(),
                          {"id": "a", "mode": "instruction_simulated", "population": "answer"})
-
-
-class PreparedTaskTests(unittest.TestCase):
-    """Move C: the prepared row OWNS blinding. The only model-facing variant comes
-    from its Arm, so a blind arm cannot leak the hypothesis no matter which exporter
-    reads it — and the two DISTINCT blinds are both honored: the experiment-blind
-    (materialized -> present as with_skill) and the path-hygiene blind (any ablation
-    -> opaque upload token)."""
-
-    def test_draft_can_be_partial_but_execution_validation_is_strict(self):
-        draft = am.PreparedTaskDraft.from_row({"variant": "with_skill", "prompt": "review"})
-        self.assertEqual(draft.prompt, "review")
-        with self.assertRaises(ValueError):
-            draft.validate()
-
-    def test_invalid_execution_rows_are_unconstructible(self):
-        base = {
-            "case_id": "c", "split": "tune", "kind": "behavior", "variant": "with_skill",
-            "run_number": 1, "skill_name": "s", "repo_root": "/repo",
-            "skill_paths": ["skills/s/SKILL.md"], "input_files": [],
-            "run_dir": "c/with_skill/run-1", "instruction": "", "prompt": "p", "tags": [],
-        }
-        with self.assertRaisesRegex(ValueError, "missing run_number"):
-            am.PreparedTask.from_row({key: value for key, value in base.items() if key != "run_number"})
-        mutations = [
-            {"case_id": ""}, {"split": "other"}, {"kind": "trigger"}, {"variant": "unknown"},
-            {"run_number": 0}, {"run_number": True}, {"run_number": "1"},
-            {"run_dir": "../escape"}, {"run_dir": "/absolute"}, {"run_dir": "."},
-            {"skill_paths": "not-a-list"},
-        ]
-        for mutation in mutations:
-            with self.subTest(mutation=mutation), self.assertRaises((TypeError, ValueError)):
-                am.PreparedTask.from_row({**base, **mutation})
-        with self.assertRaises(ValueError):
-            am.PreparedTask.from_row({**base, "variant": "without_skill"})
-
-    def test_materialized_task_rejects_missing_mount_and_mismatched_canonical_hash(self):
-        row = self.mat_row().harness_record()
-        for mutation in ({"skill_paths": []}, {"skill_tree_hash": "OTHER"}, {"skill_tree_hash": None}):
-            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
-                am.PreparedTask.from_row({**row, **mutation})
-
-    def mat_row(self):
-        prov = am.Provenance(id="no-rp", mode="materialized", population="answer",
-                             identity=am.TreeIdentity(canonical="C", edited="E"),
-                             components=(am.Component("instructions", "section", "s", {}),))
-        return am.PreparedTask(case_id="c", split="tune", kind="behavior", variant_truth="ablation:no-rp",
-                               run_number=1, skill_name="good-pr", repo_root="/r", skill_paths=("/m/SKILL.md",),
-                               input_files=(), run_dir="c/ablation:no-rp", instruction="Use the skill under test (good-pr).",
-                               prompt="Review.", tags=(), ablation=prov, skill_tree_hash="C")
-
-    def sim_row(self):
-        sim = am.InstructionSimulated(id="no-rp", population="answer", removed_component="rp")
-        return am.PreparedTask(case_id="c", split="tune", kind="behavior", variant_truth="ablation:no-rp",
-                               run_number=1, skill_name="good-pr", repo_root="/r", skill_paths=("/m/SKILL.md",),
-                               input_files=(), run_dir="c/ablation:no-rp", instruction="...directive...",
-                               prompt="Review.", tags=(), ablation=sim)
-
-    def test_materialized_arm_presents_as_with_skill(self):
-        pt = self.mat_row()
-        self.assertTrue(pt.is_materialized_ablation)
-        self.assertTrue(pt.is_blind)
-        self.assertEqual(pt.model_facing_variant(), "with_skill")             # experiment-blind
-        self.assertEqual(pt.harness_record()["variant"], "ablation:no-rp")    # truth on the row
-
-    def test_instruction_simulated_arm_is_transparent(self):
-        pt = self.sim_row()
-        self.assertFalse(pt.is_materialized_ablation)
-        self.assertFalse(pt.is_blind)
-        self.assertEqual(pt.model_facing_variant(), "ablation:no-rp")         # model is told what to simulate
-
-    def test_upload_token_is_opaque_for_any_ablation(self):
-        for pt in (self.mat_row(), self.sim_row()):
-            tok = pt.upload_token()
-            self.assertNotIn("no-rp", tok)
-            self.assertNotIn("ablation", tok)
-
-    def test_no_model_facing_method_leaks_truth_for_a_blind_arm(self):
-        pt = self.mat_row()
-        for out in (pt.model_facing_variant(), pt.upload_token()):
-            self.assertNotIn("no-rp", out)
-        self.assertIn("no-rp", pt.harness_record()["variant"])               # truth reachable only on the harness side
-
-    def test_round_trips_through_the_row(self):
-        for pt in (self.mat_row(), self.sim_row()):
-            back = am.PreparedTask.from_row(pt.harness_record())
-            self.assertEqual(back.variant_truth, pt.variant_truth)
-            self.assertEqual(type(back.ablation), type(pt.ablation))          # record type survives the round trip
-            self.assertEqual(back.is_blind, pt.is_blind)
-            self.assertEqual(back.harness_record(), pt.harness_record())      # serialization is stable
-
-
-    def test_workspace_and_prompt_helpers_reject_drafts(self):
-        draft = am.PreparedTaskDraft.from_row({"variant": "with_skill"})
-        with tempfile.TemporaryDirectory() as td, self.assertRaises(TypeError):
-            sb.build_skill_workspace(draft, Path(td))
-        with self.assertRaises(TypeError):
-            sb.build_task_prompt(draft)
 
 
 class ConsumersTakeAPreparedTaskTests(unittest.TestCase):
@@ -2520,11 +2219,12 @@ class ConsumersTakeAPreparedTaskTests(unittest.TestCase):
                                instruction="Use the good-pr skill, but simulate this ablation: drop rp.",
                                prompt="Review.", tags=(), ablation=sim)
 
-    def test_codex_prompt_consumes_preparedtask_and_blinds_materialized(self):
-        mat = sb.build_task_prompt(self.mat_pt(), ["skills/root-0/SKILL.md"], [])
-        self.assertNotIn("simulate", mat)                  # materialized arm is blind: no hypothesis text
-        sim = sb.build_task_prompt(self.sim_pt(), ["skills/root-0/SKILL.md"], [])
-        self.assertIn("simulate this ablation", sim)       # instruction-simulated is told what to do
+    def test_workspace_and_prompt_helpers_reject_drafts(self):
+        draft = am.PreparedTaskDraft.from_row({"variant": "with_skill"})
+        with tempfile.TemporaryDirectory() as td, self.assertRaisesRegex(TypeError, "build_skill_workspace requires a validated PreparedTask"):
+            sb.build_skill_workspace(draft, Path(td))
+        with self.assertRaisesRegex(TypeError, "build_task_prompt requires a validated PreparedTask"):
+            sb.build_task_prompt(draft)
 
     def test_safe_task_json_model_visible_variant_is_owned_by_the_object(self):
         mat = sb.safe_task_json(self.mat_pt(), self.MANIFEST, task_name="t", upload_files=[])
@@ -2560,7 +2260,7 @@ class MaterializeCarriesTypedArmTests(unittest.TestCase):
             rows = sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "abl")
             arow = next(r for r in rows if r["variant"] == "ablation:no-rp")
             wrow = next(r for r in rows if r["variant"] == "with_skill")
-            self.assertEqual(set(arow["ablation"]), am.Provenance.SCHEMA_KEYS)
+            self.assertEqual(arow["ablation"], am.Provenance.from_dict(arow["ablation"]).as_dict())   # exactly a Provenance record
             self.assertEqual(wrow["skill_tree_hash"], arow["ablation"]["parent_skill_hash"])   # both arms, same revision
 
 
@@ -2575,19 +2275,11 @@ class OldSkillParityTests(unittest.TestCase):
     OLD = "---\nname: good-pr\ndescription: Review PRs. Use for PRs.\n---\n\n# Old\n\nOLD-MARKER\n"
 
     def repo(self, root: Path):
-        rp = root / "repo"
-        cur = rp / "skills" / "good-pr"; cur.mkdir(parents=True)
-        (cur / "SKILL.md").write_text(self.CUR, encoding="utf-8")
-        old = rp / "old-skills" / "good-pr"; old.mkdir(parents=True)
+        p = make_eval_repo(root, skill_name="good-pr", skill_text=self.CUR, cases=[ANY_CASE],
+                           extra={"old_skill_paths": ["old-skills/good-pr/SKILL.md"]})
+        old = p.parents[1] / "old-skills" / "good-pr"
+        old.mkdir(parents=True)
         (old / "SKILL.md").write_text(self.OLD, encoding="utf-8")
-        (rp / "evals").mkdir()
-        m = {"version": 1, "skill_name": "good-pr",
-             "skill_paths": ["skills/good-pr/SKILL.md"],
-             "old_skill_paths": ["old-skills/good-pr/SKILL.md"],
-             "variants": ["with_skill", "without_skill"],
-             "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}],
-             "ablations": []}
-        p = rp / "evals" / "shared-benchmark.json"; p.write_text(json.dumps(m), encoding="utf-8")
         return p
 
     def old_row(self, p):
@@ -2688,8 +2380,8 @@ class AnswerWorkspaceAttestationTests(unittest.TestCase):
             row = next(item for item in rows if item["variant"] == "with_skill")
             source = Path(row["skill_paths"][0]).parent / "references" / "guide.md"
             source.write_text("changed after prepare\n", encoding="utf-8")
-            with self.assertRaises(SystemExit):
-                sb.build_skill_workspace(sb.PreparedTask.from_row(row), Path(wd))
+            assert_dies(self, lambda: sb.build_skill_workspace(sb.PreparedTask.from_row(row), Path(wd)),
+                        "mounted skill tree hash")
 
     def test_materialized_mount_matches_edited_not_parent_hash(self):
         with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as wd:
@@ -2708,9 +2400,9 @@ class AnswerWorkspaceAttestationTests(unittest.TestCase):
                 row["ablation"]["parent_skill_hash"])
             Path(row["skill_paths"][0]).write_text(
                 "changed after materialization\n", encoding="utf-8")
-            with tempfile.TemporaryDirectory() as changed_wd, self.assertRaises(SystemExit):
-                sb.build_skill_workspace(
-                    sb.PreparedTask.from_row(row), Path(changed_wd))
+            with tempfile.TemporaryDirectory() as changed_wd:
+                assert_dies(self, lambda: sb.build_skill_workspace(sb.PreparedTask.from_row(row), Path(changed_wd)),
+                            "mounted skill tree hash")
 
     def test_answer_runner_persists_recomputed_mount_and_fixture_hashes(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2742,8 +2434,8 @@ class AnswerWorkspaceAttestationTests(unittest.TestCase):
             first.write_text("one", encoding="utf-8")
             second.write_text("two", encoding="utf-8")
             row["input_files"] = [str(first), str(second)]
-            with self.assertRaises(SystemExit):
-                sb.build_skill_workspace(sb.PreparedTask.from_row(row), Path(wd))
+            assert_dies(self, lambda: sb.build_skill_workspace(sb.PreparedTask.from_row(row), Path(wd)),
+                        "input fixture destination collision(s): data.txt")
             self.assertFalse((Path(wd) / "inputs").exists())
 
     def test_jetty_rejects_multi_turn_before_writing_export(self):
@@ -2751,8 +2443,9 @@ class AnswerWorkspaceAttestationTests(unittest.TestCase):
             root = Path(td)
             path = self.manifest(root, multi_turn=True)
             out = root / "jetty.jsonl"
-            with self.assertRaises(SystemExit):
-                sb.export_jetty(argparse.Namespace(manifest=str(path), out=str(out)))
+            code, _, stderr = run_cli("export-jetty", path, "--out", out)
+            self.assertEqual(code, 1)
+            self.assertIn("Jetty export does not support multi-turn prepared tasks", stderr)
             self.assertFalse(out.exists())
 
     def test_jetty_execution_rechecks_attested_upload_bytes(self):
@@ -2760,7 +2453,8 @@ class AnswerWorkspaceAttestationTests(unittest.TestCase):
             root = Path(td)
             path = self.manifest(root)
             out = root / "jetty.jsonl"
-            sb.export_jetty(argparse.Namespace(manifest=str(path), out=str(out)))
+            code, _, stderr = run_cli("export-jetty", path, "--out", out)
+            self.assertEqual(code, 0, stderr)
             payloads = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
             payload = next(
                 item for item in payloads if item["harness"]["variant"] == "with_skill")
@@ -2768,14 +2462,36 @@ class AnswerWorkspaceAttestationTests(unittest.TestCase):
                 item for item in payload["upload_plan"]["files"]
                 if item.get("role") == "skill")
             Path(skill_item["local_path"]).write_text("changed after export\n", encoding="utf-8")
+            client = FakeJettyClient()
 
-            class MustNotUpload:
-                def upload(self, *_args, **_kwargs):
-                    raise AssertionError("attestation failure must precede upload")
-
-            [record] = list(sb.execute_jetty_payloads([payload], client=MustNotUpload()))
+            [record] = list(sb.execute_jetty_payloads([payload], client=client))
             self.assertEqual(record["status"], "failed")
             self.assertIn("changed after attestation", record["error"])
+            self.assertEqual((client.upload_calls, client.submit_calls), (0, 0))
+
+    def test_jetty_plan_rejects_skill_bytes_that_differ_from_the_prepared_tree(self):
+        # The export-time twin of the workspace mount check: the planned skill
+        # upload must hash to the tree recorded at prepare, so a source edited
+        # after prepare never ships under the prepared hash.
+        with tempfile.TemporaryDirectory() as td:
+            path = self.manifest(Path(td))
+            manifest = sb.validate_manifest(path)
+            row = next(item for item in sb.prepared_task_rows(path, manifest)
+                       if item["variant"] == "with_skill")
+
+            def build():
+                return sb.build_jetty_payload(
+                    sb.PreparedTask.from_row(row), manifest, collection="c", task_prefix=None,
+                    agent="claude-code", model="m", model_provider="anthropic", snapshot="s")
+
+            self.assertEqual(build()["harness"]["skill_tree_hash"], row["skill_tree_hash"])
+            source = Path(row["skill_paths"][0]).parent / "references" / "guide.md"
+            source.write_text("changed after prepare\n", encoding="utf-8")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+                build()
+        self.assertIn("Jetty mounted skill tree hash", stderr.getvalue())
+        self.assertIn(f"does not match expected {row['skill_tree_hash']!r}", stderr.getvalue())
 
 
 if __name__ == "__main__":

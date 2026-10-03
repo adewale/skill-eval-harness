@@ -104,6 +104,18 @@ exhaustively adapts the union to artifacts; backends cannot repair or mutate sta
 writing files. `RunnerOutcome` remains only as a strict compatibility factory that constructs one
 of the four variants.
 
+A `Completed` outcome also carries completion evidence in its frozen `OutcomeContext` metadata,
+because an exit-zero answer can still be cut off or come from another model.
+`completion_contracts.py` owns three values: `StopObservation` maps a provider's stop reason into
+the closed `StopClass` (`completed`, `truncated`, `turn_limit`, `refused`, `other`, `unobserved`)
+and keeps the raw value; `ServedModel` compares the reported model with the requested one
+(`match`, `mismatch`, `unverifiable`, `unobserved`, `not-requested`); and `EffortSetting` records
+the requested level or `backend-default`. The shared writer fills `unobserved` and
+`backend-default` when a backend reports nothing, so a run without evidence stays distinct from a
+run that predates the fields. `execution_valid` treats a `truncated` or `turn_limit` stop and a
+served-model `mismatch` as unscorable, so the run blocks its pair; a refusal stays graded and is
+counted in the report's `run_endings` block. *Update (2026-09-30): these values are now spelled `unavailable` (was `unobserved`), `not_requested` (was `not-requested`) and `backend_default` (was `backend-default`), and the served-model check gained `mixed`; [`vocabulary.md`](vocabulary.md#run-artifacts) owns the current values.*
+
 ## Judge invocation results
 
 `judge_contracts.JudgeInvocation` is the immutable process boundary shared by native judge
@@ -250,6 +262,12 @@ BooleanVerdict | ScoredVerdict | DimensionVerdict | DynamicVerdict | ConsensusVe
   serialized as its own verdict kind.
 - Provider output that violates schema or semantic invariants is retained only as diagnostic raw
   payload; both report and strict modes store one valid failed boolean verdict.
+
+Human verdicts cross their own boundary. `human_judgements.HumanJudgement` parses each
+`feedback.json` entry into a run coordinate, an optional judge assertion, a closed
+`pass | fail | unsure` verdict, and a note, and rejects an entry with neither verdict nor note.
+`judge-alignment` derives a label only from a pass/fail verdict on a named assertion, so a run-level
+note or an `unsure` cannot become ground truth.
 
 ## Draft versus executable tasks
 
@@ -405,7 +423,9 @@ observed numeric rate -> UnitRate(0 <= value <= 1)
 
 Answer-population ablation confirmation uses the same exact case/model/repetition pairs, requires
 symmetric named-assertion coverage, and applies a paired sign-flip test to per-pair score deltas.
-Fewer than six unanimous matched pairs cannot clear the two-sided p≤0.05 floor.
+Fewer than six unanimous matched pairs cannot clear the two-sided p≤0.05 floor. The same bound
+drives `effect_estimates.py` for with/without lift: its `interval` inverts the sign-flip test, so on
+the exact path it cannot exclude zero while `significance` fails to reject, and its `noise_check` reports the moved cases and smallest reachable p that explain why.
 
 `ablation_model.py` closes provenance over `AblationMode`, `Population`, `ComponentClass`, and
 `Mechanism`. Strict wire parsers reject unknown strings, booleans masquerading as scalar values,
@@ -414,6 +434,11 @@ populations, and population/component contradictions.
 Mode-specific constructors preserve the distinction between materialized, instruction-simulated,
 and invalid-skill experiments. `MaterializedArm` still requires a genuinely edited tree and matching
 provenance, so a canonical tree cannot be labeled as a materialized removal.
+
+*Note (2026-09-30): `Population` has since been replaced by `manifest_contracts.CasePopulation`, the
+one case-population enum, and the lift test and its interval now share one sign-flip core, so they
+also agree on the sampled path. Since 2026-10-02 the exact path is chosen on the units that moved,
+not the total, and repeated deltas are enumerated as one group.*
 
 ## Test proof
 
@@ -447,6 +472,13 @@ legacy artifact never recorded. In particular:
 - legacy rows may lack revision/configuration provenance even when their case/model/run key is
   present; telemetry comparison remains blocked when its required basis is absent;
 - Jetty aliases and response shapes still need token-backed live validation before production claims;
+- completion evidence exists only where a backend exposes it. Claude records its stop reason and
+  served model; Gemini records its served model but an `unobserved` stop; Codex, Vibe,
+  `run-subagent`, and Jetty imports record `unobserved` for both (now spelled `unavailable`). On
+  every path but Claude's, an answer cut off at an output or turn limit still grades as an
+  ordinary miss. *(2026-10-02: `run-subagent` now records the stop and served model too, from
+  Claude's stream on its default backend or from `stop_class` and `served_models` in an
+  `--agent-cmd` reply; Vibe's stop stays unavailable because its output carries none.)*;
 - `RunnerOutcome` is retained as a compatibility factory, so new code should construct the explicit
   union variants directly;
 - `skill_benchmark.py` remains a shared orchestration monolith, so the conservative trigger identity

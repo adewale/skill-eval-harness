@@ -5,6 +5,9 @@ test_roadmap_features, test_followup_features, test_external_review_gaps,
 test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
+import contextlib
+import functools
+import io
 import json
 import os
 import sys
@@ -13,7 +16,11 @@ import unittest
 from pathlib import Path
 
 from helpers import (
+    assert_dies,
     attest_answer_design,
+    judge_with_scores,
+    judge_with_stub,
+    run_cli,
     trace_event,
     write_run,
 )
@@ -416,35 +423,44 @@ class GradedScoringSeverityTests(unittest.TestCase):
         self.assertTrue(significant["significant_at_0_05"])
         self.assertEqual(flat["p_value"], 1.0)
         self.assertGreater(mixed["p_value"], 0.05)
-
-    def test_sign_flip_sampled_is_deterministic(self):
-        deltas = [0.1 * (1 if i % 3 else -1) for i in range(20)]
-        self.assertEqual(sb.sign_flip_significance(deltas), sb.sign_flip_significance(deltas))
-        self.assertEqual(sb.sign_flip_significance(deltas)["method"], "sign-flip-sampled")
+        # A sub-millionth regression is still a regression: the zero-delta
+        # tolerance must not swallow it.
+        tiny = sb.sign_flip_significance([2_999_999 / 3_000_000 - 1.0] * 6)
+        self.assertLess(tiny["observed_mean_delta"], 0)
+        self.assertTrue(tiny["significant_at_0_05"])
 
     def test_sampled_sign_flip_is_order_invariant_and_conservative_at_gate(self):
-        # The deterministic Monte-Carlo point estimate is below .05, while
-        # exact enumeration is just above it.  A point-estimate gate would
-        # therefore manufacture a causal confirmation.
+        # Exact enumeration is just above .05, so no sample settles the
+        # decision: the sampled test draws more patterns while its bounds
+        # straddle .05, stops at its cap of 2**18, and still decides on the
+        # upper bound. A point-estimate gate, which the first 4,096 patterns
+        # put below .05, would manufacture a causal confirmation.
+        # These 15 are exact by default (tenths, so their pattern sums are
+        # whole numbers of tenths), so a 2**0 budget puts them on the sampled
+        # path.
         deltas = [-1, -.9, -.6, .5, .1, -.5, .4, .4, -.1, .4,
                   -.4, -1, -.8, -.6, -.6]
-        sampled = sb.sign_flip_significance(deltas)
-        reversed_sampled = sb.sign_flip_significance(list(reversed(deltas)))
+        sampled = sb.sign_flip_significance(deltas, max_exact_n=0)
+        reversed_sampled = sb.sign_flip_significance(list(reversed(deltas)), max_exact_n=0)
         exact = sb.sign_flip_significance(deltas, max_exact_n=20)
+        self.assertEqual(sb.sign_flip_significance(deltas), exact)
+        self.assertEqual(sampled["method"], "sign-flip-sampled")
+        # Equal across two calls on reordered input: the sample is seeded
+        # (a re-grade stays byte-identical) and independent of case order.
         self.assertEqual(sampled, reversed_sampled)
         self.assertAlmostEqual(exact["p_value"], 0.05010986328125)
-        self.assertLess(sampled["p_value"], 0.05)  # point estimate alone is unsafe
+        self.assertEqual(sampled["sampled_patterns"], 2 ** 18)
+        self.assertAlmostEqual(sampled["p_value"], exact["p_value"], delta=0.002)
         self.assertGreater(sampled["p_value_upper_bound"], 0.05)
         self.assertFalse(sampled["significant_at_0_05"])
 
-    def test_inference_rates_keep_sub_millionth_regressions(self):
-        baseline = sb._exact_rate(3_000_000, 3_000_000)
-        ablation = sb._exact_rate(2_999_999, 3_000_000)
-        delta = ablation - baseline
-        self.assertLess(delta, 0)
-        result = sb.sign_flip_significance([delta] * 6)
-        self.assertLess(result["observed_mean_delta"], 0)
-        self.assertTrue(result["significant_at_0_05"])
+    def test_sampled_sign_flip_p_is_never_exact_zero(self):
+        # (b+1)/(m+1): the observed sign pattern is itself a valid permutation,
+        # so a sampled p can never be an impossible 0.0, even when no sampled
+        # pattern reaches the observed mean.
+        result = sb.sign_flip_significance([0.5] * 20, max_exact_n=4)
+        self.assertEqual(result["method"], "sign-flip-sampled")
+        self.assertAlmostEqual(result["p_value"], 1 / 4097)
 
     def test_paired_summary_carries_significance_and_graded_channel(self):
         results = []
@@ -460,6 +476,22 @@ class GradedScoringSeverityTests(unittest.TestCase):
         self.assertEqual(paired["significance"]["n"], 3)
         self.assertAlmostEqual(paired["graded"]["delta"], 0.6)
         self.assertIn("significance", paired["graded"])
+
+    def test_a_graded_score_no_pair_can_use_is_reported_not_dropped(self):
+        # A plain soft judge that answers on a 1-5 scale records graded_score
+        # 5.0, outside the channel's 0-1 range. The channel must say it is
+        # partial and why, not vanish while the report reads complete.
+        results = []
+        for case_id in ["c1", "c2", "c3"]:
+            for variant, graded in [("with_skill", 5.0), ("without_skill", 0.0)]:
+                results.append({
+                    "case_id": case_id, "variant": variant, "run_number": 1, "missing_output": False,
+                    "execution_valid": True, "objective_pass_rate": 1.0, "graded_score": graded, "metadata": {},
+                })
+        graded = sb.build_paired_summary(results)["graded"]
+        self.assertEqual(graded["availability"], "partial")
+        self.assertIsNone(graded["delta"])
+        self.assertEqual(graded["pairing"]["blocked_reason_counts"], {"invalid_graded_score": 3})
 
     def test_validation_rejects_bad_shapes(self):
         bad_shapes = [
@@ -496,6 +528,180 @@ class GradedScoringSeverityTests(unittest.TestCase):
         self.assertEqual(result["objective_pass_rate"], 1.0)
         self.assertEqual(result["combined_pass_rate"], 1.0)
         self.assertEqual(result["deferred_judge_tasks"], 1)
+
+    def test_a_judge_without_a_verdict_keeps_the_runs_and_the_lift_partial(self):
+        # A gate judge with no verdict is deferred, not graded: every run's
+        # grading stays partial and the benchmark withholds the paired lift,
+        # keeping the objective-only delta as observed, until verdicts arrive.
+        manifest = base_manifest()
+        manifest["cases"][0]["assertions"].append(
+            {"name": "quality", "type": "judge", "severity": "gate", "rubric": ["complete"]})
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = write_manifest(root, manifest)
+            runs, out = root / "runs", root / "benchmark.json"
+            write_run(runs / "case-1" / "with_skill", "alpha")
+            write_run(runs / "case-1" / "without_skill", "none")
+            attest_answer_design(path, runs)
+            code, _, stderr = run_cli(
+                "benchmark", str(path), "--runs", str(runs), "--out", str(out))
+            report = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(len(report["deferred_judge_tasks"]), 2)
+        self.assertEqual(report["incomplete_reasons"], ["deferred_judge_verdicts"])
+        self.assertEqual([row["grading_availability"] for row in report["results"]],
+                         ["partial", "partial"])
+        paired = report["paired_summary"]
+        self.assertEqual(paired["availability"], "partial")
+        self.assertEqual(paired["design_coverage_reason"], "grading_evidence_incomplete")
+        self.assertIsNone(paired["absolute_delta"])
+        self.assertEqual(paired["observed_absolute_delta"], 1.0)
+
+    def test_a_critical_judge_veto_on_a_judge_only_case_is_reported(self):
+        # A case gated only by a critical judge has no objective assertion.
+        # A failed verdict vetoes the run, which must zero its combined rate
+        # and leave its objective rate not applicable; a vetoed run once read
+        # objective 0.0 beside objective_total 0, and the report refused it.
+        manifest = base_manifest()
+        manifest["cases"][0]["assertions"] = [
+            {"name": "quality", "type": "judge", "severity": "critical",
+             "rubric": ["Names the third Greek letter"]}]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = write_manifest(root, manifest)
+            runs, out = root / "runs", root / "benchmark.json"
+            write_run(runs / "case-1" / "with_skill", "gamma")
+            write_run(runs / "case-1" / "without_skill", "none")
+            attest_answer_design(path, runs)
+            verdicts = judge_with_stub(path, runs, root / "verdicts.jsonl", passes_on="gamma")
+            code, _, stderr = run_cli("benchmark", path, "--runs", runs,
+                                      "--judge-results", verdicts, "--out", out)
+            self.assertEqual(code, 0, stderr)
+            report = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(report["availability"], "complete")
+        self.assertEqual([(row["variant"], row["vetoed"], row["objective_pass_rate"],
+                           row["combined_pass_rate"]) for row in report["results"]],
+                         [("with_skill", False, None, 1.0), ("without_skill", True, None, 0.0)])
+
+    @staticmethod
+    def scaled_judge(**fields):
+        return {"name": "craft", "type": "judge", "rubric": ["5 = polished; 1 = careless"],
+                **fields}
+
+    def test_validate_refuses_a_score_scale_it_cannot_normalise(self):
+        refusals = [
+            ({"score_scale": [5, 1]}, "score_scale must be [low, high]"),
+            ({"score_scale": [3, 3]}, "score_scale must be [low, high]"),
+            ({"score_scale": [1]}, "score_scale must be [low, high]"),
+            ({"score_scale": [1, "5"]}, "score_scale must be [low, high]"),
+            ({"score_scale": [True, 5]}, "score_scale must be [low, high]"),
+            ({"score_scale": "1-5"}, "score_scale must be [low, high]"),
+            ({"score_scale": [1, 5], "threshold": 6}, "threshold must lie on its score_scale [1, 5]"),
+            ({"score_scale": [1, 5], "atLeast": 0.5}, "score_scale cannot combine with atLeast"),
+            ({"score_scale": [1, 5],
+              "graded_dimensions": [{"name": "d", "rubric": "5 = good; 1 = bad"}]},
+             "score_scale cannot combine with graded_dimensions"),
+        ]
+        for fields, message in refusals:
+            manifest = base_manifest()
+            manifest["cases"][0]["assertions"].append(self.scaled_judge(**fields))
+            with self.subTest(fields=fields), tempfile.TemporaryDirectory() as td:
+                code, _, stderr = run_cli("validate", write_manifest(Path(td), manifest))
+                self.assertEqual(code, 1)
+                self.assertIn(message, stderr)
+        manifest = base_manifest()
+        manifest["cases"][0]["assertions"].append(self.scaled_judge(score_scale=[1, 5], threshold=4))
+        with tempfile.TemporaryDirectory() as td:
+            code, _, stderr = run_cli("validate", write_manifest(Path(td), manifest))
+        self.assertEqual(code, 0, stderr)
+
+    def test_a_judge_on_its_own_scale_feeds_the_graded_channel(self):
+        # A soft judge answering 1-5 declares score_scale [1, 5]: its score is
+        # normalised to 0-1 for the graded channel, (score - 1) / 4, while pass
+        # or fail still compares the raw score with threshold 4.
+        raw = {"c1": (5, 2), "c2": (4, 4), "c3": (5, 1)}   # case -> (with, without)
+        cases = [{"id": cid, "split": "tune", "kind": "behavior", "prompt": "Do the task.",
+                  "assertions": [{"name": "has-alpha", "type": "contains", "value": "alpha"},
+                                 self.scaled_judge(score_scale=[1, 5], threshold=4)]}
+                 for cid in raw]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = write_manifest(root, base_manifest(cases=cases))
+            runs, out = root / "runs", root / "benchmark.json"
+            for cid, scores in raw.items():
+                for variant, score in zip(("with_skill", "without_skill"), scores):
+                    write_run(runs / cid / variant, f"alpha mark-{cid}-{variant}")
+            attest_answer_design(path, runs)
+            verdicts = judge_with_scores(path, runs, root / "verdicts.jsonl", scores={
+                f"mark-{cid}-{variant}": score for cid, scores in raw.items()
+                for variant, score in zip(("with_skill", "without_skill"), scores)})
+            code, _, stderr = run_cli("benchmark", path, "--runs", runs,
+                                      "--judge-results", verdicts, "--out", out)
+            self.assertEqual(code, 0, stderr)
+            report = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(report["availability"], "complete")
+        judged = {(row["case_id"], row["variant"]): row["qualitative_assertions"][0]
+                  for row in report["results"]}
+        self.assertEqual({key: (entry["passed"], entry["raw_score"], entry["score"])
+                          for key, entry in judged.items()}, {
+            ("c1", "with_skill"): (True, 5.0, 1.0), ("c1", "without_skill"): (False, 2.0, 0.25),
+            ("c2", "with_skill"): (True, 4.0, 0.75), ("c2", "without_skill"): (True, 4.0, 0.75),
+            ("c3", "with_skill"): (True, 5.0, 1.0), ("c3", "without_skill"): (False, 1.0, 0.0),
+        })
+        graded = report["paired_summary"]["graded"]
+        self.assertEqual(graded["availability"], "complete")
+        # Normalised deltas 0.75, 0 and 1: mean 1.75 / 3.
+        self.assertEqual(graded["delta"], round(1.75 / 3, 4))
+        self.assertEqual(graded["with_skill_mean_score"], round(2.75 / 3, 4))
+        self.assertEqual(graded["without_skill_mean_score"], round(1.0 / 3, 4))
+
+    def test_a_score_off_the_declared_scale_is_refused_as_a_parse_error(self):
+        manifest = base_manifest()
+        manifest["cases"][0]["assertions"].append(
+            self.scaled_judge(score_scale=[1, 5], threshold=4))
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = write_manifest(root, manifest)
+            runs = root / "runs"
+            write_run(runs / "case-1" / "with_skill", "alpha high")
+            write_run(runs / "case-1" / "without_skill", "alpha none")
+            attest_answer_design(path, runs)
+            verdicts = judge_with_scores(path, runs, root / "verdicts.jsonl",
+                                         scores={"alpha high": 7, "alpha none": 1})
+            rows = {json.loads(line)["variant"]: json.loads(line)
+                    for line in verdicts.read_text(encoding="utf-8").splitlines()}
+        self.assertEqual(rows["with_skill"]["availability"], "partial")
+        self.assertFalse(rows["with_skill"]["passed"])
+        self.assertIn("score in [1, 5] (score_scale)", rows["with_skill"]["evidence"])
+        self.assertEqual((rows["without_skill"]["availability"], rows["without_skill"]["passed"],
+                          rows["without_skill"]["score"]), ("complete", False, 1))
+
+    def test_a_scaled_panel_verdict_keeps_the_panels_pass(self):
+        # A panel folds its members by majority or --quorum, so its median
+        # score can clear the threshold while the panel fails: three judges
+        # scoring 5, 5 and 2 at quorum 3. Normalising the score must not
+        # re-decide the pass from the median.
+        assertion = self.scaled_judge(score_scale=[1, 5], threshold=4)
+        panel = {"verdict_kind": "consensus", "passed": False, "score": 5.0}
+        entry = sb.merged_qualitative_entry(assertion, panel, "j")
+        self.assertEqual((entry["passed"], entry["score"], entry["raw_score"]), (False, 1.0, 5.0))
+
+    def test_an_at_least_panel_verdict_keeps_the_panels_pass(self):
+        # A panel at --quorum 3 scoring 0.9, 0.9 and 0.2 against atLeast 0.8
+        # fails, though its median (0.9) clears 0.8. Grading must keep the
+        # panel's fail; a single judge's pass is still its score against atLeast.
+        assertion = {"name": "craft", "type": "judge", "atLeast": 0.8,
+                     "rubric": ["names the first Greek letter"]}
+        cases = [
+            ({"verdict_kind": "consensus", "passed": False, "score": 0.9}, (False, 0.9)),
+            ({"verdict_kind": "consensus", "passed": True, "score": 0.9}, (True, 0.9)),
+            ({"passed": True, "score": 0.9, "threshold": 0.8}, (True, 0.9)),
+            ({"passed": False, "score": 0.7, "threshold": 0.8}, (False, 0.7)),
+        ]
+        for judged, expected in cases:
+            with self.subTest(judged=judged):
+                entry = sb.merged_qualitative_entry(assertion, judged, "j")
+                self.assertEqual((entry["passed"], entry["score"]), expected)
 
 
 class SimilarityScorerTests(unittest.TestCase):
@@ -947,30 +1153,18 @@ class ReviewFixRegressionTests(unittest.TestCase):
         report = {"skill_name": "d", "summary": {}, "paired_summary": {}, "case_flags": [], "results": [result]}
         self.assertIn('failures="1"', sb.junit_xml_from_report(report))
 
-    def test_p2_tool_call_matches_normalized_tool_call_events(self):
-        events = {"schema_version": 2, "source": "subagent", "events": [
-            {"type": "tool_call", "name": "Read", "input_summary": "skills/demo/refs.md", "status": "completed"},
-            {"type": "tool_call", "name": "WebSearch", "input_summary": "query", "status": "in_progress"},
-        ]}
-        with tempfile.TemporaryDirectory() as td:
-            base = Path(td)
-            (base / "output.md").write_text("t", encoding="utf-8")
-            (base / "events.json").write_text(json.dumps(events), encoding="utf-8")
-            hit = sb.assertion_result({"type": "tool_call", "tool": "Read"}, "t", base / "output.md", run_base=base)
-            in_progress_only = sb.assertion_result({"type": "tool_call", "tool": "WebSearch"}, "t", base / "output.md", run_base=base)
-        self.assertTrue(hit["passed"], hit["evidence"])
-        self.assertFalse(in_progress_only["passed"])   # a started-but-unfinished call is not a call that ran
-
     def test_p2_turn_assertions_are_validated(self):
         manifest = base_manifest()
         manifest["cases"] = [{
             "id": "conv", "split": "tune", "kind": "behavior",
             "turns": [{"prompt": "ask", "assertions": [{"type": "no_such_type", "value": "x"}]}],
         }]
+        stderr = io.StringIO()
         with tempfile.TemporaryDirectory() as td:
             path = write_manifest(Path(td), manifest)
-            with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
                 sb.validate_manifest(path)
+        self.assertIn("conv: turn #1 assertion #0 has unsupported type 'no_such_type'", stderr.getvalue())
 
 
 class AssertionDependenciesTests(unittest.TestCase):
@@ -989,36 +1183,42 @@ class AssertionDependenciesTests(unittest.TestCase):
     def test_shape_rejected(self):
         p = Path("x")
         for bad in ([], 5, ["ok", 1], ""):
-            with self.assertRaises(SystemExit):
-                sb.validate_case_assertion("c", "a", 0, {"type": "contains", "value": "x", "depends_on": bad}, p)
+            with self.subTest(depends_on=bad):
+                assertion = {"type": "contains", "value": "x", "depends_on": bad}
+                assert_dies(self, functools.partial(sb.validate_case_assertion, "c", "a", 0, assertion, p),
+                            "depends_on must be a non-empty string or non-empty list of non-empty strings")
         sb.validate_case_assertion("c", "a", 0, {"type": "contains", "value": "x", "depends_on": "pre"}, p)   # ok
 
     def test_scope_unknown_ambiguous_and_cycle_rejected(self):
         p = Path("x")
         A = lambda **kw: {"type": "contains", "value": "x", **kw}
-        with self.assertRaises(SystemExit):   # unknown target
-            sb.validate_depends_on_scope("c", [A(name="dep", depends_on="missing")], p)
-        with self.assertRaises(SystemExit):   # self-cycle
-            sb.validate_depends_on_scope("c", [A(name="a", depends_on="a")], p)
-        with self.assertRaises(SystemExit):   # 2-cycle
-            sb.validate_depends_on_scope("c", [A(name="a", depends_on="b"), A(name="b", depends_on="a")], p)
-        with self.assertRaises(SystemExit):   # ambiguous target (duplicate label)
-            sb.validate_depends_on_scope("c", [A(name="pre"), A(name="pre", value="y"), A(name="dep", depends_on="pre")], p)
+        for label, assertions, message in (
+            ("unknown target", [A(name="dep", depends_on="missing")],
+             "depends_on unknown assertion 'missing'"),
+            ("self-cycle", [A(name="a", depends_on="a")], "depends_on cycle involving 'a'"),
+            ("2-cycle", [A(name="a", depends_on="b"), A(name="b", depends_on="a")],
+             "depends_on cycle involving 'a'"),
+            ("ambiguous target", [A(name="pre"), A(name="pre", value="y"), A(name="dep", depends_on="pre")],
+             "depends_on ambiguous label 'pre'"),
+        ):
+            with self.subTest(label):
+                assert_dies(self, functools.partial(sb.validate_depends_on_scope, "c", assertions, p), message)
         sb.validate_depends_on_scope("c", [A(name="pre"), A(name="dep", depends_on="pre")], p)   # valid graph
 
     def test_turn_depends_on_rejected_at_validate(self):
+        manifest = base_manifest()
+        manifest["cases"] = [{
+            "id": "c", "split": "tune", "kind": "behavior",
+            "turns": [{"prompt": "p", "assertions": [
+                {"name": "t", "type": "contains", "value": "x", "depends_on": "other"}]}],
+        }]
+        stderr = io.StringIO()
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            (root / "repo" / "skill").mkdir(parents=True)
-            (root / "repo" / "skill" / "SKILL.md").write_text("---\nname: d\ndescription: D\n---\n", encoding="utf-8")
-            (root / "repo" / "evals").mkdir()
-            p = root / "repo" / "evals" / "shared-benchmark.json"
-            p.write_text(json.dumps({"version": 1, "skill_name": "d", "skill_paths": ["skill/SKILL.md"],
-                "variants": ["with_skill", "without_skill"], "ablations": [],
-                "cases": [{"id": "c", "split": "tune", "kind": "behavior",
-                           "turns": [{"prompt": "p", "assertions": [{"name": "t", "type": "contains", "value": "x", "depends_on": "other"}]}]}]}), encoding="utf-8")
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(p)
+            path = write_manifest(Path(td), manifest)
+            with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+                sb.validate_manifest(path)
+        self.assertIn("c: turn #1 assertion #0 depends_on is not supported in turn assertions",
+                      stderr.getvalue())
 
     # --- grading ---
     def test_dependent_counted_when_prereq_passes(self):
@@ -1231,28 +1431,24 @@ class ToolCallValidationTests(unittest.TestCase):
         self._validate({"type": "tool_call", "order": ["Read", "Edit"]})
         self._validate({"type": "tool_call", "tool": "Read"})                                # legacy pattern/count path
 
-    def test_rejects_multiple_selectors(self):
-        with self.assertRaises(SystemExit):
-            self._validate({"type": "tool_call", "required_calls": ["Read"], "call_set": ["Read"]})
-        with self.assertRaises(SystemExit):
-            self._validate({"type": "tool_call", "expected_no_call": True, "required_calls": ["Read"]})
-
-    def test_rejects_bad_list_types(self):
-        for bad in ("Read", [], [1, 2], ["ok", 3]):
-            with self.assertRaises(SystemExit):
-                self._validate({"type": "tool_call", "required_calls": bad})
-
-    def test_rejects_non_bool_expected_no_call(self):
-        with self.assertRaises(SystemExit):
-            self._validate({"type": "tool_call", "expected_no_call": "false"})   # the string footgun
-        with self.assertRaises(SystemExit):
-            self._validate({"type": "tool_call", "expected_no_call": 1})
-
-    def test_rejects_invalid_regex_in_pattern_or_order(self):
-        with self.assertRaises(SystemExit):
-            self._validate({"type": "tool_call", "pattern": "["})
-        with self.assertRaises(SystemExit):
-            self._validate({"type": "tool_call", "order": ["ok", "("]})
+    def test_malformed_tool_calls_are_rejected_by_their_guard(self):
+        multiple = "tool_call sets multiple selectors"
+        not_a_list = "tool_call required_calls must be a non-empty list of non-empty strings"
+        not_a_bool = "tool_call expected_no_call must be true or false"
+        for fields, message in (
+            ({"required_calls": ["Read"], "call_set": ["Read"]}, f"{multiple} ['required_calls', 'call_set']"),
+            ({"expected_no_call": True, "required_calls": ["Read"]}, f"{multiple} ['expected_no_call', 'required_calls']"),
+            ({"required_calls": "Read"}, not_a_list),
+            ({"required_calls": []}, not_a_list),
+            ({"required_calls": [1, 2]}, not_a_list),
+            ({"required_calls": ["ok", 3]}, not_a_list),
+            ({"expected_no_call": "false"}, not_a_bool),   # the string footgun
+            ({"expected_no_call": 1}, not_a_bool),
+            ({"pattern": "["}, "tool_call invalid regex '['"),
+            ({"order": ["ok", "("]}, "tool_call invalid regex '('"),
+        ):
+            with self.subTest(fields=fields):
+                assert_dies(self, functools.partial(self._validate, {"type": "tool_call", **fields}), message)
 
     def test_literal_name_selectors_are_not_regex_validated(self):
         # required_calls/call_set are exact tool NAMES, so a regex-special name is fine

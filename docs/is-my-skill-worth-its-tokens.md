@@ -1,23 +1,32 @@
 # Is my skill worth its tokens?
 
 Every skill you ship rides in the model's context on every request that loads it —
-the `SKILL.md`, its frontmatter, and whichever `references/` it pulls in. That is a
-standing cost paid on every run, forever. The naive version of the question wants one
-number ("my skill adds 9 KB, is that OK?"), but 9 KB is only the *bill*; whether it is
-*worth* it is the bill weighed against the **lift** those tokens buy — the with-skill
-minus without-skill pass-rate delta from the same paired cases the benchmark already
-runs. A skill that adds 4 KB and lifts nothing is worse than one that adds 12 KB and
-turns a 0.2 pass rate into 0.9. So the question is not "how big is it" but "what is the
+the `SKILL.md`, its frontmatter, and whichever `references/` it pulls in. That text is
+the visible cost and usually the smaller one. Once it sits in a cached prefix, later
+requests read it at about a tenth of the fresh-input price, and the cost-reduction
+guide that `/claude-api hillclimb` follows (in the claude-api skill) measured that
+"cost scales with extra actions triggered, not prompt length." The larger term is what
+the skill makes the model *do*: the extra tool calls, file reads, and output tokens a
+with-skill run spends beyond its without-skill pair. The naive version of the question
+wants one number ("my skill adds 9 KB, is that OK?"), but 9 KB is only part of the
+*bill*; whether it is *worth* it is the bill weighed against the **lift** those tokens
+buy — the with-skill minus without-skill pass-rate delta from the same paired cases
+the benchmark already runs. A skill that adds 4 KB and lifts nothing is worse than one
+that adds 12 KB and turns a 0.2 pass rate into 0.9. So the question is not "how big is it" but "what is the
 lift per token, and is any of that footprint buying nothing?"
 
 That splits into two measurements, and they need different evidence:
 
 - **Static footprint** is deterministic and free — no model, no run. `profile-skill`
-  counts it. This is the numerator's denominator: the tokens you pay unconditionally.
-- **Runtime lift and dollar cost** need real runs with telemetry. `token-overhead`
-  joins the static footprint to the measured objective lift and (when the runner
-  recorded it) the dollar delta; `cost-summary` rolls up spend across a whole suite.
-  These are only as real as the token/cost numbers your runner actually wrote.
+  counts it: the text every loading request carries, usually the smaller term once
+  cached.
+- **Runtime lift and dollar cost** need real runs with telemetry, and they hold the
+  larger term. `token-overhead` joins the static footprint to the measured objective
+  lift, the with-minus-without total-token delta, and (when the runner recorded it)
+  the dollar delta; `cost-summary` rolls up spend across a whole suite; the
+  benchmark's `trajectory_diff` shows where the extra spend went, as per-case
+  `tool_calls`, `file_reads`, and `commands` deltas. These are only as real as the
+  token/cost numbers and traces your runner actually wrote.
 
 ## Run the static half offline
 
@@ -58,26 +67,33 @@ reference that has quietly grown past its keep shows up here before you pay for 
 ## Run the runtime half — and see why the demo can't fake it
 
 Now join footprint to lift. `token-overhead` reads the same paired runs the benchmark
-graded and reports lift-per-token and lift-per-dollar per skill:
+graded and reports lift-per-token and lift-per-dollar per skill. The demo's cases carry judge
+assertions, so pass the verdicts the demo README's `judge` step wrote; without them the lift
+is withheld as partial coverage:
 
 ```bash
 python3 ../../skill_benchmark.py token-overhead evals/shared-benchmark.json \
-  --runs /tmp/demo-runs --format markdown
+  --runs /tmp/demo-runs --judge-results /tmp/demo-judge.jsonl --format markdown
 ```
 
-Real output against the offline stub runs (2026-07-05):
+Real output against the offline stub runs (2026-10-02, six repeats per arm; the summary
+table, before the per-case pairs):
 
 ```text
 # Token overhead report
 
-| Skill | Static SKILL tokens | Reference tokens | Runtime pairs | Mean total delta | ... | Mean cost delta USD | Lift per $ | Saturated/no-lift cost USD |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| demo-reviewer | 144 | 51 | 0 | None | ... | None | None | 0 |
+| Skill | Static SKILL tokens | Reference tokens | Runtime pairs | Mean total delta | Median total delta | Mean input delta | Mean objective lift | Lift per 1k total tokens | Mean cost delta USD | Lift per $ | Saturated/no-lift cost USD |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| demo-reviewer | 144 | 51 | 12 | — | — | — | 1.0 | — | — | — | 0.0 |
 ```
 
-**Runtime pairs 0, every delta `None`.** That is not a bug — it is the honest shape of
-the offline demo. The deterministic stub stands in for a model, so it writes no token
-or dollar telemetry. `cost-summary` says the same thing out loud:
+**Twelve runtime pairs and a lift of 1.0, but every token and cost delta is `—`** (the
+JSON report holds `null` there). The
+lift is real arithmetic over the stub's answers; the deltas are missing because the stub
+stands in for a model and has no tokens to report. Each run's trace-normalized usage block
+reads zero, and a zero-token basis cannot divide a lift, so each pair's token comparison
+is blocked with reason `basis_missing` and the lift-per-dollar status reads `missing_left`.
+`cost-summary` shows the same split:
 
 ```bash
 python3 ../../skill_benchmark.py cost-summary \
@@ -86,22 +102,24 @@ python3 ../../skill_benchmark.py cost-summary \
 
 ```json
 "coverage": {
-  "runs_seen": 8,
-  "runs_with_token_usage": 0,
+  "runs_seen": 48,
+  "runs_with_token_usage": 48,
   "runs_with_dollar_cost": 0,
-  "runs_missing_usage": 8,
-  "runs_missing_cost": 8
+  "runs_with_non_usd_cost": 0,
+  "runs_missing_usage": 0,
+  "runs_missing_cost": 48
 }
 ```
 
-Eight runs on disk, zero carrying usage or cost. The harness records this as `source:
-"missing"` in each run's `metadata.json` rather than silently reporting `0` — a missing
-number and a zero number are different claims, and the ledger keeps them apart.
+All 48 runs (two cases, four arms, six repeats) carry a usage block, and none carries a
+dollar cost. The harness records the missing cost as `source: "missing"` in each run's
+`metadata.json` rather than reporting `0`: a missing number and a zero number are
+different claims, and the ledger keeps them apart.
 
 To get real runtime numbers, run the same cases through a runner that captures
 telemetry. `run-claude` parses the `claude -p` JSON envelope and records
 `usage_normalized` / `cost_normalized`; the Pi smoke runner does the same. Re-run
-`token-overhead` / `cost-summary` against *those* runs and the `None`s become the deltas
+`token-overhead` / `cost-summary` against *those* runs and the `—` cells become the deltas
 below.
 
 ## Reading the numbers, symptom by symptom
@@ -118,9 +136,23 @@ Once the runtime pairs are real, read the row for the keep/trim/cut decision:
   USD` totals exactly the spend on cases that bought no lift — that column is the
   trim list.
 - **Large `Reference tokens`, small lift** → suspect a reference. `profile-skill`
-  tells you which module carries the bytes; drop it from the skill, re-run, and if the
-  lift holds, the reference was dead weight. (This is a footprint ablation you can do
-  by hand; the [ablation study](ablation-study-walkthrough.md) does the causal version.)
+  tells you which module carries the bytes. Before you drop it and re-run, write down
+  three gates, following the adoption gates in the `/claude-api hillclimb` cost
+  guide: a quality band (the trimmed skill's lift stays within a named distance of
+  the current lift), a cost margin (runtime tokens or dollars fall by more than a
+  named amount), and a mechanism (the saving shows up where you predicted, such as a
+  smaller `file_reads` or `tool_calls` delta in `trajectory_diff`). Cut the reference
+  only when all three pass. A lower bill with no visible mechanism is a confound, and
+  a reference the model rarely read was nearly free, so deleting it may not cut cost
+  at all. (This is a footprint ablation you can do by hand; the [ablation
+  study](ablation-study-walkthrough.md) does the causal version.)
+- **`with_skill` already passes every case** → quality has nowhere left to climb on
+  this suite, so make the objective the same quality at lower cost. The blog post
+  [Automating eval design and hillclimbing with
+  Claude](https://claude.dev/blog/automating-eval-design-and-hillclimbing/) calls cost
+  "one generally strong objective" because you can still pursue it "even if an
+  evaluation is saturated"; the gates above are how you hold quality at parity while
+  you cut.
 - **`audit-manifest --runs <dir>`** folds the same signal into review findings —
   expensive-but-saturated cases, high-cost judge-only cases with no deterministic
   oracle — so the cost view shows up next to the manifest hygiene view.

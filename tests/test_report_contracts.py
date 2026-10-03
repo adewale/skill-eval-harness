@@ -1,5 +1,7 @@
 import unittest
 
+from helpers import result_row
+
 import report_contracts as rc
 import skill_benchmark as sb
 
@@ -77,7 +79,6 @@ class ReportCohortTests(unittest.TestCase):
         self.assertIsInstance(metric, rc.PartialReportCohort)
         self.assertEqual(rc.observed_rates(metric, "objective_pass_rate"), (1.0,))
         self.assertIsNone(rc.headline_value(metric, 1.0))
-        self.assertEqual(rc.diagnostic_rates(metric, "objective_pass_rate"), (1.0,))
 
     def test_not_applicable_metric_is_distinct_from_empty_and_unavailable(self):
         cohort = self.cohort([{"id": "one", "process_pass_rate": None}], {"one"})
@@ -119,28 +120,17 @@ class ReportCohortTests(unittest.TestCase):
         self.assertEqual(summary["scorable_runs"], 0)
 
     @staticmethod
-    def result_row(run_number=1, *, grading="complete", elapsed_ms=10):
-        return {
-            "case_id": "case-1",
-            "variant": "with_skill",
-            "run_number": run_number,
-            "missing_output": False,
-            "execution_valid": True,
-            "grading_availability": grading,
-            "objective_total": 1,
-            "objective_pass_rate": 1.0,
-            "combined_total": 1,
-            "combined_pass_rate": 1.0,
-            "process_total": 0,
-            "process_pass_rate": None,
-            "efficiency_total": 0,
-            "efficiency_pass_rate": None,
-            "metadata": {"elapsed_ms": elapsed_ms},
-            "run_base": "/definitely/not/a/run",
-        }
+    def summary_row(run_number=1, *, grading="complete", elapsed_ms=10):
+        return result_row(
+            "case-1", run_number=run_number, grading_availability=grading,
+            objective_total=1, combined_total=1,
+            process_total=0, process_pass_rate=None,
+            efficiency_total=0, efficiency_pass_rate=None,
+            metadata={"elapsed_ms": elapsed_ms}, run_base="/definitely/not/a/run",
+        )
 
     def test_zero_denominator_metrics_are_not_applicable_in_production_summary(self):
-        summary = sb.variant_summary_block([self.result_row()])
+        summary = sb.variant_summary_block([self.summary_row()])
 
         self.assertEqual(summary["availability"], "complete")
         self.assertEqual(summary["metric_availability"], {
@@ -154,8 +144,8 @@ class ReportCohortTests(unittest.TestCase):
 
     def test_grading_incompleteness_does_not_discard_execution_telemetry(self):
         rows = [
-            self.result_row(1, elapsed_ms=10),
-            self.result_row(2, grading="partial", elapsed_ms=100),
+            self.summary_row(1, elapsed_ms=10),
+            self.summary_row(2, grading="partial", elapsed_ms=100),
         ]
         summary = sb.variant_summary_block(rows)
 
@@ -165,19 +155,19 @@ class ReportCohortTests(unittest.TestCase):
         self.assertEqual(summary["elapsed_ms"]["mean"], 55)
 
     def test_report_attempt_identity_rejects_boolean_run_number(self):
-        row = self.result_row()
+        row = self.summary_row()
         row["run_number"] = True
         with self.assertRaises(ValueError):
             sb.variant_summary_block([row])
 
     def test_metric_totals_reject_coercion_and_zero_rate_contradictions(self):
         for total in (False, 0.0, -1, "0"):
-            row = self.result_row()
+            row = self.summary_row()
             row["process_total"] = total
             with self.subTest(total=total), self.assertRaises(ValueError):
                 sb.variant_summary_block([row])
 
-        row = self.result_row()
+        row = self.summary_row()
         row["process_pass_rate"] = 0.0
         with self.assertRaisesRegex(ValueError, "contradicts"):
             sb.variant_summary_block([row])

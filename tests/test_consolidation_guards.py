@@ -9,6 +9,10 @@ source of truth and make the sync executable —
 
   * identity tests pin that a runner's helper IS the harness's function, so a
     re-fork shows up as a failing `assertIs`, not as silent drift;
+  * behavior tests drive the commands that share an owner (grade, judge,
+    benchmark, contamination, cost-summary, the trigger matrix, the answer
+    runners) over one fixture and fail when any of them diverges, whatever
+    the shared helpers are called;
   * source scans pin that single-owner literals are not re-spelled;
   * doc-coverage tests enumerate CLI/assertion surfaces from the parser,
     packaging metadata, and registries and require their owning docs to mention
@@ -16,7 +20,6 @@ source of truth and make the sync executable —
 """
 import argparse
 import contextlib
-import inspect
 import io
 import json
 import re
@@ -28,7 +31,13 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from helpers import make_eval_repo
+from helpers import (
+    attest_answer_design,
+    make_eval_repo,
+    run_cli,
+    skill_markdown,
+    write_run,
+)
 
 import ablation_model as am
 import agent_capabilities as ac
@@ -58,25 +67,15 @@ class SharedOwnerIdentityTests(unittest.TestCase):
     """Every helper both a runner and the harness need must BE the harness's
     object. (Pattern established by test_audit_fixes' detect_trigger check.)"""
 
-    def test_trigger_runners_share_the_harness_repo_root_resolver(self):
-        self.assertIs(tr.repo_root_for_manifest, sb.repo_root_for_manifest)
+    def test_the_trigger_runner_shares_the_harness_repo_root_resolver(self):
         self.assertIs(tm.repo_root_for_manifest, sb.repo_root_for_manifest)
 
-    def test_trigger_runners_share_the_harness_mount_and_subprocess_helpers(self):
-        self.assertIs(tr.mount_skill_tree, sb.mount_skill_tree)
+    def test_the_trigger_runner_shares_the_harness_mount_and_subprocess_helpers(self):
         self.assertIs(tm.mount_skill_tree, sb.mount_skill_tree)
         self.assertIs(tm.AgentAdapter._mount_tree, sb.mount_skill_tree)
-        self.assertIs(tr.invoke_argv_with_timeout, sb.invoke_argv_with_timeout)
         self.assertIs(tm.AgentAdapter._run_argv, sb.invoke_argv_with_timeout)
 
-    def test_trigger_matrix_reuses_the_pi_runner_row_loaders(self):
-        self.assertIs(tm.cases_from_manifest, tr.cases_from_manifest)
-        self.assertIs(tm.eval_rows_from_args, tr.eval_rows_from_args)
-        self.assertIs(tm.validate_trigger_rows, tr.validate_trigger_rows)
-        self.assertIs(tm.pi_argv, tr.pi_argv)
-
-    def test_trigger_runners_share_trace_label_sanitizer(self):
-        self.assertIs(tr.safe_trace_label, sb.safe_trace_label)
+    def test_the_trigger_runner_shares_the_trace_label_sanitizer(self):
         self.assertIs(tm.safe_trace_label, sb.safe_trace_label)
 
     def test_codex_default_command_has_one_code_owner(self):
@@ -88,26 +87,13 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         self.assertNotIn(tm.DEFAULT_CODEX_CMD,
                          (ROOT / "run_trigger_matrix.py").read_text(encoding="utf-8"))
 
-    def test_manifest_loading_goes_through_the_harness_source_loader(self):
-        # tr.load_manifest is a thin named wrapper; what matters is that a YAML
-        # manifest or dataset_files resolve for the runners exactly as for the
-        # harness (they used to silently break on both).
-        import inspect
-        self.assertIn("load_manifest_source", inspect.getsource(tr.load_manifest))
-
     def test_usage_alias_tables_are_one_table(self):
-        for claude_key, canonical_key in [("input_tokens", "input_tokens"),
-                                          ("output_tokens", "output_tokens"),
-                                          ("cache_read_tokens", "cache_read_tokens"),
-                                          ("cache_creation_tokens", "cache_write_tokens")]:
-            self.assertIs(sb.CLAUDE_USAGE_KEYS[claude_key], sb.USAGE_ALIASES[canonical_key])
-        # And the trace normalizer resolves through the same table: an alias only
+        # The trace normalizer resolves through the one alias table: an alias only
         # USAGE_ALIASES knows (camelCase) must be visible to usage_number.
         self.assertEqual(sb.usage_number({"promptTokens": 7}, "input_tokens"), 7.0)
 
     def test_evidence_class_literal_is_owned_by_ablation_model(self):
         self.assertEqual(am.TRIGGER_MEASUREMENT_EVIDENCE_CLASS, "raw_autonomous_trigger_measurement")
-        self.assertIs(tr.TRIGGER_MEASUREMENT_EVIDENCE_CLASS, am.TRIGGER_MEASUREMENT_EVIDENCE_CLASS)
         self.assertIs(tm.TRIGGER_MEASUREMENT_EVIDENCE_CLASS, am.TRIGGER_MEASUREMENT_EVIDENCE_CLASS)
         # The literal must not be re-spelled in the runners' source.
         for module_path in (ROOT / "run_pi_trigger_eval.py", ROOT / "run_trigger_matrix.py"):
@@ -133,47 +119,9 @@ class SharedOwnerIdentityTests(unittest.TestCase):
             for sub in (getattr(action, "choices", None) or {}).values() if action.__class__.__name__ == "_SubParsersAction" else ():
                 yield from SharedOwnerIdentityTests._walk_actions(sub)
 
-    def test_population_boundary_is_one_predicate(self):
-        # grade / judge / benchmark / prepare must all exclude trigger cases via
-        # is_trigger_case — the drift this guards against let `grade` score runs
-        # `benchmark` deliberately refused.
-        for fn in (sb.grade, sb.collect_judge_tasks, sb.build_benchmark_report, sb.prepared_task_rows):
-            self.assertIn("is_trigger_case", inspect.getsource(fn),
-                          f"{fn.__name__} does not route the trigger-population boundary through is_trigger_case")
-
-    def test_run_discovery_is_one_iterator(self):
-        # The four graders must walk (model, variant, run) through the one
-        # discovered_run_units iterator, not private copies of the nesting.
-        for fn in (sb.grade, sb.collect_judge_tasks, sb.build_benchmark_report, sb.contamination_report):
-            self.assertIn("discovered_run_units", inspect.getsource(fn),
-                          f"{fn.__name__} does not discover runs through discovered_run_units")
-
-    def test_cost_ledgers_share_the_rollup_owners(self):
-        # Both ledgers must build coverage/totals/spend groups from the shared
-        # helpers — the drift this guards against made the two ledgers disagree
-        # on judge spend and bill different sets of runs.
-        for fn in (sb.build_cost_summary, sb.suite_cost_ledger):
-            src = inspect.getsource(fn)
-            self.assertIn("cost_coverage_block", src, f"{fn.__name__} hand-rolls its coverage block")
-            self.assertIn("judge_cost_block", src, f"{fn.__name__} hand-rolls its judge spend line")
-        self.assertIn("cost_totals_block", inspect.getsource(sb.build_cost_summary))
-        self.assertIn("cost_totals_block", inspect.getsource(sb.suite_cost_ledger))
-        self.assertIn("discover_on_disk_run_rows", inspect.getsource(sb.suite_cost_ledger))
-
     def test_agent_cost_capabilities_use_normalized_source_vocabulary(self):
         for name, cap in ac.AGENT_CAPABILITIES.items():
             self.assertIn(cap.dollar_cost, sb.COST_SOURCES, name)
-
-    def test_agent_capability_registry_declares_every_telemetry_signal(self):
-        for name, cap in ac.AGENT_CAPABILITIES.items():
-            signals = cap.telemetry_contract()
-            self.assertEqual(set(signals), {"usage", "cost", "elapsed_ms", "trace"}, name)
-            for signal in signals.values():
-                self.assertIn(signal.availability, {"available", "unavailable", "not_applicable"})
-                if signal.availability == "available":
-                    self.assertIsNotNone(signal.provenance)
-                else:
-                    self.assertIsNotNone(signal.reason)
 
     def test_available_capability_signals_require_explicit_provenance(self):
         common = {
@@ -194,18 +142,17 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         self.assertEqual(signals["cost"].availability, "not_applicable")
         self.assertEqual(signals["elapsed_ms"].availability, "available")
 
-    def test_invocation_request_is_answer_runner_only(self):
-        fields = set(sb.InvocationRequest.__dataclass_fields__)
-        self.assertEqual(fields, {"prompt", "workspace", "model", "timeout_s"})
-
     def test_agent_capability_registry_matches_registered_surfaces(self):
+        surfaces = {surface: {name for name, registration in ac.BACKENDS.items()
+                              if getattr(registration, surface) is not None}
+                    for surface in ("answer", "trigger", "judge")}
         self.assertEqual(
             ac.AGENT_CAPABILITIES,
             {name: registration.capabilities for name, registration in ac.BACKENDS.items()},
         )
-        self.assertEqual(set(tm.ADAPTERS), set(ac.surface_names("trigger")))
-        self.assertEqual(set(sb.AGENT_BACKENDS), set(ac.surface_names("answer")))
-        self.assertEqual(set(sb.JUDGE_BACKENDS), set(ac.surface_names("judge")))
+        self.assertEqual(set(tm.ADAPTERS), surfaces["trigger"])
+        self.assertEqual(set(sb.AGENT_BACKENDS), surfaces["answer"])
+        self.assertEqual(set(sb.JUDGE_BACKENDS), surfaces["judge"])
         self.assertEqual(
             set(sb.WORKSPACE_BUILDERS),
             {name for name, registration in ac.BACKENDS.items()
@@ -213,7 +160,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         )
         autonomous = {name for name, cap in ac.AGENT_CAPABILITIES.items()
                       if cap.autonomous_trigger}
-        self.assertEqual(autonomous, set(ac.surface_names("trigger")))
+        self.assertEqual(autonomous, surfaces["trigger"])
         for name, cap in ac.AGENT_CAPABILITIES.items():
             if cap.trigger_ablation:
                 self.assertTrue(cap.autonomous_trigger, name)
@@ -223,7 +170,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         judge_backend_action = next(a for a in judge_parser._actions if "--judge-backend" in getattr(a, "option_strings", ()))
         native_judges = set(judge_backend_action.choices) - {"cmd"}
         self.assertEqual(native_judges, set(sb.JUDGE_BACKENDS))
-        self.assertEqual(native_judges, set(ac.surface_names("judge")))
+        self.assertEqual(native_judges, surfaces["judge"])
         registered_traces = {
             name: registration.trace.resolve()
             for name, registration in ac.BACKENDS.items()
@@ -233,17 +180,17 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         self.assertEqual(ac.trace_dialect_implementations(), registered_traces)
         for name, dialect in registered_traces.items():
             self.assertIs(sb.TRACE_DIALECTS[name], dialect)
-        for name in ac.surface_names("answer"):
+        for name in sorted(surfaces["answer"]):
             self.assertIsInstance(
                 sb.AGENT_BACKENDS[name],
                 ac.binding_for(name, "answer").implementation.resolve(),
             )
-        for name in ac.surface_names("trigger"):
+        for name in sorted(surfaces["trigger"]):
             self.assertIs(
                 tm.ADAPTERS[name],
                 ac.binding_for(name, "trigger").implementation.resolve(),
             )
-        for name in ac.surface_names("judge"):
+        for name in sorted(surfaces["judge"]):
             self.assertIs(
                 sb.JUDGE_BACKENDS[name],
                 ac.binding_for(name, "judge").implementation.resolve(),
@@ -303,14 +250,10 @@ class SharedOwnerIdentityTests(unittest.TestCase):
             ["export-jetty", "run-jetty", "import-jetty-results"],
         )
         self.assertEqual(
-            ac.DEDICATED_SMOKE_TARGETS["jetty"].command,
+            payload["jetty"]["smoke"]["command"],
             ("python3", "-m", "unittest", "discover", "tests", "-k", "smoke_jetty", "-v"),
         )
         self.assertNotIn("jetty", ac.SMOKE_TARGETS)
-        self.assertEqual(
-            payload["jetty"]["smoke"]["command"],
-            ac.DEDICATED_SMOKE_TARGETS["jetty"].command,
-        )
         self.assertTrue(payload["subagent"]["capabilities"]["answer_runner"])
         self.assertFalse(payload["subagent"]["native_bindings"]["answer"])
         self.assertEqual(payload["subagent"]["answer_route"], "subagent")
@@ -823,29 +766,15 @@ else:
         original = sb.AGENT_BACKENDS["codex"]
         try:
             sb.AGENT_BACKENDS["codex"] = WrongBackend()
-            stderr = io.StringIO()
-            with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
-                sb.run_agent(argparse.Namespace(agent="codex"))
-            self.assertIn("replacement identifies as 'claude'", stderr.getvalue())
+            with tempfile.TemporaryDirectory() as td:
+                code, _, stderr = run_cli("run-agent", "--agent", "codex",
+                                          "--tasks", Path(td) / "tasks.jsonl",
+                                          "--runs", Path(td) / "runs")
+                self.assertFalse((Path(td) / "runs").exists())
+            self.assertEqual(code, 1)
+            self.assertIn("replacement identifies as 'claude'", stderr)
         finally:
             sb.AGENT_BACKENDS["codex"] = original
-
-    def test_trigger_adapter_replacements_keep_the_zero_argument_compatibility_seam(self):
-        class Replacement:
-            name = "codex"
-
-            def __init__(self):
-                self.created = True
-
-        original = tm.ADAPTERS["codex"]
-        try:
-            tm.ADAPTERS["codex"] = Replacement
-            adapter = tm.adapter_instance(
-                "codex", backend_options={"codex_cmd": "custom codex"})
-        finally:
-            tm.ADAPTERS["codex"] = original
-        self.assertIsInstance(adapter, Replacement)
-        self.assertTrue(adapter.created)
 
     def test_policy_projections_are_immutable(self):
         with self.assertRaises(TypeError):
@@ -901,103 +830,255 @@ else:
         self.assertNotIn("Add OpenCode/Gemini adapters", trace_spec)
 
 
+def run_unit(row):
+    return (row.get("model"), row["variant"], row["run_number"])
+
+
+class SharedBoundaryBehaviorTests(unittest.TestCase):
+    """Behaviors the consolidation made single-owned, proven at the commands
+    that expose them rather than by reading their source."""
+
+    JUDGED_ASSERTIONS = [
+        {"name": "k", "type": "contains", "value": "GOOD"},
+        {"name": "j", "type": "judge", "prompt": "Is it good?"},
+    ]
+
+    def test_grade_and_judge_collection_exclude_trigger_cases(self):
+        # The drift this guards against let `grade` score runs `benchmark`
+        # deliberately refused; a judge must never spend a model call on a
+        # discovery-population case either.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = make_eval_repo(root, cases=[
+                {"id": "ans", "split": "tune", "kind": "pr-review", "prompt": "review",
+                 "assertions": self.JUDGED_ASSERTIONS},
+                {"id": "trg", "split": "tune", "kind": "trigger", "should_trigger": True,
+                 "prompt": "would you load?", "assertions": self.JUDGED_ASSERTIONS},
+            ])
+            runs = root / "runs"
+            for case_id in ("ans", "trg"):
+                for variant in ("with_skill", "without_skill"):
+                    write_run(runs / case_id / variant, "GOOD result")
+            graded, judge_tasks = root / "grade.json", root / "judge-tasks.jsonl"
+            self.assertEqual(run_cli("grade", manifest, "--runs", runs, "--out", graded,
+                                     "--judge-tasks", judge_tasks)[0], 0)
+            results = json.loads(graded.read_text(encoding="utf-8"))["results"]
+            grade_tasks = [json.loads(line) for line in
+                           judge_tasks.read_text(encoding="utf-8").splitlines()]
+            collected = sb.collect_judge_tasks(manifest, runs)
+        self.assertEqual({row["case_id"] for row in results}, {"ans"})
+        self.assertEqual({task["case_id"] for task in grade_tasks}, {"ans"})
+        self.assertEqual({task["case_id"] for task in collected}, {"ans"})
+
+    def test_graders_discover_the_same_runs_across_both_layouts(self):
+        # grade, judge collection, benchmark and contamination must all walk the
+        # legacy <case>/<variant>/run-N layout and the fanned <case>/<model>/<variant>
+        # layout alike; a private copy of the nesting silently drops one.
+        canary = "canary-3f1c9e2a-7b4d-4e8f-9a61-0c2d5e7b8f13"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = make_eval_repo(root, cases=[{
+                "id": "c", "split": "tune", "prompt": "Do it.", "canary": canary,
+                "assertions": self.JUDGED_ASSERTIONS,
+            }])
+            runs = root / "runs"
+            expected = set()
+            for variant in ("with_skill", "without_skill"):
+                for run_number in (1, 2):
+                    write_run(runs / "c" / variant / f"run-{run_number}", f"GOOD {canary}")
+                    expected.add((None, variant, run_number))
+                write_run(runs / "c" / "model-b" / variant, f"GOOD {canary}")
+                expected.add(("model-b", variant, 1))
+            attest_answer_design(manifest, runs)
+            graded, judge_tasks = root / "grade.json", root / "judge-tasks.jsonl"
+            benchmark, contamination = root / "benchmark.json", root / "contamination.json"
+            self.assertEqual(run_cli("grade", manifest, "--runs", runs, "--out", graded,
+                                     "--judge-tasks", judge_tasks)[0], 0)
+            self.assertEqual(run_cli("benchmark", manifest, "--runs", runs, "--out", benchmark)[0], 0)
+            self.assertEqual(run_cli("contamination", manifest, "--runs", runs, "--out", contamination)[0], 0)
+            discovered = {
+                "grade": {run_unit(row) for row in
+                          json.loads(graded.read_text(encoding="utf-8"))["results"]},
+                "grade judge tasks": {run_unit(json.loads(line)) for line in
+                                      judge_tasks.read_text(encoding="utf-8").splitlines()},
+                "collect_judge_tasks": {run_unit(task) for task in
+                                        sb.collect_judge_tasks(manifest, runs)},
+                "benchmark": {run_unit(row) for row in
+                              json.loads(benchmark.read_text(encoding="utf-8"))["results"]},
+                "contamination": {
+                    run_unit(finding)
+                    for case in json.loads(contamination.read_text(encoding="utf-8"))["cases"]
+                    for finding in case["findings"]},
+            }
+        for grader, units in discovered.items():
+            with self.subTest(grader=grader):
+                self.assertEqual(units, expected)
+
+    def test_benchmark_and_suite_cost_ledgers_agree_on_the_same_runs(self):
+        # The two ledgers once disagreed on judge spend and billed different
+        # sets of runs. Over a run tree holding only the compared arms, the
+        # benchmark's cost block and `cost-summary` must report one coverage,
+        # one set of totals, and one judge spend line.
+        spend = {("with_skill", 1): 0.30, ("without_skill", 1): 0.10,
+                 ("with_skill", 2): None, ("without_skill", 2): 0.05}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = make_eval_repo(root)
+            runs = root / "runs"
+            for (variant, run_number), cost in spend.items():
+                write_run(runs / "case-1" / variant / f"run-{run_number}", "alpha", metadata={
+                    "provider": "test-provider", "model": "test-model", "billing_scope": "run",
+                    "usage_normalized": {"total_tokens": 100, "source": "provider_reported"},
+                    "cost_normalized": ({"currency": "USD", "total_cost": cost,
+                                         "source": "provider_reported"}
+                                        if cost is not None else {"source": "missing"}),
+                })
+            attest_answer_design(manifest, runs)
+            judge_results = root / "judge-results.jsonl"
+            judge_results.write_text("".join(json.dumps({
+                "judge_task_id": task_id, "passed": True,
+                "cost_normalized": {"currency": "USD", "total_cost": cost,
+                                    "source": "provider_reported"},
+            }) + "\n" for task_id, cost in (("t1", 0.02), ("t2", 0.01))), encoding="utf-8")
+            benchmark, ledger_path = root / "benchmark.json", root / "cost-summary.json"
+            self.assertEqual(run_cli("benchmark", manifest, "--runs", runs,
+                                     "--judge-results", judge_results, "--out", benchmark)[0], 0)
+            self.assertEqual(run_cli("cost-summary", "--manifest", manifest, "--runs", runs,
+                                     "--judge-results", judge_results, "--out", ledger_path)[0], 0)
+            report = json.loads(benchmark.read_text(encoding="utf-8"))["cost_summary"]
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["coverage"], ledger["coverage"])
+        self.assertEqual(ledger["coverage"]["runs_seen"], 4)
+        self.assertEqual(ledger["coverage"]["runs_missing_cost"], 1)
+        report_totals = {key: value for key, value in report["totals"].items()
+                         if key != "execution_errors"}
+        self.assertEqual(report_totals, ledger["totals"])
+        self.assertEqual(ledger["totals"]["known_total_cost_usd"], 0.45)
+        self.assertEqual(report["judge"], ledger["judge"])
+        self.assertEqual(ledger["judge"]["total_cost_usd"], 0.03)
+
+    def test_trigger_matrix_reads_a_yaml_manifest_with_dataset_files(self):
+        # The trigger runners resolve a manifest exactly as the harness does:
+        # YAML syntax and dataset_files rows (they used to break on both).
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            skill = repo / "skills" / "demo" / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text(skill_markdown(
+                "demo", "Review a proposed change and label the severity of each finding."),
+                encoding="utf-8")
+            (repo / "asks.jsonl").write_text(
+                '{"id": "diff", "ask": "Review this proposed diff and label each finding severity."}\n'
+                '{"id": "patch", "ask": "Review my proposed patch; label the severity of findings."}\n',
+                encoding="utf-8")
+            manifest = repo / "eval.yaml"
+            manifest.write_text(
+                "version: 1\nskill_name: demo\nskill_paths: [skills/demo/SKILL.md]\n"
+                "variants: [with_skill, without_skill]\n"
+                "dataset_files:\n  asks: asks.jsonl\n"
+                "cases:\n"
+                "  - id: fire\n    split: tune\n    kind: trigger\n    should_trigger: true\n"
+                "    template: asks\n    prompt: \"{ask}\"\n"
+                "  - id: quiet\n    split: tune\n    kind: trigger\n    should_trigger: false\n"
+                "    prompt: What is the capital of France?\n",
+                encoding="utf-8")
+            out = Path(td) / "report.json"
+            argv = ["skill-trigger-matrix", str(manifest), "--agent", "stub",
+                    "--runs-per-query", "1", "--out", str(out)]
+            with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(tm.main(), 0)
+            report = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(
+            sorted((row["query_id"], row["triggered"]) for row in report["results"]),
+            [("fire-diff", True), ("fire-patch", True), ("quiet", False)])
+
+
 class TimeoutConventionTests(unittest.TestCase):
     """One timeout encoding: timed_out=True (the flag execution_valid keys on)
     plus returncode 124, on every path that spawns a process."""
 
-    def test_default_runner_timeout_is_one_constant(self):
+    def test_every_runner_timeout_flag_defaults_to_the_one_constant(self):
         parser = sb.build_arg_parser()
-        defaults = []
-        for action in SharedOwnerIdentityTests._walk_actions(parser):
-            if "--timeout" in getattr(action, "option_strings", ()) and action.default == sb.DEFAULT_RUNNER_TIMEOUT_S:
-                defaults.append(action)
-        self.assertGreaterEqual(len(defaults), 4, "the runner --timeout flags no longer share DEFAULT_RUNNER_TIMEOUT_S")
+        subs = next(a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction")
+        runners = sorted(name for name in subs.choices if name.startswith("run-"))
+        self.assertGreaterEqual(len(runners), 5)
+        for name in runners:
+            with self.subTest(command=name):
+                [timeout] = [action for action in subs.choices[name]._actions
+                             if "--timeout" in action.option_strings]
+                self.assertEqual(timeout.default, sb.DEFAULT_RUNNER_TIMEOUT_S)
 
-    def test_answer_runners_write_the_contract_through_one_owner(self):
-        # Every answer runner adapts its RunnerOutcome onto the run contract via
-        # write_runner_outcome — none may hand-roll a metadata/metrics/events/
-        # output write, the drift that let the Codex empty-output path skip the
-        # normalized telemetry blocks the others wrote.
-        for fn in (sb.run_agent_tasks, sb.run_subagent_tasks):
-            src = inspect.getsource(fn)
-            self.assertIn("write_runner_outcome", src,
-                          f"{fn.__name__} does not write its run through write_runner_outcome")
-            # The run-level (base /) contract writes must be the writer's; a
-            # per-turn turn_dir/output.md write is not one of these.
-            for artifact in ('"metadata.json"', '"metrics.json"', '"events.json"', '"output.md"'):
-                self.assertNotIn(f"write_json(base / {artifact}", src,
-                                 f"{fn.__name__} hand-rolls a write to {artifact} instead of using write_runner_outcome")
-                self.assertNotIn(f"(base / {artifact}).write_text", src,
-                                 f"{fn.__name__} hand-rolls output for {artifact} instead of using write_runner_outcome")
-        for fn in (sb.run_codex, sb.run_claude, sb.run_agent):
-            src = inspect.getsource(fn)
-            self.assertIn("run_agent_tasks", src,
-                          f"{fn.__name__} bypasses the shared native answer runner")
-
-    def test_runner_failure_markers_have_one_provider_map(self):
-        # Backend rows own the binding; the ablation module only projects it.
-        self.assertEqual(
-            am.RUNNER_FAILURE_MARKER_BY_PROVIDER,
-            {name: registration.failure_marker for name, registration in ac.BACKENDS.items()
-             if registration.failure_marker is not None},
-        )
-        self.assertIs(am.RUNNER_FAILURE_MARKER_BY_PROVIDER["codex"], am.CODEX_FAILURE)
-        self.assertIs(am.RUNNER_FAILURE_MARKER_BY_PROVIDER["claude"], am.CLAUDE_FAILURE)
-        self.assertIs(am.RUNNER_FAILURE_MARKER_BY_PROVIDER["subagent"], am.CLAUDE_FAILURE)
-        self.assertIs(am.RUNNER_FAILURE_MARKER_BY_PROVIDER["vibe"], am.VIBE_FAILURE)
-        self.assertEqual(
-            am.RUNNER_FAILURE_MARKER_BY_PROVIDER["gemini"], "[GEMINI FAILURE")
-        for marker in am.RUNNER_FAILURE_MARKER_BY_PROVIDER.values():
-            self.assertIn(marker, am.RUNNER_FAILURE_MARKERS)
-
-    def test_subagent_timeout_is_a_timeout_not_a_generic_error(self):
-        # A backend that times out must yield metadata the scorable predicate
-        # excludes AND that names the timeout — not a generic error that loses
-        # the timed_out flag (the misclassification this pins against).
-        def timing_out_backend(*, prompt, workspace, model, tool_executor, history=None):
-            raise subprocess.TimeoutExpired(cmd="agent", timeout=1)
-
+    def test_every_answer_runner_failure_commits_the_run_contract(self):
+        # Every answer runner adapts its outcome through the one run-contract
+        # writer. A path that hand-rolled its own files (the drift that let the
+        # Codex empty-output path skip the normalized telemetry blocks) would
+        # leave an uncommitted artifact set without explicit missing telemetry,
+        # and a timeout that became a generic error would lose its encoding.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             manifest = make_eval_repo(root)
-            rows = sb.prepared_task_rows(manifest, sb.validate_manifest(manifest))
-            runs = root / "runs"
-            sb.run_subagent_tasks(rows[:1], runs, timing_out_backend)
-            base = runs / rows[0]["run_dir"]
-            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
-            text = (base / "output.md").read_text(encoding="utf-8")
-        self.assertTrue(meta["timed_out"])
-        self.assertEqual(meta["returncode"], 124)
-        self.assertTrue(text.startswith(am.TIMEOUT_FAILURE))
-        self.assertFalse(am.execution_valid(meta, text))
+            rows = sb.prepared_task_rows(manifest, sb.validate_manifest(manifest))[:1]
 
-    def test_subagent_reported_timeout_defaults_to_124(self):
-        # If the backend reports a timeout rather than raising TimeoutExpired, the
-        # shared writer still owns the shell-compatible timeout return code.
-        def reported_timeout_backend(*, prompt, workspace, model, tool_executor, history=None):
-            return {"answer": "", "timed_out": True}
+            def native(outcome):
+                class Backend:
+                    name = "codex"
 
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            manifest = make_eval_repo(root)
-            rows = sb.prepared_task_rows(manifest, sb.validate_manifest(manifest))
-            runs = root / "runs"
-            sb.run_subagent_tasks(rows[:1], runs, reported_timeout_backend)
-            base = runs / rows[0]["run_dir"]
-            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
-            text = (base / "output.md").read_text(encoding="utf-8")
-        self.assertTrue(meta["timed_out"])
-        self.assertEqual(meta["returncode"], 124)
-        self.assertTrue(text.startswith(am.TIMEOUT_FAILURE))
-        self.assertFalse(am.execution_valid(meta, text))
+                    def invoke_answer(self, request, **options):
+                        return outcome
+                return lambda runs: sb.run_agent_tasks(rows, runs, Backend())
 
-    def test_native_invocation_helper_kills_process_groups_on_timeout(self):
-        src = inspect.getsource(sb.invoke_argv_with_timeout)
-        self.assertIn("start_new_session=True", src)
-        self.assertIn('getattr(os, "killpg"', src)
-        self.assertIn('getattr(signal, "SIGKILL"', src)
-        self.assertIn("InvocationOutcome.spawn_failed", src)
-        self.assertIn("invoke_argv_with_timeout", inspect.getsource(sb.run_argv_capture))
+            def subagent(respond):
+                def agent(*, prompt, workspace, model, tool_executor, history=None):
+                    return respond()
+                return lambda runs: sb.run_subagent_tasks(rows, runs, agent, replay_mode="off")
+
+            def raising(exc):
+                def respond():
+                    raise exc
+                return respond
+
+            # (runner path, timed out, returncode, body prefix)
+            paths = {
+                "native empty output": (
+                    native(am.RunnerOutcome(provider="codex", answer=None, returncode=0)),
+                    False, 0, "[CODEX FAILURE"),
+                "native timeout": (
+                    native(am.RunnerOutcome(provider="codex", answer="", timed_out=True)),
+                    True, 124, "[CODEX FAILURE"),
+                "native nonzero exit": (
+                    native(am.RunnerOutcome(provider="codex", answer="", returncode=2)),
+                    False, 2, "[CODEX FAILURE"),
+                "subagent exception": (
+                    subagent(raising(RuntimeError("backend down"))),
+                    False, 1, "[CLAUDE FAILURE"),
+                "subagent raised timeout": (
+                    subagent(raising(subprocess.TimeoutExpired(cmd="agent", timeout=1))),
+                    True, 124, "[TIMEOUT"),
+                "subagent reported timeout": (
+                    subagent(lambda: {"answer": "", "timed_out": True}),
+                    True, 124, "[TIMEOUT"),
+                "subagent empty answer": (
+                    subagent(lambda: {"answer": ""}),
+                    False, 0, "[CLAUDE FAILURE"),
+            }
+            for name, (run, timed_out, returncode, prefix) in paths.items():
+                with self.subTest(path=name):
+                    runs = root / name.replace(" ", "-")
+                    run(runs)
+                    base = runs / rows[0]["run_dir"]
+                    raw = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+                    committed = sb.read_metrics_base(base)
+                    text = (base / "output.md").read_text(encoding="utf-8")
+                    self.assertIs(committed["artifact_set_complete"], True)
+                    self.assertEqual(raw["usage_normalized"], {"source": "missing"})
+                    self.assertEqual(raw["cost_normalized"], {"source": "missing"})
+                    for sidecar in ("metrics.json", "events.json"):
+                        self.assertEqual(json.loads((base / sidecar).read_text(
+                            encoding="utf-8"))["schema_version"], 2, sidecar)
+                    self.assertIs(raw["timed_out"], timed_out)
+                    self.assertEqual(raw["returncode"], returncode)
+                    self.assertTrue(text.startswith(prefix), text)
+                    self.assertFalse(am.execution_valid(committed, text))
 
     def test_run_argv_with_timeout_converts_spawn_failure_to_failed_observation(self):
         result = sb.run_argv_with_timeout(["/definitely/not/a/real/binary"], cwd=Path("."), timeout=1)

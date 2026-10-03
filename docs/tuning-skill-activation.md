@@ -10,20 +10,56 @@ model, and because the model makes the routing decision, the author's only contr
 indirect: measure the rate per combination, edit the description, and re-measure until
 it holds everywhere you ship.
 
-That measured rate is the whole method. The loop:
+That measured rate is the whole method. Because the description is the one lever you
+hold and the trigger rate moves with it directly, a change in the rate traces back to
+the edit that caused it; [Automating eval design and hillclimbing with
+Claude](https://claude.dev/blog/automating-eval-design-and-hillclimbing/) uses skill
+triggering as its example of that kind of *attributable* hillclimbing surface. The
+loop:
 
-1. **Write trigger cases in both polarities.** Real user prompts — the words someone
-   actually types — not descriptions of prompts. Positive cases where the skill must
-   fire, negative cases where it must stay quiet. Both matter: a description broad
-   enough to always fire is one that also fires on your negatives.
-2. **Measure the matrix.** Run every (agent, model, query) cell several times, with
+1. **Write trigger cases in both polarities, and split them.** Real user prompts — the
+   words someone actually types — not descriptions of prompts. Positive cases where
+   the skill must fire, negative cases where it must stay quiet. Both matter: a
+   description broad enough to always fire is one that also fires on your negatives.
+   Give each case `"split": "tune"` or `"split": "holdout"` in the manifest. You read
+   failures and write edits from tune only; `skill-trigger-matrix --split holdout`
+   measures the queries no edit was written from.
+2. **Check the noise before the first edit.** Count queries, not runs. The harness's
+   trigger significance test (`skill-benchmark trigger-compare`) collapses every
+   agent, model, and repeat of one query into a single unit, so repeats sharpen each
+   query's rate without adding units. When all k queries move the same way, the exact
+   two-sided sign-flip test cannot report less than 2/2^k: 3 queries bottom out at
+   p = 0.25, and it takes 6 to reach p ≤ 0.05 (0.03125). The bundled demo's two
+   queries can never go below p = 0.5. If your holdout split is smaller than that,
+   add real queries before spending rounds, or treat each keep/revert call as a
+   judgment on rates rather than a test result.
+3. **Measure the matrix.** Run every (agent, model, query) cell several times, with
    the skill mounted where that agent discovers skills on its own — never named in
    the prompt, never force-loaded.
-3. **Read failures by polarity.** Positives failing → under-trigger. Negatives
+4. **Read failures by polarity.** Positives failing → under-trigger. Negatives
    failing → over-trigger. A cell can do both at once, which is why the report never
    folds the two into one number.
-4. **Edit the description, re-run, compare.** Stop when the rates hold across the
-   matrix at a repetition count you trust.
+5. **Edit the description, re-run both splits, keep or revert.** Keep the edit only
+   when holdout improves. When tune improves and holdout stays flat, the edit fit
+   the tune queries rather than the request class, so revert it; revert on any
+   regression in either split as well. Stop when the rates hold across the matrix at
+   a repetition count you trust.
+6. **When two or three rounds stall, sort the leftover failures before editing
+   again.** Put each remaining tune failure in one bucket, because another
+   description edit fixes only some of them:
+   - *description gap*: the query uses invocation language the description lacks.
+     Keep editing.
+   - *isolation or competing skills*: another skill won the routing. If the run's
+     metadata records `config_isolated: false`, a personal skill may have leaked
+     in, so fix the sandbox (log in through the environment; see below). The row's
+     `competing_skills` names every other skill the model was offered. A built-in
+     winning is a real routing loss (see below), so treat it as a description gap
+     against that competitor.
+   - *ambiguous query*: a domain expert could argue either polarity. Rewrite or drop
+     the query, not the description.
+   - *variance*: the cell flips across identical re-runs by as much as the round
+     moved it. Raise `--runs-per-query`, or add queries if step 2 said the split is
+     too small.
 
 ## Run it on the bundled demo
 
@@ -62,6 +98,12 @@ smoke earlier the same day had that same Haiku cell pass 1/1 — one sample sat 
 the lucky side of a 1-in-3 rate and hid it. The JSON report keeps per-query
 trigger rates and per-run evidence for the cells that disagree.
 
+That run predates two changes that can move these rates: the skill now mounts as
+`demo` (its own directory name) rather than `skills_demo_SKILL.md`, and a run that logs
+in through the environment is now isolated from personal and organisation skills.
+Re-run the command before comparing a new reading with it; a published rate is dated
+evidence, not a property of the description.
+
 The same run is wired into a manual smoke test (it spends real tokens, so CI skips
 it):
 
@@ -92,9 +134,14 @@ any selected adapter, including Codex or Vibe.
 ## Reading the matrix
 
 - **Positives fail on some model** → the description omits the invocation language
-  those users type. Add the phrases from your failing queries. From the saturation
-  round: `anti-slop-writing` under-triggered until its description gained "tighten,"
-  "talk intro," and "generic launch copy" — the words its actual requests use.
+  that class of request uses. Add that language, taken from real requests of the same
+  kind rather than copied from the failing tune queries, and confirm the edit on
+  holdout queries it never saw. The `/claude-api hillclimb` guide in the claude-api
+  skill names the risk: "pasting specific nouns or phrases from train cases into the
+  prompt is the fastest route to an overfit change that helps train and does nothing
+  held-out." From the saturation round: `anti-slop-writing` under-triggered until its
+  description gained "tighten," "talk intro," and "generic launch copy" — the words
+  its actual requests use.
 - **Negatives fail** → the description claims territory adjacent skills or the base
   model should own. Name the exclusion explicitly: `good-readme` over-triggered on
   full docs sites and launch-readiness audits until its description said it was not
@@ -108,7 +155,9 @@ any selected adapter, including Codex or Vibe.
 Trigger cases are cheap to run compared to answer-quality cases, so repetition is
 affordable: one run per cell is a coin flip, and this repo's own ablation study saw
 two of three single-shot findings evaporate at n=5. `--runs-per-query 3` is the
-floor; raise it before trusting a marginal cell.
+floor; raise it before trusting a marginal cell. Repeats and queries fix different
+problems: `--runs-per-query` tightens one cell's rate, while only more queries lower
+the p-value floor from step 2 of the loop.
 
 ## What keeps the measurement honest
 
@@ -118,13 +167,30 @@ Each rule below exists because its violation produced a wrong number at least on
 - **Run the real prompt.** A meta-prompt ("Would the skill trigger on: …?") tests
   the model's opinion of the classifier, not skill discovery.
 - **Detect loading from evidence, not names.** The detector matches the mounted
-  skill's temp path (or Claude Code's `Skill` tool call carrying the mounted skill's
-  name). The skill's name appearing in the answer text proves nothing — reading
+  skill's temp path, or Claude Code's `Skill` tool call carrying either the skill's
+  declared name or its mounted directory name (Claude Code 2.1.269 calls skills by
+  directory name). The skill's name appearing in the answer text proves nothing — reading
   `good-readme/README.md` once looked like loading the `good-readme` skill.
+- **Mount the skill under the name your users see.** Agents list a skill by the
+  directory it sits in, so the matrix mounts `skills/demo/SKILL.md` as `demo`, the
+  name a user's install shows. Before that change it mounted the flattened manifest
+  path, and Claude Code offered the model a skill called `skills_demo_SKILL.md`; a rate
+  measured under that name is not comparable with one measured under the real name.
+  Two skill roots with the same directory name fail validation for the same reason.
 - **Isolate the sandbox, keep the harness.** Each run gets a fresh config dir so
-  the experimenter's personal skills can't shadow the one under test. The agent's
+  the experimenter's personal skills can't shadow the one under test. The dir sits
+  beside the working directory, not inside it, so the copied credentials are out of
+  the model's reach, and it is removed when the cell ends. The agent's
   built-in skills stay, because your users run against them too — losing a routing
-  fight to a built-in is a real activation failure.
+  fight to a built-in is a real activation failure. Claude isolation needs portable
+  auth: an API key, auth token, OAuth token (`CLAUDE_CODE_OAUTH_TOKEN`, what
+  `claude setup-token` prints for CI), `ANTHROPIC_BASE_URL`, or Bedrock or Vertex in
+  the environment, or a credentials file it can copy. A keychain login cannot move
+  into a fresh config, so those runs keep your normal config and read
+  `config_isolated: false`, and `trigger-compare` will not compare them. Isolated runs
+  also drop `CLAUDE_CODE_SYNC_SKILLS`, so your organisation's skills stay out, and every
+  row lists the skills that did compete as `competing_skills`. Never compare an
+  isolated rate with an unisolated one.
 - **A passing answer benchmark proves nothing about discovery.** The answer runners
   force-load the skill (`prepare` refuses to even emit trigger-case rows for them).
   Only an autonomous-trigger run measures whether the skill loads by itself.
@@ -147,6 +213,8 @@ gates, command option, smoke policy, and other supported surfaces belong in
 `agent_capabilities.BACKENDS`:
 
 ```python
+from invocation_contracts import ProcessInvocationPlan
+
 class MyAgentAdapter(AgentAdapter):
     name = "my-agent"
 
@@ -155,7 +223,10 @@ class MyAgentAdapter(AgentAdapter):
 
     def invoke(self, query, model, workspace, timeout):
         argv = ["my-agent", "run", "--json", query] + (["--model", model] if model else [])
-        return self._run_argv(argv, cwd=workspace, env=os.environ.copy(), timeout=timeout)
+        # _run_argv takes one frozen plan: argv, stdin, cwd, timeout and environment.
+        return self._run_argv(ProcessInvocationPlan.from_values(
+            argv, input_text="", cwd=workspace, timeout_s=timeout,
+            environment=os.environ.copy()))
 
 # Add as another argument to backend_registry(...), which builds BACKENDS:
 BackendRegistration(
@@ -164,6 +235,7 @@ BackendRegistration(
         answer_runner=False, autonomous_trigger=True,
         trigger_ablation=True, trace_artifacts=True,
         token_usage=True, dollar_cost="trace_normalized",
+        usage_provenance="trace_normalized", elapsed_provenance="process_measured",
         judge_backend=False, tool_replay=False, live_smoke_env=None,
     ),
     answer_route="none",
@@ -171,6 +243,11 @@ BackendRegistration(
     trigger=SurfaceBinding(ObjectRef("run_trigger_matrix", "MyAgentAdapter")),
 )
 ```
+
+An adapter that copies credentials into a home outside the workspace (as Claude
+Code, Codex and Pi do) also overrides `secret_files(workspace)`, so tokens the agent
+refreshes during the run are redacted from the artifacts, and `release(workspace)`,
+which removes that home once the cell ends, even after a failed mount or invoke.
 
 The default `detect()` already scans any JSON event stream for reads of the mounted
 skill paths; override it only when an agent reports skill loads some other way, as
@@ -180,10 +257,9 @@ or materialized skill tree and the same detector rules decide "triggered." The
 matrix validates the unified row before starting runs so a new adapter cannot
 finish live calls and then fail during report assembly.
 
-For Pi specifically, `skill-pi-trigger-eval` remains a compatibility entry point for
-older scripts. The matrix now has the shared surfaces that matter for parity: per-run
-trace artifacts, materialized trigger ablations, cost/usage parsing where the stream
-reports it, and the same evidence-class stamp.
+For Pi specifically, `skill-pi-trigger-eval` is the matrix with the Pi adapter
+alone, kept for older scripts. It writes the matrix report, so everything above
+applies to it unchanged.
 
 The demo's Haiku cell is the method in miniature: one run said the description was
 fine, three runs put its Haiku trigger rate at 1-in-3, and only the matrix made the

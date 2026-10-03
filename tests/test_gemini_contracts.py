@@ -94,7 +94,7 @@ class GeminiStreamContractTests(unittest.TestCase):
         self.assertEqual(parsed.tool_calls[0].name, "read_file")
         self.assertEqual(parsed.tool_calls[0].status, "success")
 
-    def test_usage_can_be_absent_without_becoming_zero(self):
+    def test_usage_and_model_stats_can_be_absent_without_being_invented(self):
         parsed = GeminiStream.parse(stream(
             event("init", session_id="session-1", model="gemini-2.5-flash"),
             event("message", role="user", content="Question"),
@@ -104,6 +104,9 @@ class GeminiStreamContractTests(unittest.TestCase):
 
         self.assertTrue(parsed.complete)
         self.assertIsNone(parsed.usage)
+        # The init event names the configured model; only provider stats resolve it.
+        self.assertEqual(parsed.configured_model, "gemini-2.5-flash")
+        self.assertIsNone(parsed.resolved_model)
 
     def test_degenerate_streams_construct_explicit_protocol_failures(self):
         valid_init = event("init", session_id="session-1", model="gemini-2.5-flash")
@@ -228,16 +231,6 @@ class GeminiStreamContractTests(unittest.TestCase):
                 status="success", error="contradictory")
         with self.assertRaises(TypeError):
             GeminiStream(models="gemini-test", answer="answer")
-
-    def test_multi_model_stream_does_not_claim_one_resolved_model(self):
-        parsed = GeminiStream(
-            configured_model="auto", models=("model-a", "model-b"),
-            answer="answer")
-        self.assertIsNone(parsed.resolved_model)
-
-    def test_configured_model_without_provider_stats_is_not_resolved_model(self):
-        parsed = GeminiStream(configured_model="auto", answer="answer")
-        self.assertIsNone(parsed.resolved_model)
 
 
 class GeminiJsonContractTests(unittest.TestCase):

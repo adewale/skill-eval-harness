@@ -24,6 +24,8 @@ title is the question; the body is the loop that answers it, runnable on
 | How do I upgrade a v1 manifest to v2? | [`migrating-evals.md`](migrating-evals.md) |
 | How do I upgrade the harness from 0.5.1 to 0.6.0? | [`upgrading.md`](upgrading.md) |
 | How do I port my existing evals into the harness? | [`porting-existing-evals.md`](porting-existing-evals.md) |
+| Should I use `/claude-api build-eval` and `/claude-api hillclimb`, or this harness? | [`comparing-with-claude-api-evals.md`](comparing-with-claude-api-evals.md) |
+| How do I check the harness against real agent CLIs? | [`live-verification.md`](live-verification.md) |
 
 The journey backlog lives in [`TODO.md`](../TODO.md) under "User journeys the code
 supports but the docs don't walk"; an unticked entry there is a journey whose
@@ -98,8 +100,8 @@ those two, `authoring-evals.md`, and `migrating-evals.md` — do not all carry r
 6. **End at the boundary**: what the journey does not establish, and where the
    deeper tool picks up.
 
-Housekeeping when the doc lands: add its row to the main README's documentation
-map and the table above; tick (or add) its entry in the TODO backlog; keep any
-`name:line` code references accurate — `tests/test_doc_refs.py` fails on drift;
-if the journey adds a command, `CONTRIBUTING.md`'s checklist applies to the
-command too.
+Housekeeping when the doc lands: add its row to the table above (this index is the
+only list of docs; the main README points here); tick (or add) its entry in the TODO
+backlog; keep any `name:line` code references accurate — `tests/test_doc_refs.py` fails
+on drift, and `tests/test_doc_facts.py` fails if the new doc is missing from this index;
+if the journey adds a command, `CONTRIBUTING.md`'s checklist applies to the command too.

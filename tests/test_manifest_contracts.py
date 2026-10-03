@@ -4,7 +4,6 @@ import unittest
 import ablation_model
 import skill_benchmark as sb
 from manifest_contracts import (
-    ABLATION_VARIANT_PREFIX,
     CaseId,
     CaseKind,
     CasePopulation,
@@ -62,7 +61,6 @@ class ManifestIdentityContractTests(unittest.TestCase):
             ExecutionVariant("ablation:")
 
     def test_ablation_model_reexports_the_canonical_compatibility_helpers(self):
-        self.assertEqual(ablation_model.ABLATION_VARIANT_PREFIX, ABLATION_VARIANT_PREFIX)
         self.assertIs(ablation_model.ablation_id_of, ablation_id_of)
         self.assertIs(ablation_model.is_ablation_variant, is_ablation_variant)
 
@@ -80,47 +78,6 @@ class ManifestIdentityContractTests(unittest.TestCase):
             variants,
             ["with_skill", "without_skill", "old_skill", "ablation:no-rp"],
         )
-
-    def test_prepared_task_parses_identity_values_at_the_row_boundary(self):
-        row = {
-            "case_id": "case-1",
-            "split": "tune",
-            "kind": "behavior",
-            "variant": "with_skill",
-            "run_number": 1,
-            "skill_name": "example",
-            "repo_root": "/repo",
-            "skill_paths": ["/repo/SKILL.md"],
-            "input_files": [],
-            "run_dir": "case-1/with_skill",
-            "instruction": "use the skill",
-            "prompt": "do the task",
-            "tags": [],
-        }
-        task = ablation_model.PreparedTask.from_row(row)
-        self.assertIsInstance(task.split, Split)
-        self.assertIsInstance(task.kind, CaseKind)
-        self.assertIsInstance(task.variant_truth, ExecutionVariant)
-        self.assertEqual(task.harness_record(), row)
-
-    def test_prepared_task_rejects_untyped_identity_values_at_the_boundary(self):
-        row = {
-            "case_id": "case-1",
-            "split": "training",
-            "kind": "behavior",
-            "variant": "with_skill",
-            "run_number": 1,
-            "skill_name": "example",
-            "repo_root": "/repo",
-            "skill_paths": ["/repo/SKILL.md"],
-            "input_files": [],
-            "run_dir": "case-1/with_skill",
-            "instruction": "",
-            "prompt": "",
-            "tags": [],
-        }
-        with self.assertRaisesRegex(ValueError, "split must be"):
-            ablation_model.PreparedTask.from_row(row)
 
 
 if __name__ == "__main__":

@@ -1,69 +1,53 @@
-import contextlib
-import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from typing import NamedTuple
 
-from helpers import attest_answer_design
+from helpers import (
+    assert_dies,
+    attest_answer_design,
+    demo_manifest,
+    run_cli,
+    write_demo_manifest,
+)
 
 import skill_benchmark as sb
 
 
-class BlindComparisonIntegrityTests(unittest.TestCase):
-    def make_manifest(self, root: Path) -> Path:
-        repo = root / "repo"
-        (repo / "skill").mkdir(parents=True)
-        (repo / "skill" / "SKILL.md").write_text(
-            "---\nname: demo\ndescription: Demo skill\n---\n", encoding="utf-8"
-        )
-        (repo / "evals").mkdir()
-        manifest = {
-            "version": 1,
-            "skill_name": "demo",
-            "skill_paths": ["skill/SKILL.md"],
-            "variants": ["with_skill", "without_skill"],
-            "cases": [{
-                "id": "case-1",
-                "split": "tune",
-                "kind": "behavior",
-                "prompt": "Say alpha.",
-                "expected_behavior": ["Say alpha"],
-                "assertions": [{"name": "has-alpha", "type": "contains", "value": "alpha"}],
-            }],
-            "ablations": [],
-        }
-        path = repo / "evals" / "shared-benchmark.json"
-        path.write_text(json.dumps(manifest), encoding="utf-8")
-        return path
+class Invocation(NamedTuple):
+    """A command line for run_cli and the files it writes."""
 
-    def compare_task_args(self, manifest: Path, runs: Path, root: Path) -> SimpleNamespace:
+    argv: tuple[str, ...]
+    out: Path
+    truth_out: Path | None = None
+
+
+class BlindComparisonIntegrityTests(unittest.TestCase):
+    def compare_task_args(self, manifest: Path, runs: Path, root: Path) -> Invocation:
         attest_answer_design(
             manifest, runs, variants=["with_skill", "without_skill"])
-        return SimpleNamespace(
-            manifest=str(manifest),
-            runs=str(runs),
-            split=None,
-            primary="with_skill",
-            baseline="without_skill",
-            seed=42,
-            allow_missing_prompts=False,
-            out=str(root / "comparison-tasks.jsonl"),
-            truth_out=str(root / "comparison-truth.json"),
-        )
+        out, truth_out = root / "comparison-tasks.jsonl", root / "comparison-truth.json"
+        return Invocation(
+            ("compare-tasks", str(manifest), "--runs", str(runs), "--primary", "with_skill",
+             "--baseline", "without_skill", "--seed", "42", "--out", str(out),
+             "--truth-out", str(truth_out)),
+            out, truth_out)
+
+    def assert_runs(self, invocation: Invocation) -> None:
+        code, _, stderr = run_cli(*invocation.argv)
+        self.assertEqual(code, 0, stderr)
+
+    def assert_refused(self, invocation: Invocation, message: str) -> None:
+        code, _, stderr = run_cli(*invocation.argv)
+        self.assertEqual(code, 1, stderr)
+        self.assertIn(message, stderr)
 
     def write_output(self, runs: Path, variant: str, run_number: int, text: str = "alpha") -> Path:
         base = runs / "case-1" / variant / f"run-{run_number}"
         base.mkdir(parents=True)
         (base / "output.md").write_text(text, encoding="utf-8")
         return base
-
-    def assert_dies(self, callback, message: str) -> None:
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
-            callback()
-        self.assertIn(message, stderr.getvalue())
 
     def valid_truth(self) -> dict:
         task_id = "case-1::run-1::blind-with_skill-vs-without_skill"
@@ -128,7 +112,7 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
             **extra,
         }
 
-    def write_comparison_inputs(self, root: Path, truth: dict, results: list[dict]) -> SimpleNamespace:
+    def write_comparison_inputs(self, root: Path, truth: dict, results: list[dict]) -> Invocation:
         root.mkdir(parents=True, exist_ok=True)
         truth_path = root / "truth.json"
         results_path = root / "results.jsonl"
@@ -137,40 +121,41 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
         results_path.write_text(
             "".join(json.dumps(result) + "\n" for result in results), encoding="utf-8"
         )
-        return SimpleNamespace(
-            truth=str(truth_path), results=str(results_path), out=str(output_path)
-        )
+        return Invocation(
+            ("compare-results", "--truth", str(truth_path), "--results", str(results_path),
+             "--out", str(output_path)),
+            output_path)
 
     def test_compare_tasks_rejects_zip_truncation_when_run_populations_differ(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            manifest = self.make_manifest(root)
+            manifest = write_demo_manifest(root, demo_manifest())
             runs = root / "runs"
             self.write_output(runs, "with_skill", 1)
             self.write_output(runs, "with_skill", 2)
             self.write_output(runs, "without_skill", 1)
             args = self.compare_task_args(manifest, runs, root)
 
-            self.assert_dies(lambda: sb.compare_tasks(args), "comparison run identities differ")
+            self.assert_refused(args, "comparison run identities differ")
             self.assertFalse(Path(args.out).exists())
             self.assertFalse(Path(args.truth_out).exists())
 
     def test_compare_tasks_rejects_missing_output_instead_of_skipping_pair(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            manifest = self.make_manifest(root)
+            manifest = write_demo_manifest(root, demo_manifest())
             runs = root / "runs"
             self.write_output(runs, "with_skill", 1)
             (runs / "case-1" / "without_skill" / "run-1").mkdir(parents=True)
             args = self.compare_task_args(manifest, runs, root)
 
-            self.assert_dies(lambda: sb.compare_tasks(args), "missing or blank output")
+            self.assert_refused(args, "missing or blank output")
             self.assertFalse(Path(args.out).exists())
 
     def test_compare_tasks_rejects_execution_invalid_arm_with_output_file(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            manifest = self.make_manifest(root)
+            manifest = write_demo_manifest(root, demo_manifest())
             runs = root / "runs"
             primary = self.write_output(runs, "with_skill", 1)
             self.write_output(runs, "without_skill", 1)
@@ -179,23 +164,20 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
             )
             args = self.compare_task_args(manifest, runs, root)
 
-            self.assert_dies(
-                lambda: sb.compare_tasks(args),
-                "cannot construct comparison from unscorable arm",
-            )
+            self.assert_refused(args, "cannot construct comparison from unscorable arm")
             self.assertFalse(Path(args.out).exists())
 
     def test_compare_tasks_pairs_every_exact_run_identity(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            manifest = self.make_manifest(root)
+            manifest = write_demo_manifest(root, demo_manifest())
             runs = root / "runs"
             for variant in ("with_skill", "without_skill"):
                 self.write_output(runs, variant, 1)
                 self.write_output(runs, variant, 2)
             args = self.compare_task_args(manifest, runs, root)
 
-            self.assertEqual(sb.compare_tasks(args), 0)
+            self.assert_runs(args)
             tasks = [json.loads(line) for line in Path(args.out).read_text(encoding="utf-8").splitlines()]
             truth_doc = json.loads(Path(args.truth_out).read_text(encoding="utf-8"))
             truth = truth_doc["tasks"]
@@ -227,7 +209,7 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
     def test_compare_tasks_excludes_trigger_population(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            manifest = self.make_manifest(root)
+            manifest = write_demo_manifest(root, demo_manifest())
             data = json.loads(manifest.read_text(encoding="utf-8"))
             data["cases"].append({
                 "id": "trigger-1",
@@ -246,14 +228,14 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
                 (trigger_base / "output.md").write_text("trigger measurement", encoding="utf-8")
             args = self.compare_task_args(manifest, runs, root)
 
-            self.assertEqual(sb.compare_tasks(args), 0)
+            self.assert_runs(args)
             tasks = [json.loads(line) for line in Path(args.out).read_text(encoding="utf-8").splitlines()]
             self.assertEqual({task["case_id"] for task in tasks}, {"case-1"})
 
     def test_compare_tasks_preserves_fanned_model_axis(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            manifest = self.make_manifest(root)
+            manifest = write_demo_manifest(root, demo_manifest())
             runs = root / "runs"
             for model in ("model-a", "model-b"):
                 for variant in ("with_skill", "without_skill"):
@@ -268,7 +250,7 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
                     )
             args = self.compare_task_args(manifest, runs, root)
 
-            self.assertEqual(sb.compare_tasks(args), 0)
+            self.assert_runs(args)
             tasks = [
                 json.loads(line)
                 for line in Path(args.out).read_text(encoding="utf-8").splitlines()
@@ -292,7 +274,7 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
                 root, truth, [self.valid_result(truth)]
             )
 
-            self.assert_dies(lambda: sb.compare_results(args), "comparison truth duplicate id")
+            self.assert_refused(args, "comparison truth duplicate id")
             self.assertFalse(Path(args.out).exists())
 
     def test_comparison_truth_rejects_ambiguous_roles(self):
@@ -304,7 +286,7 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
                 root, truth, [self.valid_result(truth)]
             )
 
-            self.assert_dies(lambda: sb.compare_results(args), "distinct primary/baseline roles")
+            self.assert_refused(args, "distinct primary/baseline roles")
 
     def test_comparison_results_rejects_duplicate_and_truthy_fallback_ids(self):
         with tempfile.TemporaryDirectory() as td:
@@ -318,7 +300,7 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
                               "comparison_task_id": None, "id": task_id}) + "\n",
                 encoding="utf-8",
             )
-            self.assert_dies(
+            assert_dies(self, 
                 lambda: sb.load_comparison_results(duplicate), "comparison results duplicate id"
             )
 
@@ -328,7 +310,7 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
                             "comparison_task_id": "", "id": task_id}) + "\n",
                 encoding="utf-8",
             )
-            self.assert_dies(
+            assert_dies(self, 
                 lambda: sb.load_comparison_results(conflicting),
                 "conflicting comparison_task_id and id",
             )
@@ -350,10 +332,7 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
                     scenario_root = root / name
                     scenario_root.mkdir()
                     args = self.write_comparison_inputs(scenario_root, truth, results)
-                    self.assert_dies(
-                        lambda comparison_args=args: sb.compare_results(comparison_args),
-                        "do not exactly cover comparison truth",
-                    )
+                    self.assert_refused(args, "do not exactly cover comparison truth")
                     self.assertFalse(Path(args.out).exists())
 
     def test_compare_results_rejects_invalid_winner_before_emitting_summary(self):
@@ -369,10 +348,7 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
                         truth,
                         [self.valid_result(truth, winner=winner)],
                     )
-                    self.assert_dies(
-                        lambda comparison_args=args: sb.compare_results(comparison_args),
-                        "winner must be one of",
-                    )
+                    self.assert_refused(args, "winner must be one of")
                     self.assertFalse(Path(args.out).exists())
 
     def test_compare_results_emits_only_complete_valid_summary(self):
@@ -385,7 +361,7 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
                 [self.valid_result(truth, winner=" a ", reasoning="better")],
             )
 
-            self.assertEqual(sb.compare_results(args), 0)
+            self.assert_runs(args)
             report = json.loads(Path(args.out).read_text(encoding="utf-8"))
             self.assertTrue(report["comparison_complete"])
             self.assertEqual(report["coverage"], {"expected": 1, "received": 1})
@@ -413,18 +389,18 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
                 with self.subTest(name=name):
                     args = self.write_comparison_inputs(
                         root / name, truth, [{**self.valid_result(truth), **patch}])
-                    self.assert_dies(lambda args=args: sb.compare_results(args), "comparison results row")
+                    self.assert_refused(args, "comparison results row")
                     self.assertFalse(Path(args.out).exists())
 
     def test_compare_results_rejects_verdict_replayed_after_candidate_changes(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            manifest = self.make_manifest(root)
+            manifest = write_demo_manifest(root, demo_manifest())
             runs = root / "runs"
             self.write_output(runs, "with_skill", 1, "original primary")
             self.write_output(runs, "without_skill", 1, "baseline")
             task_args = self.compare_task_args(manifest, runs, root)
-            self.assertEqual(sb.compare_tasks(task_args), 0)
+            self.assert_runs(task_args)
             old_truth = json.loads(Path(task_args.truth_out).read_text(encoding="utf-8"))
             stale_result = self.valid_result(old_truth)
 
@@ -433,13 +409,10 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
             )
             changed_args = self.write_comparison_inputs(
                 root / "changed-candidate", old_truth, [stale_result])
-            self.assert_dies(
-                lambda: sb.compare_results(changed_args),
-                "changed after comparison task construction",
-            )
+            self.assert_refused(changed_args, "changed after comparison task construction")
             self.assertFalse(Path(changed_args.out).exists())
 
-            self.assertEqual(sb.compare_tasks(task_args), 0)
+            self.assert_runs(task_args)
             new_truth = json.loads(Path(task_args.truth_out).read_text(encoding="utf-8"))
             self.assertNotEqual(
                 old_truth["tasks"][0]["comparison_task_sha256"],
@@ -447,10 +420,7 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
             )
             result_args = self.write_comparison_inputs(root / "replay", new_truth, [stale_result])
 
-            self.assert_dies(
-                lambda: sb.compare_results(result_args),
-                "stale or mismatched comparison_design_sha256",
-            )
+            self.assert_refused(result_args, "stale or mismatched comparison_design_sha256")
             self.assertFalse(Path(result_args.out).exists())
 
             stale_task_result = dict(stale_result)
@@ -458,10 +428,7 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
             task_result_args = self.write_comparison_inputs(
                 root / "replay-task", new_truth, [stale_task_result]
             )
-            self.assert_dies(
-                lambda: sb.compare_results(task_result_args),
-                "stale or mismatched comparison_task_sha256",
-            )
+            self.assert_refused(task_result_args, "stale or mismatched comparison_task_sha256")
             self.assertFalse(Path(task_result_args.out).exists())
 
 

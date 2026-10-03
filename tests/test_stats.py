@@ -1,16 +1,15 @@
-"""Closed-form statistics: unbiased pass@k / pass^k, paired reliability lift, permutation tests.
+"""Closed-form statistics: unbiased pass@k / pass^k and paired reliability lift.
 
 Classes moved verbatim from the PR-named test files (test_audit_fixes,
 test_roadmap_features, test_followup_features, test_external_review_gaps,
 test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
-import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import attest_answer_design
+from helpers import attest_answer_design, make_eval_repo, write_run
 
 import skill_benchmark as sb
 
@@ -188,7 +187,9 @@ class PairedReliabilityLiftTests(unittest.TestCase):
             results += self._arm(f"c{i}", "with_skill", 3, 3) + self._arm(f"c{i}", "without_skill", 3, 0)
         block = sb.paired_reliability_block(sb.paired_case_counts(results))
         deltas = [block["by_case"][cid]["pass_at_1_delta"] for cid in sorted(block["by_case"])]
-        self.assertEqual(block["pooled"]["significance"], sb.sign_flip_significance(deltas))
+        significance = dict(block["pooled"]["significance"])
+        self.assertEqual(significance.pop("unit"), "case")
+        self.assertEqual(significance, sb.sign_flip_significance(deltas))
         self.assertTrue(block["pooled"]["significance"]["significant_at_0_05"])   # 6 unanimous cases
 
     def test_zero_delta_not_significant(self):
@@ -211,30 +212,13 @@ class PairedReliabilityLiftTests(unittest.TestCase):
         self.assertNotIn("by_model", out)
         self.assertEqual(set(out["by_case"]), {"c1"})
 
-    def test_deterministic(self):
-        results = self._arm("c1", "with_skill", 4, 3) + self._arm("c1", "without_skill", 4, 1)
-        self.assertEqual(sb.build_paired_reliability(results), sb.build_paired_reliability(results))
-
     def test_end_to_end_attached_and_per_arm_untouched(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "repo" / "skill").mkdir(parents=True)
-            (root / "repo" / "skill" / "SKILL.md").write_text("---\nname: demo\ndescription: Demo\n---\n", encoding="utf-8")
-            (root / "repo" / "evals").mkdir()
-            manifest = {
-                "version": 1, "skill_name": "demo", "skill_paths": ["skill/SKILL.md"],
-                "variants": ["with_skill", "without_skill"],
-                "cases": [{"id": "case-1", "split": "tune", "kind": "behavior", "prompt": "Do it.",
-                           "assertions": [{"name": "has-alpha", "type": "contains", "value": "alpha"}]}],
-                "ablations": [],
-            }
-            path = root / "repo" / "evals" / "shared-benchmark.json"
-            path.write_text(json.dumps(manifest), encoding="utf-8")
+            path = make_eval_repo(root)
             runs = root / "runs"
             for variant, text in [("with_skill", "alpha"), ("without_skill", "nope")]:
-                base = runs / "case-1" / variant
-                base.mkdir(parents=True)
-                (base / "output.md").write_text(text, encoding="utf-8")
+                write_run(runs / "case-1" / variant, text)
             attest_answer_design(path, runs)
             report = sb.build_benchmark_report(path, runs)
         rel = report["reliability"]
@@ -242,77 +226,6 @@ class PairedReliabilityLiftTests(unittest.TestCase):
         self.assertIn("by_variant", rel)
         self.assertIn("paired_lift", rel)        # new nested block attached
         self.assertEqual(rel["paired_lift"]["by_case"]["case-1"]["pass_at_1_delta"], 1.0)
-
-
-class TwoSamplePermutationTests(unittest.TestCase):
-    def test_single_run_per_arm_never_significant(self):
-        r = sb.two_sample_permutation_significance([1.0], [0.0])
-        self.assertEqual(r["p_value"], 1.0)
-        self.assertFalse(r["significant_at_0_05"])
-
-    def test_clean_separation_becomes_significant_by_four_per_arm(self):
-        self.assertFalse(sb.two_sample_permutation_significance([1, 1, 1], [0, 0, 0])["significant_at_0_05"])  # p=0.1
-        self.assertTrue(sb.two_sample_permutation_significance([1, 1, 1, 1], [0, 0, 0, 0])["significant_at_0_05"])  # p=0.0286
-
-    def test_symmetric_under_group_swap(self):
-        # two-sided: the p-value must not depend on which arm is passed first (a
-        # `target = observed` one-sided mutation makes the reversed order differ)
-        fwd = sb.two_sample_permutation_significance([1, 1, 1, 1], [0, 0, 0, 0])
-        rev = sb.two_sample_permutation_significance([0, 0, 0, 0], [1, 1, 1, 1])
-        self.assertEqual(fwd["p_value"], rev["p_value"])
-        self.assertTrue(rev["significant_at_0_05"])   # reversed order still fires
-
-    def test_method_edges_and_exact_vs_sampled(self):
-        self.assertEqual(sb.two_sample_permutation_significance([1, 1, 1, 1], [0, 0, 0, 0])["method"], "two-sample-permutation-exact")
-        big = sb.two_sample_permutation_significance([1.0] * 12, [0.0] * 12)   # total 24 -> sampled
-        self.assertEqual(big["method"], "two-sample-permutation-sampled")
-        self.assertIsNone(sb.two_sample_permutation_significance([], [1, 2])["p_value"])   # empty arm
-        self.assertEqual(sb.two_sample_permutation_significance([1, 1], [1, 1])["p_value"], 1.0)  # all equal
-
-    def test_deterministic_under_sampling(self):
-        a, b = [1.0] * 12, [0.0] * 12   # total 24 -> sampled branch, seeded
-        r1, r2 = sb.two_sample_permutation_significance(a, b), sb.two_sample_permutation_significance(a, b)
-        self.assertEqual(r1, r2)
-        self.assertEqual(r1["method"], "two-sample-permutation-sampled")   # actually exercising the sampled path
-
-    def test_sampled_permutation_is_invariant_to_within_group_order(self):
-        a = [1, .9, .8, .7, .6, .5, .4, .3, .2, .1, 0, 0]
-        b = [0, .1, .2, .3, .4, .5, .6, .7, .8, .9, 1, 1]
-        first = sb.two_sample_permutation_significance(a, b)
-        reordered = sb.two_sample_permutation_significance(
-            [a[i] for i in (5, 1, 10, 0, 8, 3, 11, 6, 2, 9, 4, 7)],
-            list(reversed(b)),
-        )
-        self.assertEqual(first, reordered)
-
-    def test_sampled_permutation_uses_conservative_bound_at_gate(self):
-        result = sb.two_sample_permutation_significance(
-            [0.0] * 10, [1.0] * 5 + [0.0] * 5)
-        self.assertEqual(result["method"], "two-sample-permutation-sampled")
-        self.assertAlmostEqual(result["p_value"], 0.035147669, places=8)
-        self.assertAlmostEqual(result["p_value_upper_bound"], 0.063950568, places=8)
-        self.assertLess(result["p_value"], 0.05)
-        self.assertGreater(result["p_value_upper_bound"], 0.05)
-        self.assertFalse(result["significant_at_0_05"])
-
-    def test_noisy_non_degenerate_effects(self):
-        # not perfect separation: a strong noisy effect (7-1 vs 1-7) is significant;
-        # a moderate one (4-1 vs 1-4, exact) is not; a weak one is not.
-        strong = sb.two_sample_permutation_significance([1, 1, 1, 1, 1, 1, 1, 0], [0, 0, 0, 0, 0, 0, 0, 1])
-        self.assertTrue(strong["significant_at_0_05"])
-        self.assertLess(strong["p_value"], 0.05)
-        moderate = sb.two_sample_permutation_significance([1, 1, 1, 1, 0], [0, 0, 0, 0, 1])
-        self.assertFalse(moderate["significant_at_0_05"])
-        self.assertAlmostEqual(moderate["p_value"], 0.206349, places=5)   # exact, deterministic
-        self.assertFalse(sb.two_sample_permutation_significance([1, 1, 0, 0], [1, 0, 0, 0])["significant_at_0_05"])
-
-    def test_sampled_p_is_never_exact_zero(self):
-        # (b+1)/(m+1) Monte-Carlo estimator: a sampled p can never be an impossible 0.0
-        r = sb.two_sample_permutation_significance([1.0] * 12, [0.0] * 12)   # sampled, perfect separation
-        self.assertGreater(r["p_value"], 0.0)
-        self.assertAlmostEqual(r["p_value"], 1 / 4097, places=6)
-        # and the pre-existing sign-flip sampled branch (n>14) is corrected too
-        self.assertGreater(sb.sign_flip_significance([0.5] * 20)["p_value"], 0.0)
 
 
 if __name__ == "__main__":

@@ -15,25 +15,22 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Generic, TypeVar
 
 from json_contracts import freeze_json_mapping
+from observation_contracts import MEASUREMENT_PROVENANCE, Availability
 
 T = TypeVar("T")
 
 AVAILABLE = "available"
-UNAVAILABLE = "unavailable"
-NOT_APPLICABLE = "not_applicable"
-COMPLETE = "complete"
-PARTIAL = "partial"
+UNAVAILABLE = Availability.UNAVAILABLE.value
+NOT_APPLICABLE = Availability.NOT_APPLICABLE.value
+COMPLETE = Availability.COMPLETE.value
+PARTIAL = Availability.PARTIAL.value
+# Measurement and comparison states with no general availability counterpart.
 COMPARABLE = "comparable"
 BLOCKED = "blocked"
 
-PROVENANCE = {
-    "provider_reported",
-    "trace_normalized",
-    "process_measured",
-    "price_table_estimated",
-    "estimated",
-    "legacy_unverified",
-}
+# Provenance a measured number may carry; owned by observation_contracts so the
+# answer path, the trigger path and this domain read one list.
+PROVENANCE = MEASUREMENT_PROVENANCE
 MAX_ELAPSED_MS = 2**63 - 1
 CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
 
@@ -45,6 +42,43 @@ USAGE_ALIASES: dict[str, tuple[str, ...]] = {
     "reasoning_tokens": ("reasoning_tokens", "thinking_tokens", "reasoningTokens"),
     "total_tokens": ("total_tokens", "totalTokens", "total", "tokens"),
 }
+
+
+def finite_nonnegative(value: Any, label: str, *, integer: bool = False) -> int | float:
+    """A measured count, duration or amount: a finite, non-negative real number.
+
+    An integer count (``integer``) is kept exact at any size. Any other amount
+    must also fit a float, because every consumer does float arithmetic on it.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ValueError(f"{label} must be finite and non-negative")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{label} must be finite and non-negative")
+    if integer:
+        if not isinstance(value, int):
+            raise ValueError(f"{label} must be a non-negative integer")
+        return value
+    try:
+        converted = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"{label} must be finite and non-negative") from exc
+    if not math.isfinite(converted):
+        raise ValueError(f"{label} must be finite and non-negative")
+    return value
+
+
+def validate_raw_usage(value: Any, label: str) -> None:
+    """A provider's raw usage object before normalization: string-keyed nested
+    mappings whose leaves are finite non-negative numbers, with an integer for
+    every ``*tokens`` count. The runner and judge boundaries both call this, so
+    a payload one accepts the other cannot reject."""
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"{label} object keys must be strings")
+            validate_raw_usage(item, f"{label}.{key}")
+        return
+    finite_nonnegative(value, label, integer=label.rsplit(".", 1)[-1].casefold().endswith("tokens"))
 
 
 def canonical_usage_counts(raw: Any) -> dict[str, int]:

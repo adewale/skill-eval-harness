@@ -28,23 +28,35 @@ class ArtifactSetObservationTests(unittest.TestCase):
                 base, declared_contract_version=ac.ARTIFACT_CONTRACT_VERSION)
             self.assertIsInstance(observation, ac.InvalidArtifactCommit)
 
-    def test_schema_versions_are_exact_integers(self):
+    @staticmethod
+    def committed_run(base: Path, *, marker_version=ac.ARTIFACT_CONTRACT_VERSION) -> None:
+        for name in ac.ARTIFACT_REQUIRED_FILES:
+            (base / name).write_text("{}", encoding="utf-8")
+        sb.write_artifact_commit(base)
+        marker_path = base / ac.ARTIFACT_COMMIT_NAME
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["schema_version"] = marker_version
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    def test_marker_schema_version_is_an_exact_integer(self):
         for version in (True, False, 1.0, "1", 2):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as td:
                 base = Path(td)
-                for name in ac.ARTIFACT_REQUIRED_FILES:
-                    (base / name).write_text("{}", encoding="utf-8")
-                sb.write_artifact_commit(base)
-                marker = json.loads(
-                    (base / ac.ARTIFACT_COMMIT_NAME).read_text(encoding="utf-8"))
-                marker["schema_version"] = version
-                (base / ac.ARTIFACT_COMMIT_NAME).write_text(
-                    json.dumps(marker), encoding="utf-8")
+                self.committed_run(base, marker_version=version)
+                observation = ac.observe_artifact_set(
+                    base, declared_contract_version=ac.ARTIFACT_CONTRACT_VERSION)
+                self.assertIsInstance(observation, ac.InvalidArtifactCommit)
+                self.assertIn("unsupported schema version", observation.reason)
 
+    def test_declared_contract_version_is_an_exact_integer(self):
+        for version in (True, False, 1.0, "1", 2):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as td:
+                base = Path(td)
+                self.committed_run(base)
                 observation = ac.observe_artifact_set(
                     base, declared_contract_version=version)
-
                 self.assertIsInstance(observation, ac.InvalidArtifactCommit)
+                self.assertIn("unsupported contract version", observation.reason)
 
     def test_dangling_and_live_marker_symlinks_are_invalid(self):
         with tempfile.TemporaryDirectory() as td:
@@ -95,12 +107,12 @@ class ArtifactSetObservationTests(unittest.TestCase):
     def test_metadata_projection_exposes_reasoned_state_and_legacy_shape(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
-            self.assertEqual(sb.read_metadata_base(base), {})
+            self.assertEqual(sb.read_metrics_base(base), {})
             (base / "metadata.json").write_text(json.dumps({
                 "artifact_contract_version": ac.ARTIFACT_CONTRACT_VERSION,
             }), encoding="utf-8")
 
-            metadata = sb.read_metadata_base(base)
+            metadata = sb.read_metrics_base(base)
 
             self.assertFalse(metadata["artifact_set_complete"])
             self.assertEqual(metadata["artifact_set_state"], "missing_commit")

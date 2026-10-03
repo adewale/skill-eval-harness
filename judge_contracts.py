@@ -6,7 +6,6 @@ instead of repairing independently assembled dictionaries.
 """
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -17,26 +16,6 @@ from json_contracts import freeze_json_mapping, validate_json_text
 
 JudgeUsageSource = Literal["provider_reported", "trace_normalized"]
 JUDGE_USAGE_SOURCES = frozenset({"provider_reported", "trace_normalized"})
-
-
-def _finite_nonnegative(value: Any, label: str) -> int | float:
-    if (isinstance(value, bool) or not isinstance(value, (int, float))
-            or value < 0
-            or (isinstance(value, float) and not math.isfinite(value))):
-        raise ValueError(f"{label} must be finite and non-negative")
-    return value
-
-
-def _validate_usage(value: Any, label: str, key: str | None = None) -> None:
-    if isinstance(value, Mapping):
-        for child_key, item in value.items():
-            if not isinstance(child_key, str):
-                raise TypeError(f"{label} object keys must be strings")
-            _validate_usage(item, f"{label}.{child_key}", child_key)
-        return
-    _finite_nonnegative(value, label)
-    if key is not None and key.casefold().endswith("tokens") and type(value) is not int:
-        raise ValueError(f"{label} must be a non-negative integer")
 
 
 @dataclass(frozen=True)
@@ -88,7 +67,7 @@ class JudgeInvocation:
         object.__setattr__(self, "metadata", freeze_json_mapping(
             self.metadata, "judge metadata"))
         if self.cost_usd is not None:
-            _finite_nonnegative(self.cost_usd, "judge cost_usd")
+            telemetry.finite_nonnegative(self.cost_usd, "judge cost_usd")
             try:
                 object.__setattr__(self, "cost_usd", float(self.cost_usd))
             except OverflowError as exc:
@@ -97,7 +76,7 @@ class JudgeInvocation:
         if self.usage is not None:
             if not isinstance(self.usage, Mapping):
                 raise TypeError("judge usage must be a mapping or None")
-            _validate_usage(self.usage, "judge usage")
+            telemetry.validate_raw_usage(self.usage, "judge usage")
             frozen_usage = freeze_json_mapping(self.usage, "judge usage")
             telemetry.canonical_usage_counts(frozen_usage)
             object.__setattr__(self, "usage", frozen_usage)

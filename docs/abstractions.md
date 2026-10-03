@@ -18,7 +18,7 @@ This is the **engineering lens** on the terms in [`vocabulary.md`](vocabulary.md
 | Split | `manifest_contracts.Split` | Which cases are visible during iteration. |
 | Assertion | `assertion_result` | A single pass/fail check over one run. |
 | Prepared task row | `prepared_task_rows` | A runner-neutral unit of work. |
-| Run-output contract | `discover_run_bases` | The files a runner leaves on disk. |
+| Run-output contract | `discover_run_bases_under` | The files a runner leaves on disk. |
 | Runner / adapter | `run_codex` | Turns a task row into contract files. |
 | Trace normalization | `normalize_trace_records` | Runner-specific events, made uniform. |
 | Judge plumbing | `collect_judge_tasks` | Qualitative checks, deferred to a model you supply. |
@@ -107,8 +107,8 @@ An assertion is one check. The code-side registries are `TEXT_ASSERTIONS`,
 graded `script` oracle set a real value), and `grade_case_variant` stamps a `severity`
 (`critical`/`gate`/`soft`) and an `oracle` tier (`strong`/`demo`/`live`) on each.
 
-Severity decides how a result counts: a `critical` failure vetoes the run and is excluded from
-every mean; a `gate` carries the pass rate; a `soft` result feeds only the graded score. The
+Severity decides how a result counts; the three tiers are defined under **Severity** in
+[`vocabulary.md`](vocabulary.md#things-you-assert). The
 graded shape (roadmap 2.2, ported from `adewale/anti-slop-writing`) adds two `judge` assertion
 forms:
 
@@ -170,7 +170,8 @@ runs/<case_id>/<variant>/[run-<n>/]metrics.json       # optional, normalized
 runs/<case_id>/<variant>/[run-<n>/]artifact-commit.json # harness-written commit marker
 ```
 
-`discover_run_bases` and `read_output_base` read this layout. A runner that writes these
+`discover_case_model_roots` finds each case's variant directories (with or without a model
+segment), and `discover_run_bases_under` and `read_output_base` read the runs under them. A runner that writes these
 files is a valid runner, whether it is Pi, Codex, Jetty, a subagent, or a person with a text
 editor. Harness-owned schema-v1 writers commit their required files and SHA-256 inventory by
 writing `artifact-commit.json` last; a missing or stale marker makes such a declared artifact
@@ -187,13 +188,21 @@ Likewise, `read_event_log_base` produces `MissingEventLog | InvalidEventLog | Lo
 `read_events_base` is only the legacy tuple adapter. Strict JSON parsing lives in
 `json_contracts.py`, so every disk reader shares duplicate-key and non-finite-number rejection.
 
+`content_digests.py` owns how bytes are hashed. `file_sha256` is the digest an artifact commit
+records and verifies; `tree_sha256` hashes a file tree as (relative path, bytes) entries sorted by
+path component, each framed as path, NUL, then content. The canonical `skill_tree_hash`, the
+workspace fixture hash, the script-oracle trees in the eval contract, and the Jetty upload plan
+all go through it, so a digest computed from the upload plan equals the canonical one it is
+checked against. Each skill root sits in a skill tree under its own directory name, so the
+hashed paths are the paths an agent lists. The judge's explore-surface digest frames directories too and stays separate.
+
 ## Runner / adapter
 
 An **answer runner** consumes prepared task rows and produces the run-output contract. The repo
-ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10472`), Claude (`run_claude:10658`, capturing real
+ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10637`), Claude (`run_claude:10839`, capturing real
 per-run cost), Gemini CLI and Mistral Vibe (`run-agent --agent gemini|vibe`, using isolated provider homes outside the workdir), the in-process
-subagent runner (`run_subagent:13248`, which hosts record/replay tool I/O via `ToolReplayStore`),
-Jetty (`JettyClient:4028` and the export/run/import commands), and any runner that writes the
+subagent runner (`run_subagent:13507`, which hosts record/replay tool I/O via `ToolReplayStore`),
+Jetty (`JettyClient:4067` and the export/run/import commands), and any runner that writes the
 contract directly. Each answer runner registers a workspace builder so one cross-runner invariant
 proves its `without_skill` arm is skill-free (CF.2). Autonomous trigger runners are separate: they
 read trigger cases from the manifest directly, never consume answer task rows, and emit trigger
@@ -214,7 +223,32 @@ model and timeout are also precise values. Provider adapters can choose wire for
 cannot omit or disagree about process inputs after the plan boundary. The same module owns the
 shared `InvocationState` vocabulary: `InvocationResult` admits only process-boundary states, while
 provider or harness failures remain semantic classifications and never rewrite the observed return
-code.
+code. `InvocationRequest.effort` carries a requested effort level; `run_agent_tasks` refuses it
+before any spend when the backend declares no `effort_control` or the level is not among its
+`effort_levels`.
+
+`completion_contracts.py` records how each answer run ended. `StopObservation` normalizes a
+provider's stop reason into the closed `StopClass` (`completed`, `truncated`, `turn_limit`,
+`refused`, `other`, `unavailable`) and keeps the raw value beside it. `ServedModel` applies one rule
+to every backend: one reported model is credited and compared with the request (a dated snapshot
+suffix or a family alias still matches); several reported models credit none and read `mixed` when
+the requested model is among them, `mismatch` when it is not. Claude subagent turns are not
+counted, because a subagent may use another model by design. The check reads `match`, `mismatch`,
+`mixed`, `unverifiable`, `unavailable` or `not_requested`. `EffortSetting` records the requested
+level and how the backend applied it, or `backend_default`. The shared writer fills `unavailable`
+and `backend_default` for any runner that reports nothing, so an old run and a run with no evidence
+are distinguishable. `execution_valid` ([execution validity](vocabulary.md#run-artifacts)) treats a
+truncated, turn-limited or wrong-model run as unscorable, because grading it would blame the
+requested model for the eval's limits or for another model's answer; a refusal and a mixed run stay graded and are counted in the report's `run_endings`
+block.
+
+`observation_contracts.py` owns how the harness says whether it observed something.
+`Availability` (`complete`, `partial`, `unavailable`, `not_applicable`) is the canonical vocabulary;
+`Availability.parse` also reads the older spellings still persisted in run artifacts (`incomplete`,
+`unknown`, `unobserved`, `missing`, `not-applicable`), so code compares members instead of
+re-spelling strings, and a test fails if a production module writes a retired spelling again.
+`TelemetrySource` is the one list of where a usage or cost number came from, and the usage and cost
+source sets that the answer path and the trigger path both validate against are derived from it.
 
 ## Trace normalization
 
@@ -258,6 +292,55 @@ row still carries `{judge_task_id, verdict_kind, passed, score, evidence}` — p
 exact rendered prompt, candidate output, and evidence. A stale or mismatched result is rejected
 or re-queued even when its `judge_task_id` still matches.
 
+Every per-run record shares one key, `manifest_contracts.RunCoordinate` (case, execution variant,
+run number, and a model on a model-fanned run). `judge_task_id` is that coordinate's rendering
+with an assertion label, so a judge task, a human judgement and a result row cannot name the same
+run differently. Repeated runs of one judge and a panel of judge models fold their verdicts with one
+rule, `judge_verdict.resolve_consensus`: a strict majority passes, an explicit `--quorum` overrides
+it, and an exact tie is decided by the median score only against an explicit threshold, else it is
+`unresolved` and does not pass. Both merges report the same `agreement` block, so a judge that
+disagrees with itself is visible rather than averaged away.
+
+Human verdicts have one shape, `human_judgements.HumanJudgement`: a run coordinate, an optional
+judge assertion, a `pass | fail | unsure` verdict and a note. `render-viewer --serve` writes them
+to `feedback.json`; `judge-alignment --labels feedback.json` turns each pass/fail verdict on a named
+assertion into a label for that assertion's `judge_task_id`; `error-analysis --feedback` puts the
+run-level notes into its review queue. A reviewer writes a verdict once, and the calibration label
+and the review note cannot disagree.
+
+## Findings, gate policy and eval health
+
+`findings.py` is the one vocabulary for "this eval has a problem". `CaseFlag` is the closed set of
+per-case benchmark flags; each value is the exact wire text (three carry a `": detail"` suffix), and
+consumers compare members instead of matching substrings. `FindingKind` registers every finding
+kind the harness emits, from `audit-manifest`, readiness, `profile-skill`, `cost-summary`,
+`contamination` and `judge-robustness`; each kind declares its `Subject` (`skill`, `eval`,
+`grader`, `run`), its default `Severity` and the `EvalMark` it is evidence against, if any.
+`Finding.as_dict` keeps the historical `{kind, severity, message, evidence}` shape.
+
+`eval_health` is a view over findings, not a second copy of them. It takes the findings and a
+per-mark `observed` flag, and rates each of the five marks
+([defined in the glossary](vocabulary.md#eval-health)): a mark with a finding of its kinds is
+`concern`, an observed mark with none is `ok`, and the rest are `unavailable`, which is not `ok`.
+`audit_manifest_report` supplies the observations: a recorded case `source` for mark 1, a graded
+reference or null answer from `known_answer_check` for mark 2, the run conditions for mark 5
+(`run_condition_findings`, on any benchmark), and a complete benchmark for marks 3 and 4, whose
+run-measured findings (`run_measured_findings`) are computed only then. It feeds the
+audit findings and the readiness blocker findings through the same view, so a blocker such as
+`floor-eval` counts against mark 3 like any other finding of that kind.
+
+`gate_policy.py` decides what fails a command. A `GatePolicy` names finding kinds and severities,
+and `decide` fails on any matching finding and, when told the evidence is incomplete, fails closed.
+Four presets carry the older flags' meaning: `READINESS` (`blockers`), `SELF_JUDGING`
+(`strict-judge`), `CONTAMINATION` and `JUDGE_ROBUSTNESS`. `audit-manifest --fail-on-blockers` and
+`--strict-judge` evaluate through the first two, `contamination --fail-on-contamination` and
+`judge-robustness --fail-on-findings` through the last two. Each command says when its evidence is
+incomplete: the benchmark's availability, contamination's `coverage` of answer runs, robustness's
+`summary.availability`. `gate_exit` prints each reason and returns the exit code.
+`parse_fail_on` reads the kinds, severities and preset names a user passes to
+`audit-manifest --fail-on` and rejects an unknown token. Grading options such as
+`--strict` are not gates: they change how verdicts are scored, not whether a command fails.
+
 ## Grade result row
 
 `grade_case_variant` produces one row per case/variant/run. It separates objective, process,
@@ -280,17 +363,35 @@ turns those in-memory result rows into the artifact you read. It does not consum
 of the `grade` command. Before arithmetic,
 `experimental_pairs.py` constructs exact `(case, model, repetition, population)` identities and
 requires one eligible treatment and control arm from an explicit `ContrastSpec`. The default
-skill-presence contrast maps to the existing `with_skill`/`without_skill` wire rows.
+skill-presence contrast maps to the existing `with_skill`/`without_skill` wire rows; ablation
+confirmation pairs `with_skill` with `ablation:<id>` under the contrast `ablation:<id>` (a missing
+arm blocks as `missing_ablation:<id>`), and `EDIT_CONTRAST` pairs `with_skill` against
+`old_skill` for `paired_edit_summary`, the same-run edit comparison. `contrast_for` returns the declared contrast for a pair
+of arms and refuses any other pairing, so an arm is never relabelled into another arm's slot. Each
+contrast names its `held_fixed` factors (today `HeldFixedFactor.EFFORT`), and
+`ContrastSpec.comparability` blocks a pair whose arms differ on one.
 The stable identity of a comparison result is `(contrast_id, pair_key)`. Blocked rows and pairing
 diagnostics serialize that contrast ID, so two different comparisons over the same execution rows
 cannot collide or lose their causal question at a persistence boundary.
 `build_paired_summary` computes per-case lift
 (`with_skill` minus `without_skill`, normalized gain, and a flag when the skill hurts) only from
 those pairs; missing/ineligible arms remain in `pairing` diagnostics and duplicate arms fail.
+Each paired block also carries `effect_estimates.sign_flip_interval`, the sign-flip test inverted
+into a confidence interval. The test (`sign_flip_significance`) and the interval share one
+sign-flip core, so the interval excludes zero exactly when the test rejects "no lift", sampled
+path included, and `noise_check`, which reports the cases that moved, the smallest p-value those cases can
+reach, the interval half-width and the headroom left in `without_skill`. `effect_estimates.Estimate`
+builds all three blocks from one set of deltas and stamps each with its `InferenceUnit`, defined
+under **Inference unit** in [`vocabulary.md`](vocabulary.md#report-signals). Through that
+comparability check, `construct_pairs` blocks a pair whose arms ran at different effort
+(`effort_mismatch`) or where only one arm recorded effort, in the benchmark, the ablation
+confirmation, and `token-overhead` alike.
 `build_slice_summary` breaks results down
 by domain, difficulty, trigger type, and success goal. Case flags mark saturated, no-lift,
-flaky, and with-skill-failed cases. These flags, the leakage lint
-(`prompt_assertion_leakage_findings:813`), and the split discipline are the part of the tool
+flaky, and with-skill-failed cases, and `effect_estimates.ceiling_or_floor` separates the two
+ways a case stops discriminating: both arms always pass (ceiling) or both always fail (floor, which
+`suggest-cases` never offers for hardening). These flags, the leakage lint
+(`prompt_assertion_leakage_findings:846`), and the split discipline are the part of the tool
 no surveyed eval framework copies.
 
 `report_contracts.report_cohort` classifies each attempted reporting population as

@@ -342,7 +342,7 @@ def run_case(repo: str, manifest: dict[str, Any], case: dict[str, Any], variant:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument("--run-name", default="baseline-smoke")
     ap.add_argument("--selection", help="JSON file mapping repo -> case IDs")
     ap.add_argument("--timeout", type=int, default=180)

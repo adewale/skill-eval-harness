@@ -3,13 +3,15 @@
 This module is checked by ``ty`` but is not imported by the runtime or packaged.
 The functions deliberately have no callers: their bodies prove that every
 current union can be narrowed exhaustively and that its public fields retain
-the intended precise types.
+the intended precise types. The precision proofs use ``assert_type``, which
+requires the declared type exactly: an annotated assignment would also accept
+a field widened to ``Any``.
 """
 
 from argparse import Namespace
 from collections.abc import Mapping
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
 from typing_extensions import assert_type
 
@@ -147,19 +149,19 @@ def judge_verdict_is_exhaustive(verdict: JudgeVerdict) -> None:
 
 
 def prepared_task_identity_is_precise(task: PreparedTask) -> None:
-    _case_id: CaseId = task.case_id
-    _split: Split = task.split
-    _kind: CaseKind = task.kind
-    _variant: ExecutionVariant = task.variant_truth
-    _run_number: RunNumber = task.run_number
-    _visible_variant: ExecutionVariant = task.model_facing_variant()
+    assert_type(task.case_id, CaseId)
+    assert_type(task.split, Split)
+    assert_type(task.kind, CaseKind)
+    assert_type(task.variant_truth, ExecutionVariant)
+    assert_type(task.run_number, RunNumber)
+    assert_type(task.model_facing_variant(), ExecutionVariant)
 
 
 def experimental_pair_identity_is_precise(key: ExperimentalPairKey) -> None:
-    _case_id: CaseId = key.case_id
-    _model: ModelId | None = key.model
-    _run_number: RunNumber = key.run_number
-    _population: ExperimentalPopulation = key.population
+    assert_type(key.case_id, CaseId)
+    assert_type(key.model, ModelId | None)
+    assert_type(key.run_number, RunNumber)
+    assert_type(key.population, ExperimentalPopulation)
 
 
 def experimental_pair_payload_type_is_preserved(
@@ -174,11 +176,11 @@ def provider_invocation_types_are_precise(
     plan: ProcessInvocationPlan,
     result: InvocationResult,
 ) -> None:
-    _request_model: ModelId | None = request.model
-    _request_timeout: TimeoutSeconds = request.timeout_s
-    _argv: tuple[str, ...] = plan.argv
-    _environment: Mapping[str, str] | None = plan.environment
-    _state: InvocationState = result.invocation_state
+    assert_type(request.model, ModelId | None)
+    assert_type(request.timeout_s, TimeoutSeconds)
+    assert_type(plan.argv, tuple[str, ...])
+    assert_type(plan.environment, Mapping[str, str] | None)
+    assert_type(result.invocation_state, InvocationState)
 
 
 def artifact_set_observation_is_exhaustive(
@@ -226,11 +228,11 @@ def assertion_observation_is_exhaustive(
 
 
 def judge_task_identity_is_precise(task: JudgeTask) -> None:
-    _case_id: CaseId = task.case_id
-    _variant: ExecutionVariant = task.variant
-    _run_number: RunNumber = task.run_number
-    _model: ModelId | None = task.model
-    _assertion: Mapping[str, object] = task.assertion
+    assert_type(task.case_id, CaseId)
+    assert_type(task.variant, ExecutionVariant)
+    assert_type(task.run_number, RunNumber)
+    assert_type(task.model, ModelId | None)
+    assert_type(task.assertion, Mapping[str, Any])
 
 
 def report_cohort_is_exhaustive(cohort: ReportCohort) -> None:
@@ -251,11 +253,11 @@ def report_rate_is_precise(rate: UnitRate) -> None:
 
 
 def cli_invocation_types_are_precise(invocation: CLIInvocation) -> None:
-    _command: CLICommand = invocation.command
-    _paths: Mapping[str, Path | tuple[Path, ...]] = invocation.paths
-    _split: Split | None = invocation.split
-    _variants: tuple[ExecutionVariant, ...] = invocation.variants
-    _model: ModelId | None = invocation.model
-    _models: tuple[ModelId, ...] = invocation.models
-    _judge_models: tuple[ModelId, ...] = invocation.judge_models
-    _namespace: Namespace = invocation.to_legacy_namespace()
+    assert_type(invocation.command, CLICommand)
+    assert_type(invocation.paths, Mapping[str, Path | tuple[Path, ...]])
+    assert_type(invocation.split, Split | None)
+    assert_type(invocation.variants, tuple[ExecutionVariant, ...])
+    assert_type(invocation.model, ModelId | None)
+    assert_type(invocation.models, tuple[ModelId, ...])
+    assert_type(invocation.judge_models, tuple[ModelId, ...])
+    assert_type(invocation.to_legacy_namespace(), Namespace)

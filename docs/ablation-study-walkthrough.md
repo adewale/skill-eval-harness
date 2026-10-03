@@ -13,20 +13,23 @@ hash, in [`examples/skill-pins.json`](../examples/skill-pins.json).
 
 Each skill at a pinned commit (all on `main`). `tree_hash` is
 `skill_benchmark.canonical_skill_tree_hash(repo_root, manifest)` — recompute it after
-fetching to prove you have the byte-identical tree that was scored here.
+fetching to prove you have the byte-identical tree that was scored here. The hash includes
+the directory each skill mounts under, which is now the skill's own directory name; every
+value below was recomputed from its pinned commit on 2026-10-02, after the previous layout's
+hash reproduced from the same commit.
 
 | skill | repo @ commit | tree_hash | note |
 |---|---|---|---|
-| anti-slop-writing | adewale/anti-slop-writing @ `891f6ff` | `a706f93b…` | |
-| audit-skill | adewale/audit-skill @ `49cb1bb` | `437779bb…` | |
-| cfdoctor | adewale/cfdoctor @ `39b1db6` | `d285b437…` | |
-| good-pr | adewale/good-pr @ `06a2b99` | `e6db327c…` | |
-| good-readme | adewale/good-readme @ `837e0d2` | `fc3b0830…` | |
-| good-repo | adewale/good-repo @ `0aacc79` | `46727ded…` | |
-| guardrails-skill | adewale/guardrails-skill @ `7eeeba9` | `193c293e…` | |
-| slide-maker | adewale/slide-maker @ `b144fb7` | `1743f508…` | pinned to the tested commit; `main` advanced after the run |
-| swiss-poster-skill | adewale/swiss-poster-skill @ `5ec0cb1` | `ea1b4952…` | |
-| testing-best-practices | adewale/testing-best-practices @ `b883b57` | `d6339ae9…` | |
+| anti-slop-writing | adewale/anti-slop-writing @ `891f6ff` | `995941e0…` | |
+| audit-skill | adewale/audit-skill @ `49cb1bb` | `4e314620…` | |
+| cfdoctor | adewale/cfdoctor @ `39b1db6` | `a97c8bf7…` | |
+| good-pr | adewale/good-pr @ `06a2b99` | `a872dcb1…` | |
+| good-readme | adewale/good-readme @ `837e0d2` | `7f950942…` | |
+| good-repo | adewale/good-repo @ `0aacc79` | `12b24159…` | |
+| guardrails-skill | adewale/guardrails-skill @ `7eeeba9` | `8a893080…` | |
+| slide-maker | adewale/slide-maker @ `b144fb7` | `ad9e455b…` | pinned to the tested commit; `main` advanced after the run |
+| swiss-poster-skill | adewale/swiss-poster-skill @ `5ec0cb1` | `b83054ed…` | |
+| testing-best-practices | adewale/testing-best-practices @ `b883b57` | `cdb4e1e9…` | |
 
 The slide-maker row is the point of pinning: by the time this was written, its `main`
 HEAD had moved past the evaluated tree. The harness tree-hash caught the divergence,
@@ -42,6 +45,12 @@ branch.
     (which captures real per-run cost into `metrics.json`) instead of the
     `run-codex --codex-cmd "claude -p"` workaround, and `compare-judges` to check whether
     the noisy judge verdicts below are judge-sensitive across two judge models.
+  - The judge graded its own model's answers. Both the runner and the judge were
+    `claude -p` with no `--model`, so the CLI's default model wrote each answer and
+    then judged it. The blog post [Automating eval design and hillclimbing with
+    Claude](https://claude.dev/blog/automating-eval-design-and-hillclimbing/) says the
+    judge "should not be the model you are testing"; a rerun should pass a different
+    `--judge-model` to `judge` than the `--model` the answers ran on.
 - Arms per skill: `with_skill`, `without_skill`, and one **materialized** component
   ablation (the largest/most-central component).
 - **This is a spot check.** Single behavioral case (or 3 safety cases) per skill,

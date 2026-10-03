@@ -1,4 +1,3 @@
-import contextlib
 import io
 import json
 import sys
@@ -6,33 +5,28 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
-from types import SimpleNamespace
 
 from helpers import (
     attach_jetty_task_contract,
     attest_answer_design,
+    demo_manifest,
     load_example_module,
+    run_cli,
+    write_demo_manifest,
+    write_run,
 )
 
-import run_pi_trigger_eval as tr
+import run_trigger_matrix as tm
 
 # Normal imports (not private importlib loads): the whole suite must share ONE
 # skill_benchmark module instance, or registries/monkeypatches/`is`-identity
 # checks silently diverge between test files.
 import skill_benchmark as sb
 
-ROOT = Path(__file__).resolve().parents[1]
 smoke = load_example_module("run_pi_smoke", "examples/adewale-workspace/run_pi_smoke.py")
 
 
 class SkillBenchmarkTests(unittest.TestCase):
-    def test_central_cli_remains_in_the_project_ty_gate(self):
-        project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-        ty_sources = project.split("[tool.ty.src]", 1)[1].split("\n[", 1)[0]
-        self.assertIn('"*.py"', ty_sources)
-        self.assertIn('"type_tests/*.py"', ty_sources)
-        self.assertNotIn("check_ty_regressions", project)
-
     def test_infra_failure_excluded_from_every_report_view(self):
         # Invariant: an infrastructure failure (execution_valid False) must not
         # affect ANY report view. Adding a crashed with_skill run (rate 0.0) must
@@ -72,33 +66,17 @@ class SkillBenchmarkTests(unittest.TestCase):
         self.assertEqual(sb.mean_rate([good, crashed]), 1.0)   # the crash did not drag it to 0.5
 
     def make_manifest(self, root: Path) -> Path:
-        repo = root / "repo"
-        (repo / "skill").mkdir(parents=True)
-        (repo / "skill" / "SKILL.md").write_text("---\nname: demo\ndescription: Demo skill\n---\n", encoding="utf-8")
-        (repo / "evals").mkdir()
-        manifest = {
-            "version": 1,
-            "skill_name": "demo",
-            "skill_paths": ["skill/SKILL.md"],
-            "variants": ["with_skill", "without_skill"],
-            "cases": [
-                {
-                    "id": "case-1",
-                    "split": "tune",
-                    "kind": "behavior",
-                    "prompt": "Say alpha and beta.",
-                    "expected_behavior": ["Say alpha and beta"],
-                    "assertions": [
-                        {"name": "has-alpha", "type": "contains", "value": "alpha"},
-                        {"name": "has-beta", "type": "contains", "value": "beta"},
-                    ],
-                }
+        return write_demo_manifest(root, demo_manifest(cases=[{
+            "id": "case-1",
+            "split": "tune",
+            "kind": "behavior",
+            "prompt": "Say alpha and beta.",
+            "expected_behavior": ["Say alpha and beta"],
+            "assertions": [
+                {"name": "has-alpha", "type": "contains", "value": "alpha"},
+                {"name": "has-beta", "type": "contains", "value": "beta"},
             ],
-            "ablations": [],
-        }
-        path = repo / "evals" / "shared-benchmark.json"
-        path.write_text(json.dumps(manifest), encoding="utf-8")
-        return path
+        }]))
 
     def test_repeated_runs_artifact_outputs_and_flaky_flag(self):
         with tempfile.TemporaryDirectory() as td:
@@ -251,6 +229,10 @@ class SkillBenchmarkTests(unittest.TestCase):
             self.assertIn("non-discriminating-assertions", kinds)
 
     def test_missing_outputs_do_not_create_no_lift_flags(self):
+        # A case with no outputs has no pairs, so it must not be flagged at all.
+        # Any missing output makes the report partial, which empties case_flags
+        # for every case; the per-case contract lives on observed_case_flags,
+        # which audit-manifest reads for a partial report.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             manifest = self.make_manifest(root)
@@ -265,41 +247,21 @@ class SkillBenchmarkTests(unittest.TestCase):
             manifest.write_text(json.dumps(data), encoding="utf-8")
             runs = root / "repo" / "eval-runs" / "latest"
             for variant in ["with_skill", "without_skill"]:
-                base = runs / "case-1" / variant
-                base.mkdir(parents=True)
-                (base / "output.md").write_text("alpha beta", encoding="utf-8")
+                write_run(runs / "case-1" / variant, "alpha beta")
             attest_answer_design(manifest, runs)
             report = sb.build_benchmark_report(manifest, runs)
-            flagged_ids = {f["case_id"] for f in report["case_flags"]}
-            self.assertNotIn("case-2", flagged_ids)
+        self.assertEqual(report["case_flags_availability"], "partial")
+        self.assertEqual(report["case_flags"], [])
+        observed = {row["case_id"]: row["flags"] for row in report["observed_case_flags"]}
+        # The paired case still gets its flags, so the view is not vacuously empty.
+        self.assertIn("no objective lift", observed["case-1"])
+        self.assertNotIn("case-2", observed)
 
     def test_trigger_eval_extracts_real_user_prompt(self):
         case = {
             "prompt": "Trigger decision eval. User prompt: write a README\n\nReturn exactly one label first: TRIGGER or NO_TRIGGER."
         }
-        self.assertEqual(tr.trigger_query_from_case(case), "write a README")
-
-    def test_trigger_detector_uses_copied_skill_paths_not_bare_skill_name(self):
-        copied = [Path("/tmp/pi-trigger-x/skills/good-readme/SKILL.md")]
-        repo_event = json.dumps({
-            "type": "file_read", "status": "completed",
-            "path": "good-readme/README.md"})
-        self.assertEqual(tr.detect_trigger(repo_event, copied), (False, []))
-        skill_event = json.dumps({
-            "type": "file_read", "status": "completed",
-            "path": "/tmp/pi-trigger-x/skills/good-readme/SKILL.md"})
-        triggered, evidence = tr.detect_trigger(skill_event, copied)
-        self.assertTrue(triggered)
-        self.assertIn("/tmp/pi-trigger-x/skills/good-readme/SKILL.md", evidence[0])
-
-    def test_trigger_detector_reads_command_array_events(self):
-        copied = [Path("/tmp/codex-trigger-x/.codex/skills/good-readme/SKILL.md")]
-        event = json.dumps({
-            "type": "command", "status": "completed",
-            "command": ["bash", "-lc", f"cat {copied[0]}"]})
-        triggered, evidence = tr.detect_trigger(event, copied)
-        self.assertTrue(triggered)
-        self.assertIn("SKILL.md", evidence[0])
+        self.assertEqual(tm.trigger_query_from_case(case), "write a README")
 
     def test_prepare_includes_input_files(self):
         with tempfile.TemporaryDirectory() as td:
@@ -336,15 +298,11 @@ class SkillBenchmarkTests(unittest.TestCase):
             data["cases"][0]["files"] = ["fixtures/case-1/input.txt"]
             manifest.write_text(json.dumps(data), encoding="utf-8")
             out = root / "jetty-payloads.jsonl"
-            args = SimpleNamespace(
-                manifest=str(manifest), split="tune", runs_per_variant=1,
-                include_old_skill=False, include_ablations=False, allow_missing_prompts=False,
-                jetty_collection="skill-evals", jetty_task_prefix=None,
-                jetty_agent="claude-code", jetty_model="claude-sonnet-4-6",
-                jetty_model_provider="anthropic", jetty_snapshot="python312-uv",
-                use_trial_keys=False, out=str(out), dry_run=False,
-            )
-            sb.export_jetty(args)
+            code, _, stderr = run_cli(
+                "export-jetty", manifest, "--split", "tune", "--jetty-collection", "skill-evals",
+                "--jetty-agent", "claude-code", "--jetty-model", "claude-sonnet-4-6",
+                "--jetty-model-provider", "anthropic", "--jetty-snapshot", "python312-uv", "--out", out)
+            self.assertEqual(code, 0, stderr)
             rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
             self.assertEqual([r["harness"]["variant"] for r in rows], ["with_skill", "without_skill"])
             with_row, without_row = rows
@@ -400,7 +358,9 @@ class SkillBenchmarkTests(unittest.TestCase):
             {"type": "turn.completed", "usage": {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 9, "reasoning_output_tokens": 0}},
         ]
         events, metrics = sb.normalize_trace_records(records, source="codex")
-        self.assertEqual(sb.final_answer_from_events(events), "codex-trace-ok")
+        messages = [e for e in events["events"] if e["type"] == "message"]
+        self.assertEqual([(m.get("role"), m.get("status"), m.get("input_summary")) for m in messages],
+                         [("assistant", "completed", "codex-trace-ok")])
         self.assertEqual(metrics["commands"], 1)
         self.assertTrue(metrics["skill_invoked"])
         self.assertEqual(metrics["input_tokens"], 100)
@@ -442,7 +402,9 @@ class SkillBenchmarkTests(unittest.TestCase):
             for index, record in enumerate((completed, failed), 1):
                 attach_jetty_task_contract(record, marker=index)
             jetty_runs.write_text(json.dumps(completed) + "\n" + json.dumps(failed) + "\n", encoding="utf-8")
-            sb.import_jetty_results(SimpleNamespace(manifest=str(manifest), jetty_runs=str(jetty_runs), runs=str(runs)))
+            code, _, stderr = run_cli("import-jetty-results", "--manifest", manifest,
+                                      "--jetty-runs", jetty_runs, "--runs", runs)
+            self.assertEqual(code, 0, stderr)
             self.assertEqual((runs / "case-1" / "with_skill" / "output.md").read_text(encoding="utf-8"), "alpha beta")
             meta = json.loads((runs / "case-1" / "with_skill" / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["provider"], "jetty")
@@ -473,25 +435,30 @@ class SkillBenchmarkTests(unittest.TestCase):
                 "status": "failed", "jetty": {"model": "m"}, "artifacts": [],
             }
             attach_jetty_task_contract(base)
+            # Re-attested at a safe run_dir, so a duplicate reaches the identity
+            # guard instead of dying on the changed-after-attestation check.
+            safe = attach_jetty_task_contract(
+                {**base, "harness": {**base["harness"], "run_dir": "case-1/with_skill"}})
             path = root / "jetty.jsonl"
             cases = [
-                [base],
-                [{**base, "harness": {k: v for k, v in base["harness"].items() if k != "run_number"}}],
-                [{**base, "harness": {**base["harness"], "run_dir": "case-1/with_skill"}},
-                 {**base, "harness": {**base["harness"], "run_dir": "case-1/with_skill"}}],
-                [{**base, "harness": {**base["harness"], "run_dir": "case-1/with_skill"},
-                  "status": "completed",
-                  "artifacts": [{"path": "output.md", "content": "answer"}]}],
-                [{**base, "harness": {**base["harness"], "run_dir": "case-1/with_skill"},
-                  "status": "completed", "trajectory_id": "   ",
-                  "artifacts": [{"path": "output.md", "content": "answer"}]}],
+                ([base], "unsafe run_dir escapes runs directory"),
+                ([{**base, "harness": {k: v for k, v in base["harness"].items() if k != "run_number"}}],
+                 "harness.run_number must be a positive integer"),
+                ([safe, safe], "duplicate Jetty result identity"),
+                ([{**safe, "status": "completed",
+                   "artifacts": [{"path": "output.md", "content": "answer"}]}],
+                 "successful trajectory requires non-blank trajectory_id"),
+                ([{**safe, "status": "completed", "trajectory_id": "   ",
+                   "artifacts": [{"path": "output.md", "content": "answer"}]}],
+                 "successful trajectory requires non-blank trajectory_id"),
             ]
-            for records in cases:
-                with self.subTest(records=records):
+            for records, message in cases:
+                with self.subTest(message=message, records=records):
                     path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
-                    with self.assertRaises(SystemExit):
-                        sb.import_jetty_results(SimpleNamespace(
-                            manifest=str(manifest), jetty_runs=str(path), runs=str(root / "runs")))
+                    code, _, stderr = run_cli("import-jetty-results", "--manifest", manifest,
+                                              "--jetty-runs", path, "--runs", root / "runs")
+                    self.assertEqual(code, 1, stderr)
+                    self.assertIn(message, stderr)
             self.assertFalse((root / "escape").exists())
 
     def test_import_jetty_persists_ablation_provenance_into_metadata(self):
@@ -511,7 +478,9 @@ class SkillBenchmarkTests(unittest.TestCase):
             }
             attach_jetty_task_contract(rec)
             jetty_runs.write_text(json.dumps(rec) + "\n", encoding="utf-8")
-            sb.import_jetty_results(SimpleNamespace(manifest=str(manifest), jetty_runs=str(jetty_runs), runs=str(runs)))
+            code, _, stderr = run_cli("import-jetty-results", "--manifest", manifest,
+                                      "--jetty-runs", jetty_runs, "--runs", runs)
+            self.assertEqual(code, 0, stderr)
             meta = json.loads((runs / "case-1" / "ablation:no-rp" / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["ablation"], prov)
 
@@ -529,15 +498,12 @@ class SkillBenchmarkTests(unittest.TestCase):
             }]
             manifest.write_text(json.dumps(data), encoding="utf-8")
             out = root / "jetty-payloads.jsonl"
-            args = SimpleNamespace(
-                manifest=str(manifest), split="holdout", runs_per_variant=1,
-                include_old_skill=False, include_ablations=False, allow_missing_prompts=True,
-                jetty_collection="skill-evals", jetty_task_prefix=None,
-                jetty_agent="claude-code", jetty_model="claude-sonnet-4-6",
-                jetty_model_provider="anthropic", jetty_snapshot="python312-uv",
-                use_trial_keys=False, out=str(out), dry_run=True,
-            )
-            sb.export_jetty(args)
+            code, _, stderr = run_cli(
+                "export-jetty", manifest, "--split", "holdout", "--allow-missing-prompts",
+                "--jetty-collection", "skill-evals", "--jetty-agent", "claude-code",
+                "--jetty-model", "claude-sonnet-4-6", "--jetty-model-provider", "anthropic",
+                "--jetty-snapshot", "python312-uv", "--out", out, "--dry-run")
+            self.assertEqual(code, 0, stderr)
             row = json.loads(out.read_text(encoding="utf-8").splitlines()[0])
             self.assertFalse(row["harness"]["executable"])
 
@@ -550,7 +516,10 @@ class SkillBenchmarkTests(unittest.TestCase):
             self.assertEqual(records[0]["lifecycle"]["kind"], "protocol_invalid")
             self.assertIn("non-executable", records[0]["error"])
 
-    def test_pi_smoke_workspace_omits_skill_for_without_skill(self):
+    def test_pi_smoke_command_line_points_only_at_workspace_copies(self):
+        # CF.2 proves what each pi-smoke workspace holds; this owns what the pi
+        # invocation is handed: --no-skills without the skill, and --skill
+        # paths and input files that resolve inside the workspace, never the repo.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             manifest = self.make_manifest(root)
@@ -559,37 +528,20 @@ class SkillBenchmarkTests(unittest.TestCase):
             fixture.parent.mkdir()
             fixture.write_text("fixture", encoding="utf-8")
             data = json.loads(manifest.read_text(encoding="utf-8"))
-            data["cases"][0]["files"] = ["fixtures/input.txt"]
-            with tempfile.TemporaryDirectory() as wd:
-                instruction, skill_args, inputs, skill_paths, _ = smoke.materialize_runtime_workspace(data, repo, data["cases"][0], "without_skill", Path(wd))
-                self.assertEqual(skill_args, ["--no-skills"])
-                self.assertEqual(skill_paths, [])
-                self.assertEqual(len(inputs), 1)
-                self.assertTrue(str(inputs[0]).startswith(str(Path(wd).resolve())))
-                self.assertFalse((Path(wd) / "skills").exists())
-                self.assertIn("not present", instruction)
-            with tempfile.TemporaryDirectory() as wd:
-                _, skill_args, _, skill_paths, _ = smoke.materialize_runtime_workspace(data, repo, data["cases"][0], "with_skill", Path(wd))
-                self.assertTrue(skill_paths)
-                self.assertIn("--skill", skill_args)
-                self.assertTrue(all(str(p.resolve()).startswith(str(Path(wd).resolve())) for p in skill_paths))
-
-    def test_pi_trigger_trace_artifact_writer_uses_detector_evidence(self):
-        with tempfile.TemporaryDirectory() as td:
-            run_dir = Path(td) / "trigger-run"
-            stdout = "\n".join([
-                json.dumps({"type": "tool_execution_end", "toolName": "read",
-                            "args": {"path": "/tmp/pi-trigger/skills/demo/SKILL.md"}}),
-                json.dumps({"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}], "usage": {"input": 3, "output": 2, "totalTokens": 5}}}),
-                json.dumps({"type": "agent_end", "messages": [{"role": "assistant", "content": [{"type": "text", "text": "done"}], "usage": {"input": 3, "output": 2, "totalTokens": 5}}]}),
-            ]) + "\n"
-            result = {"query": "demo", "should_trigger": True, "triggered": True, "pass": True, "elapsed_ms": 50, "returncode": 0, "timed_out": False, "evidence": ["/tmp/pi-trigger/skills/demo/SKILL.md"]}
-            tr.write_trigger_trace_artifacts(run_dir, stdout, result)
-            metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
-            meta = json.loads((run_dir / "metadata.json").read_text(encoding="utf-8"))
-            self.assertTrue(metrics["skill_invoked"])
-            self.assertEqual(metrics["total_tokens"], 5)
-            self.assertEqual(meta["query"], "demo")
+            case = {**data["cases"][0], "files": ["fixtures/input.txt"]}
+            for variant in ("without_skill", "with_skill"):
+                with self.subTest(variant=variant), tempfile.TemporaryDirectory() as wd:
+                    ws = Path(wd).resolve()
+                    _, skill_args, inputs, _, _ = smoke.materialize_runtime_workspace(
+                        data, repo, case, variant, ws)
+                    if variant == "without_skill":
+                        self.assertEqual(skill_args, ["--no-skills"])
+                    else:
+                        self.assertEqual(skill_args[0::2], ["--skill"] * len(data["skill_paths"]))
+                        for path in skill_args[1::2]:
+                            self.assertTrue(Path(path).resolve().is_relative_to(ws), path)
+                    self.assertEqual([Path(p).resolve() for p in inputs],
+                                     [ws / "inputs" / "fixtures" / "input.txt"])
 
     def test_script_assertion_requires_opt_in_and_executes_oracle(self):
         with tempfile.TemporaryDirectory() as td:
@@ -626,13 +578,6 @@ class SkillBenchmarkTests(unittest.TestCase):
             self.assertEqual(allowed["results"][0]["objective_pass_rate"], 1.0)
             self.assertIn("checked output", allowed["results"][0]["assertions"][0]["evidence"])
 
-    def test_prompt_assertion_leakage_lint_finds_literal_contains_values(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            manifest = self.make_manifest(root)
-            findings = sb.prompt_assertion_leakage_findings(sb.load_json(manifest), manifest)
-            self.assertTrue(any(f["case_id"] == "case-1" and f["value"] == "alpha" for f in findings))
-
     def test_judge_command_backend_writes_loadable_results(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -654,10 +599,10 @@ class SkillBenchmarkTests(unittest.TestCase):
             )
             out = root / "judge-results.jsonl"
             transcripts = root / "judge-transcripts"
-            sb.judge_command(SimpleNamespace(
-                manifest=str(manifest), runs=str(runs), split="tune", variant=["with_skill"],
-                judge_cmd=f"{sys.executable} {judge}", out=str(out), transcripts=str(transcripts), judge_runs=1,
-            ))
+            code, _, stderr = run_cli("judge", manifest, "--runs", runs, "--split", "tune",
+                                      "--variant", "with_skill", "--judge-cmd", f"{sys.executable} {judge}",
+                                      "--out", out, "--transcripts", transcripts)
+            self.assertEqual(code, 0, stderr)
             rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(rows[0]["judge_task_id"], "case-1::with_skill::run-1::quality")
             self.assertTrue(rows[0]["passed"])
@@ -705,7 +650,7 @@ class SkillBenchmarkTests(unittest.TestCase):
                     "input_tokens": 80, "output_tokens": 20}},
             ]
             trace.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
-            sb.import_trace(SimpleNamespace(source="codex", trace=str(trace), run_dir=str(run_dir), out_events=None, out_metrics=None, write_metadata=False))
+            self.assertEqual(run_cli("import-trace", "--source", "codex", "--trace", trace, "--run-dir", run_dir)[0], 0)
             self.assertTrue((run_dir / "metadata.json").is_file())
             events = json.loads((run_dir / "events.json").read_text(encoding="utf-8"))
             metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
@@ -738,9 +683,7 @@ class SkillBenchmarkTests(unittest.TestCase):
             trace = root / "trace.jsonl"
             trace.write_text('{"type":"event","status":"completed"}\n',
                              encoding="utf-8")
-            sb.import_trace(SimpleNamespace(
-                source="generic", trace=str(trace), run_dir=str(run),
-                out_events=None, out_metrics=None))
+            self.assertEqual(run_cli("import-trace", "--trace", trace, "--run-dir", run)[0], 0)
             metrics = json.loads(
                 (run / "metrics.json").read_text(encoding="utf-8"))
             self.assertTrue(metrics["process_observation_complete"])
@@ -749,9 +692,7 @@ class SkillBenchmarkTests(unittest.TestCase):
             invalid_trace = root / "invalid.jsonl"
             invalid_trace.write_bytes(
                 b'{"type":"message","content":"\xff"}\n')
-            sb.import_trace(SimpleNamespace(
-                source="generic", trace=str(invalid_trace),
-                run_dir=str(invalid_run), out_events=None, out_metrics=None))
+            self.assertEqual(run_cli("import-trace", "--trace", invalid_trace, "--run-dir", invalid_run)[0], 0)
             invalid_metrics = json.loads(
                 (invalid_run / "metrics.json").read_text(encoding="utf-8"))
             self.assertFalse(invalid_metrics["trace_observation_complete"])
@@ -931,6 +872,22 @@ class SkillBenchmarkTests(unittest.TestCase):
                 list(sb.paired_run_bases(
                     runs, "case", "with_skill", "without_skill"))
 
+    def test_a_missing_middle_run_is_a_fail_line_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = self.make_manifest(root)
+            runs = root / "repo" / "eval-runs" / "latest"
+            for variant in ("with_skill", "without_skill"):
+                for run in ("run-1", "run-3"):
+                    base = runs / "case-1" / variant / run
+                    base.mkdir(parents=True)
+                    (base / "output.md").write_text("alpha beta", encoding="utf-8")
+            code, _, stderr = run_cli("benchmark", manifest, "--runs", runs,
+                                      "--out", root / "benchmark.json")
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL: non-contiguous run identities under", stderr)
+        self.assertNotIn("Traceback", stderr)
+
     def test_token_overhead_reports_missing_and_unscorable_pairs_as_blocked(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1017,7 +974,9 @@ class SkillBenchmarkTests(unittest.TestCase):
                 encoding="utf-8",
             )
             runs = root / "runs"
-            sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(runs), codex_cmd=f"{sys.executable} {fake}", timeout=5))
+            code, _, stderr = run_cli("run-codex", "--tasks", tasks, "--runs", runs,
+                                      "--codex-cmd", f"{sys.executable} {fake}", "--timeout", "5")
+            self.assertEqual(code, 0, stderr)
             base = runs / "case-1" / "with_skill"
             self.assertTrue((base / "trace.jsonl").exists())
             self.assertEqual((base / "output.md").read_text(encoding="utf-8"), "alpha beta")
@@ -1036,7 +995,9 @@ class SkillBenchmarkTests(unittest.TestCase):
             fake = root / "bad_codex.py"
             fake.write_text("import sys\nprint('{not json')\nprint('plain diagnostic')\nsys.exit(2)\n", encoding="utf-8")
             runs = root / "runs"
-            sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(runs), codex_cmd=f"{sys.executable} {fake}", timeout=5))
+            code, _, stderr = run_cli("run-codex", "--tasks", tasks, "--runs", runs,
+                                      "--codex-cmd", f"{sys.executable} {fake}", "--timeout", "5")
+            self.assertEqual(code, 0, stderr)   # the failed run is recorded, not the command
             base = runs / "case-1" / "with_skill"
             self.assertIn("CODEX FAILURE", (base / "output.md").read_text(encoding="utf-8"))
             metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
@@ -1051,18 +1012,25 @@ class SkillBenchmarkTests(unittest.TestCase):
             row = sb.prepared_task_rows(manifest, sb.load_json(manifest))[0]
             tasks = root / "tasks.jsonl"
             tasks.write_text(json.dumps(row) + "\n" + json.dumps(row) + "\n", encoding="utf-8")
-            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-                sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(root / "runs"),
-                                             codex_cmd=str(root / "must-not-run"), timeout=5))
+            code, _, stderr = run_cli("run-codex", "--tasks", tasks, "--runs", root / "runs",
+                                      "--codex-cmd", root / "must-not-run", "--timeout", "5")
+            self.assertEqual(code, 1, stderr)
+            self.assertIn("duplicate prepared task identity", stderr)
             self.assertFalse((root / "runs").exists())
 
     def test_run_codex_rejects_unsafe_run_dir(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
+            # A real prepared row with only its run_dir made unsafe: a bare row
+            # died earlier on its missing run_number, a guard this test is not for.
+            manifest = self.make_manifest(root)
+            row = {**sb.prepared_task_rows(manifest, sb.load_json(manifest))[0], "run_dir": "../outside"}
             tasks = root / "tasks.jsonl"
-            tasks.write_text(json.dumps({"case_id": "case", "variant": "with_skill", "run_dir": "../outside", "prompt": "x"}) + "\n", encoding="utf-8")
-            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-                sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(root / "runs"), codex_cmd=f"{sys.executable} -c 'print(1)'", timeout=5))
+            tasks.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            code, _, stderr = run_cli("run-codex", "--tasks", tasks, "--runs", root / "runs",
+                                      "--codex-cmd", f"{sys.executable} -c 'print(1)'", "--timeout", "5")
+            self.assertEqual(code, 1, stderr)
+            self.assertIn("run_dir must be a safe non-root relative path", stderr)
             self.assertFalse((root / "outside").exists())
 
     def test_run_jetty_uploads_bundle_submits_polls_and_fetches_artifacts(self):
@@ -1162,19 +1130,6 @@ class SkillBenchmarkTests(unittest.TestCase):
         self.assertEqual(
             sb.jetty_artifact_sandbox_path(f"coll/task/0000/{tid}.run.0007.logs--agent--session.jsonl"),
             "/app/results/outputs/logs--agent--session.jsonl")
-
-    def test_extract_trajectory_id_reads_live_response_shapes(self):
-        # HTTP 200 (captured 2026-07-17): bare id in jetty_metadata.trajectory_id.
-        self.assertEqual(sb.extract_trajectory_id({"id": "chatcmpl-bb2bb71e", "jetty_metadata": {"trajectory_id": "bb2bb71e"}}), "bb2bb71e")
-        # HTTP 202: workflow_id is <collection>-<task>--<trajectory_id>; the DB
-        # poll route keys on the suffix, so the full id must be normalized.
-        self.assertEqual(
-            sb.extract_trajectory_id({"id": "chatcmpl-coll-my-task--37c37963",
-                                      "jetty_metadata": {"status": "running", "workflow_id": "coll-my-task--37c37963"}}),
-            "37c37963")
-        self.assertEqual(sb.extract_trajectory_id({"jetty_metadata": {"status": "running", "workflow_id": "traj_8"}}), "traj_8")
-        self.assertEqual(sb.extract_trajectory_id({"id": "chatcmpl-traj_7"}), "traj_7")
-        self.assertIsNone(sb.extract_trajectory_id({"object": "chat.completion"}))
 
 
 if __name__ == "__main__":

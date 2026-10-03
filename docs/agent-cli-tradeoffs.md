@@ -12,7 +12,7 @@ Related docs:
 
 | Dimension | Claude Code | Codex CLI | Gemini CLI | Mistral Vibe | What it means for us |
 |---|---|---|---|---|---|
-| Final answer | Strong: JSON result envelope | Strong: `--output-last-message` sidecar | Strong after strict lifecycle validation: final assistant segment / JSON `response` | Adequate: last assistant `LLMMessage.content` | Every stream-like provider needs a tested terminal-answer rule; raw trace bytes are never answer text. |
+| Final answer | Strong: JSON result envelope | Strong: `--output-last-message` sidecar | Strong after strict lifecycle validation: final assistant segment / JSON `response` | Adequate: last assistant `LLMMessage.content` (2.22 and earlier) or the last `message` entry's text blocks (2.23 and later) | Every stream-like provider needs a tested terminal-answer rule; raw trace bytes are never answer text. |
 | Judge schema | Strong: `--json-schema` | Strong: `--output-schema` | Harness-only validation after a strict JSON envelope | Harness-only validation | Gemini/Vibe verdicts fail closed in the harness because the provider is not schema-constrained. |
 | Token telemetry | Strong: provider envelope | Partial: JSONL usage events when emitted | Provider stats with per-model totals, when present | Missing in current CLI output | Missing stats remain unavailable, never numeric zero. |
 | Dollar cost | Strong: provider-reported `total_cost_usd` | Missing unless wrapper/estimator supplies it | Missing: no CLI cost field | Missing in current CLI output | Cost-per-signal is strongest for Claude and unavailable for Gemini/Vibe without an estimator. |
@@ -63,7 +63,7 @@ These are gaps where Claude and/or Codex have a stronger first-class control sur
 
 ### 1. No exported usage/cost telemetry
 
-Vibe tracks session stats internally, but current `--output json` and `--output streaming` emit `LLMMessage` objects rather than final `AgentStats`. In token-backed smoke runs, no usage/cost fields were present.
+Vibe tracks session stats internally, but `--output json` and `--output streaming` emit `LLMMessage` objects (2.22 and earlier) or public history entries (2.23 and later), never final `AgentStats`. In token-backed smoke runs, no usage/cost fields were present.
 
 Harness behavior:
 

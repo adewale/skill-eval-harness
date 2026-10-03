@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 import skill_benchmark as sb
-from run_pi_trigger_eval import pi_invocation_outcome
+from run_trigger_matrix import pi_invocation_outcome
 from trigger_contracts import (
     CompleteTriggerResult,
     CompletionEvidence,

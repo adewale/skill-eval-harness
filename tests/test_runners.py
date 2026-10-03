@@ -5,8 +5,9 @@ test_roadmap_features, test_followup_features, test_external_review_gaps,
 test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
-import argparse
+import contextlib
 import errno
+import io
 import json
 import os
 import shutil
@@ -15,7 +16,6 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from helpers import (
@@ -29,7 +29,9 @@ from helpers import (
 )
 from helpers import (
     make_eval_repo,
-    stub_claude,
+    run_cli,
+    stub_claude_stream,
+    write_with_skill_task,
 )
 from helpers import (
     write_demo_manifest as write_manifest,
@@ -39,12 +41,21 @@ from helpers import (
 )
 
 import ablation_model as am
-import run_pi_trigger_eval as tr
 import runner_contracts as rc
 import skill_benchmark as sb
 import trace_contracts as tc
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# Fake-codex source that prints one protocol-valid `codex exec --json` turn:
+# the agent message, then the turn.completed terminator carrying usage.
+FAKE_CODEX_TURN = (
+    "for record in ({'type': 'thread.started', 'thread_id': 't'}, {'type': 'turn.started'},\n"
+    "               {'type': 'item.completed', 'item': {'id': 'item_0', 'type': 'agent_message',\n"
+    "                                                   'text': 'token from codex'}},\n"
+    "               {'type': 'turn.completed', 'usage': {'input_tokens': 4, 'output_tokens': 6}}):\n"
+    "    print(json.dumps(record))\n"
+)
 
 
 def make_tasks(root: Path) -> list[dict]:
@@ -276,9 +287,265 @@ class SubagentRunnerTests(unittest.TestCase):
             self.assertEqual(metadata["usage_normalized"]["source"], "missing")
             self.assertFalse(metrics["operation_observation_complete"])
 
-    def test_agent_backends_are_registered_workspace_builders(self):
-        for name in ("subagent", "codex", "claude", "gemini", "vibe"):
-            self.assertIn(name, sb.WORKSPACE_BUILDERS)
+    def test_run_subagent_without_agent_cmd_runs_the_claude_cli(self):
+        # The default backend drives `claude -p --output-format stream-json`,
+        # as run-claude does, and reports its usage and cost.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _, tasks, run_dir = write_with_skill_task(root)
+            stub = stub_claude_stream(root / "claude")
+            code, _, stderr = run_cli("run-subagent", "--tasks", tasks, "--runs", root / "runs",
+                                      "--claude-bin", stub)
+            base = root / "runs" / run_dir
+            output = (base / "output.md").read_text(encoding="utf-8")
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(output, "STREAM ANSWER token-XYZ")
+        usage = meta["usage_normalized"]
+        self.assertEqual(
+            [usage[key] for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")],
+            [11, 22, 100, 5])
+        self.assertEqual(meta["cost_normalized"]["total_cost"], 0.0123)
+
+    def test_run_subagent_does_not_grade_a_claude_error_envelope(self):
+        # Claude Code exits 0 with `is_error: true` when the API fails; run-claude
+        # records that as a provider failure, not as the answer.
+        envelope = {"type": "result", "is_error": True, "api_error_status": 529,
+                    "result": "API Error: 529 overloaded",
+                    "usage": {"input_tokens": 1, "output_tokens": 0}}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _, tasks, run_dir = write_with_skill_task(root)
+            stub = root / "claude"
+            stub.write_text(f"#!{sys.executable}\nimport sys\nsys.stdin.read()\n"
+                            f"sys.stdout.write({json.dumps(json.dumps(envelope))})\n",
+                            encoding="utf-8")
+            stub.chmod(0o755)
+            code, _, stderr = run_cli("run-subagent", "--tasks", tasks, "--runs", root / "runs",
+                                      "--claude-bin", stub)
+            base = root / "runs" / run_dir
+            output = (base / "output.md").read_text(encoding="utf-8")
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("API Error: 529 overloaded", output)
+        self.assertIn("Claude provider error (HTTP 529)", output)
+        self.assertNotEqual(meta["invocation_state"], "complete")
+
+    # --- how a run-subagent run stopped and which model served it ----------
+
+    # A fake --agent-cmd: answers each turn with the next reply from a JSON
+    # list, indexed by how many turns the request's history already holds.
+    AGENT_CMD_REPLIES = (
+        "import json, sys\n"
+        "request = json.load(sys.stdin)\n"
+        "replies = json.load(open(sys.argv[1], encoding='utf-8'))\n"
+        "print(json.dumps(replies[len(request.get('history') or [])]))\n")
+
+    def agent_cmd(self, root: Path, replies: list[dict]) -> tuple[str, str]:
+        script, replies_path = root / "agent.py", root / "replies.json"
+        script.write_text(self.AGENT_CMD_REPLIES, encoding="utf-8")
+        replies_path.write_text(json.dumps(replies), encoding="utf-8")
+        return "--agent-cmd", f"{sys.executable} {script} {replies_path}"
+
+    def subagent_then_benchmark(self, root: Path, *backend: str | Path,
+                                model: str | None = None,
+                                cases: list[dict] | None = None) -> tuple[dict, dict, Path]:
+        """prepare, run-subagent and benchmark through the CLI. Returns the
+        with_skill run's metadata, the benchmark rows by variant, and the
+        with_skill run directory."""
+        manifest = make_eval_repo(root, cases=cases)
+        tasks, runs, bench = root / "tasks.jsonl", root / "runs", root / "benchmark.json"
+        for argv in (("prepare", manifest, "--out", tasks),
+                     ("run-subagent", "--tasks", tasks, "--runs", runs, *backend,
+                      *(("--model", model) if model else ())),
+                     ("benchmark", manifest, "--runs", runs, "--out", bench)):
+            code, _, stderr = run_cli(*argv)
+            self.assertEqual(code, 0, f"{argv[0]}: {stderr}")
+        base = runs / "case-1" / "with_skill"
+        meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+        rows = {row["variant"]: row
+                for row in json.loads(bench.read_text(encoding="utf-8"))["results"]}
+        return meta, rows, base
+
+    def test_run_subagent_records_how_the_claude_run_stopped_and_its_model(self):
+        # A Claude answer cut off at max_tokens exits 0 with a partial answer.
+        # run-claude records it as truncated, which makes it unscorable; the
+        # default run-subagent backend drives the same CLI and must too.
+        for stop_reason, stop_class, unscorable in (
+                ("max_tokens", "truncated", "stopped:truncated"),
+                ("end_turn", "completed", None)):
+            with self.subTest(stop_reason=stop_reason), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                stub = stub_claude_stream(root / "claude", answer="alpha, then", stop_reason=stop_reason,
+                                          served_model="claude-haiku-4-5-20251001")
+                meta, rows, _ = self.subagent_then_benchmark(
+                    root, "--claude-bin", stub, model="claude-haiku-4-5")
+                self.assertEqual((meta["stop_class"], meta["stop_reason"]), (stop_class, stop_reason))
+                self.assertEqual(
+                    (meta["requested_model"], meta["served_model"], meta["served_models"],
+                     meta["served_model_check"]),
+                    ("claude-haiku-4-5", "claude-haiku-4-5-20251001",
+                     ["claude-haiku-4-5-20251001"], "match"))
+                self.assertEqual(rows["with_skill"].get("unscorable_reason"), unscorable)
+                self.assertEqual(rows["with_skill"]["execution_valid"], unscorable is None)
+
+    def test_agent_cmd_reports_its_stop_class_and_served_models(self):
+        # (reply, stop_class, stop_reason, served_model_check, unscorable_reason)
+        cases = (
+            # An agent command written before these fields still runs, and its
+            # run records unavailable evidence and stays scorable.
+            ({"answer": "alpha"}, "unavailable", None, "unavailable", None),
+            ({"answer": "alpha", "stop_class": "truncated", "stop_reason": "length",
+              "served_models": ["gpt-5"]}, "truncated", "length", "match", "stopped:truncated"),
+            ({"answer": "alpha", "stop_class": "completed", "stop_reason": "stop",
+              "served_models": ["gpt-5-mini"]}, "completed", "stop", "mismatch",
+             "served_model_mismatch"),
+            ({"answer": "alpha", "stop_class": "refused", "served_models": ["gpt-5"]},
+             "refused", None, "match", None),
+            # Providers name their stops differently, so a raw reason without a
+            # class is kept as evidence but not mapped to one.
+            ({"answer": "alpha", "stop_reason": "length"}, "unavailable", None, "unavailable", None),
+        )
+        for reply, stop_class, stop_reason, check, unscorable in cases:
+            with self.subTest(reply=reply), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                meta, rows, _ = self.subagent_then_benchmark(
+                    root, *self.agent_cmd(root, [reply]), model="gpt-5")
+                self.assertEqual((meta["stop_class"], meta["stop_reason"], meta["served_model_check"]),
+                                 (stop_class, stop_reason, check))
+                self.assertEqual(rows["with_skill"].get("unscorable_reason"), unscorable)
+                self.assertEqual(rows["with_skill"]["execution_valid"], unscorable is None)
+                if "stop_reason" in reply and "stop_class" not in reply:
+                    self.assertIn("'length'", meta["stop_source"])
+
+    def test_a_cut_off_middle_turn_makes_the_multi_turn_run_unscorable(self):
+        case = {"id": "case-1", "split": "tune",
+                "turns": [{"prompt": "first"}, {"prompt": "second"}],
+                "assertions": [{"name": "has-alpha", "type": "contains", "value": "alpha"}]}
+        # (turn replies, run stop_class and stop_reason, unscorable_reason)
+        cases = (
+            # Turn 1 was cut off, so turn 2 answered a broken transcript.
+            ([{"answer": "alpha, then", "stop_class": "truncated", "stop_reason": "length",
+               "served_models": ["model-a"]},
+              {"answer": "alpha", "stop_class": "completed", "stop_reason": "stop",
+               "served_models": ["model-b"]}],
+             ("truncated", "length"), "stopped:truncated"),
+            # Otherwise the run ends the way its last turn did.
+            ([{"answer": "alpha", "stop_class": "completed", "served_models": ["model-a"]},
+              {"answer": "alpha", "stop_class": "refused", "stop_reason": "content_filter",
+               "served_models": ["model-b"]}],
+             ("refused", "content_filter"), None),
+        )
+        for replies, stop, unscorable in cases:
+            with self.subTest(stop=stop), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                meta, rows, base = self.subagent_then_benchmark(
+                    root, *self.agent_cmd(root, replies), model="model-a", cases=[case])
+                self.assertEqual((meta["stop_class"], meta["stop_reason"]), stop)
+                turns = [json.loads((base / f"turn-{n}" / "metadata.json").read_text(encoding="utf-8"))
+                         for n in (1, 2)]
+                self.assertEqual([turn["stop_class"] for turn in turns],
+                                 [reply["stop_class"] for reply in replies])
+                # Two models answered: neither is credited, and the requested
+                # one is among them.
+                self.assertEqual((meta["served_model"], meta["served_models"], meta["served_model_check"]),
+                                 (None, ["model-a", "model-b"], "mixed"))
+                self.assertEqual(rows["with_skill"].get("unscorable_reason"), unscorable)
+
+    def test_a_multi_turn_claude_run_sums_its_turns(self):
+        # The default backend makes one `claude -p` call per turn, so each
+        # call's usage is that turn's own spend and the run's total is their sum.
+        case = {"id": "case-1", "split": "tune",
+                "turns": [{"prompt": "first"}, {"prompt": "second"}],
+                "assertions": [{"name": "has-alpha", "type": "contains", "value": "alpha"}]}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            stub = stub_claude_stream(root / "claude", answer="alpha", in_tok=11, out_tok=22, cost=0.0123)
+            meta, _, base = self.subagent_then_benchmark(root, "--claude-bin", stub, cases=[case])
+            metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
+        summary = meta["multi_turn_telemetry"]
+        self.assertEqual({channel: summary[channel]["availability"] for channel in ("usage", "cost")},
+                         {"usage": "complete", "cost": "complete"})
+        self.assertEqual((metrics["input_tokens"], metrics["output_tokens"]), (22, 44))
+        self.assertAlmostEqual(metrics["cost_usd"], 0.0246)
+
+    def test_an_unknown_stop_class_is_refused_with_the_vocabulary(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _, tasks, run_dir = write_with_skill_task(root)
+            code, _, stderr = run_cli(
+                "run-subagent", "--tasks", tasks, "--runs", root / "runs",
+                *self.agent_cmd(root, [{"answer": "alpha", "stop_class": "cut_off"}]))
+            output = (root / "runs" / run_dir / "output.md").read_text(encoding="utf-8")
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("subagent response stop_class must be one of completed, truncated, "
+                      "turn_limit, refused, other; got 'cut_off'", output)
+
+    def test_subagent_response_completion_fields_are_validated(self):
+        cases = (
+            ({"stop_class": "unavailable"}, "stop_class must be one of"),
+            ({"stop_class": 3}, "stop_class must be one of"),
+            ({"stop_reason": ""}, "stop_reason must be a non-empty string"),
+            ({"stop_reason": ["length"]}, "stop_reason must be a non-empty string"),
+            ({"served_models": "gpt-5"}, "served_models must be a list of non-empty strings"),
+            ({"served_models": ["gpt-5", ""]}, "served_models must be a list of non-empty strings"),
+            ({"served_models": [None]}, "served_models must be a list of non-empty strings"),
+        )
+        for fields, message in cases:
+            with self.subTest(fields=fields):
+                with self.assertRaises((TypeError, ValueError)) as caught:
+                    sb.validate_subagent_response({"answer": "alpha", **fields})
+                self.assertIn(message, str(caught.exception))
+
+    def test_a_claude_run_carries_the_same_process_evidence_under_run_subagent_as_run_claude(self):
+        # The canonical stub stream runs `npm test` through Bash and Reads the
+        # skill's SKILL.md before answering; the process assertions below can
+        # only pass on that tool-use evidence, never on the answer text. The
+        # fake also records the files in its working directory: the prompt
+        # names the skill by its path in the run's workspace.
+        case = {"id": "case-1", "split": "tune", "prompt": "Run the tests.",
+                "assertions": [
+                    {"name": "ran-tests", "type": "command_ran", "pattern": "npm test"},
+                    {"name": "loaded-skill", "type": "skill_invoked", "expected": True}]}
+        evidence = {}
+        for command in ("run-claude", "run-subagent"):
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                manifest = make_eval_repo(root, cases=[case])
+                tasks, runs, bench = root / "tasks.jsonl", root / "runs", root / "benchmark.json"
+                stub, calls = stub_claude_stream(root / "claude-stream"), root / "calls.jsonl"
+                claude = root / "claude"
+                claude.write_text(
+                    f"#!{sys.executable}\nimport json, os, sys\n"
+                    "prompt = sys.stdin.read()\n"
+                    "files = sorted(os.path.relpath(os.path.join(d, f)) for d, _, fs in os.walk('.') for f in fs)\n"
+                    f"print(json.dumps([prompt, files]), file=open({str(calls)!r}, 'a'))\n"
+                    f"os.execv({str(stub)!r}, [{str(stub)!r}, *sys.argv[1:]])\n", encoding="utf-8")
+                claude.chmod(0o755)
+                for argv in (("prepare", manifest, "--out", tasks),
+                             (command, "--tasks", tasks, "--runs", runs, "--claude-bin", claude),
+                             ("benchmark", manifest, "--runs", runs, "--out", bench)):
+                    code, _, stderr = run_cli(*argv)
+                    self.assertEqual(code, 0, f"{argv[0]}: {stderr}")
+                seen = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(sorted("skills/demo/SKILL.md" in files
+                                        for prompt, files in seen if "skills/demo/SKILL.md" in prompt), [True])
+                base = runs / "case-1" / "with_skill"
+                events = json.loads((base / "events.json").read_text(encoding="utf-8"))
+                metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
+                row = next(row for row in json.loads(bench.read_text(encoding="utf-8"))["results"]
+                           if row["variant"] == "with_skill")
+                self.assertEqual([(e["type"], e["name"], e["input_summary"]) for e in events["events"]
+                                  if e["status"] == "completed" and e.get("name")],
+                                 [("command", "Bash", "npm test"),
+                                  ("skill_load", "Read", "skills/demo/SKILL.md")])
+                self.assertEqual({a["name"]: a["passed"] for a in row["assertions"]},
+                                 {"ran-tests": True, "loaded-skill": True})
+                # Read through the Claude stream dialect, as run-claude reads it.
+                self.assertEqual(metrics["source"], "claude")
+                self.assertTrue(metrics["trace_observation_complete"])
+                evidence[command] = (metrics["commands"], metrics["tool_calls"], metrics["skill_invoked"])
+        self.assertEqual(evidence.get("run-subagent"), evidence.get("run-claude"))
 
 
 class ToolReplayTests(unittest.TestCase):
@@ -506,6 +773,23 @@ class TraceEventStateTests(unittest.TestCase):
         self.assertEqual(event["state_source"], "provider_event_kind")
         self.assertEqual(len(sb.command_events([event])), 1)
 
+    def test_event_kinds_are_read_by_word_not_by_substring(self):
+        # Codex opens every stream with thread.started; "th-read" once made it
+        # a file read, inflating file_reads on every Codex run.
+        cases = {
+            "thread.started": "event",
+            "file_read": "file_read",
+            "read": "file_read",
+            "file_write": "file_write",
+            "edit": "file_write",
+            "skill_load": "skill_load",
+            "already.done": "event",
+        }
+        for raw_type, expected in cases.items():
+            with self.subTest(raw_type=raw_type):
+                event = sb.normalize_trace_record({"type": raw_type}, source="codex", index=0, line=1)
+                self.assertEqual(event["type"], expected)
+
     def test_statusless_or_unknown_terminal_looking_kinds_do_not_count(self):
         records = [
             {"type": "command", "command": "echo no"},
@@ -577,31 +861,34 @@ class OTelNormalizationTests(unittest.TestCase):
         self.assertTrue(r["passed"])
 
 
-class D1_FailureMarkerOwnerTests(unittest.TestCase):
-    """The failure-body prefixes that runners WRITE are the same constants the
-    detector READS — so a renamed marker can't slip a crashed run past scoring."""
+class FailureMarkerOwnerTests(unittest.TestCase):
+    """The failure bodies runners WRITE are rejected by the scorer on their text
+    alone, for every provider the backend registry binds a marker to — so a
+    marker the detector forgets can't slip a crashed run past scoring."""
 
-    def test_writer_constants_are_exactly_the_detector_markers(self):
-        import ablation_model as am
-        self.assertEqual(
-            am.RUNNER_FAILURE_MARKERS[:4],
-            (am.CODEX_FAILURE, am.JETTY_FAILURE, am.CLAUDE_FAILURE,
-             am.VIBE_FAILURE),
-        )
-        self.assertEqual(am.RUNNER_FAILURE_MARKERS[-1], am.TIMEOUT_FAILURE)
-        self.assertEqual(
-            set(am.RUNNER_FAILURE_MARKERS[:-1]),
-            set(am.RUNNER_FAILURE_MARKER_BY_PROVIDER.values()),
-        )
-        self.assertEqual(
-            len(am.RUNNER_FAILURE_MARKERS[:-1]),
-            len(set(am.RUNNER_FAILURE_MARKERS[:-1])),
-        )
-
-    def test_each_formatted_failure_body_is_non_executable(self):
-        import ablation_model as am
-        for marker in am.RUNNER_FAILURE_MARKERS:
-            self.assertFalse(am.execution_valid({}, f"{marker}: something broke]\n"))
+    def test_every_provider_failure_body_is_non_executable(self):
+        for provider, marker in am.RUNNER_FAILURE_MARKER_BY_PROVIDER.items():
+            outcomes = {
+                "spawn": am.RunnerOutcome(provider=provider, returncode=127,
+                                          invocation_state="spawn_failed", error="not found"),
+                "returncode": am.RunnerOutcome(provider=provider, answer="partial answer",
+                                               returncode=2, stderr="boom"),
+            }
+            for shape, outcome in outcomes.items():
+                with self.subTest(provider=provider, shape=shape), tempfile.TemporaryDirectory() as td:
+                    base = Path(td) / "run"
+                    sb.write_runner_outcome(base, outcome)
+                    body = (base / "output.md").read_text(encoding="utf-8")
+                    self.assertTrue(body.startswith(f"{marker}: "), body)
+                    self.assertFalse(am.execution_valid({}, body))
+                    self.assertFalse(am.execution_valid({}, "\n  " + body))
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "run"
+            sb.write_runner_outcome(base, am.RunnerOutcome(
+                provider="codex", timed_out=True, error="wall clock exceeded"))
+            body = (base / "output.md").read_text(encoding="utf-8")
+        self.assertTrue(body.startswith(f"{am.TIMEOUT_FAILURE}: "), body)
+        self.assertFalse(am.execution_valid({}, body))
 
 
 class R3_WithoutSkillCarriesNoSkillTests(unittest.TestCase):
@@ -622,20 +909,27 @@ class SharedSkillInvokedTests(unittest.TestCase):
     read — not a 'mounted => invoked' fiat."""
 
     def test_detect_trigger_is_evidence_based(self):
-        sp = Path("/ws/skills/root-0/SKILL.md")
-        read_it = json.dumps({"type": "tool_use", "name": "Read",
-                              "status": "completed",
-                              "input": {"file_path": "/ws/skills/root-0/SKILL.md"}})
-        invoked, evidence = sb.detect_trigger(read_it, [sp])
-        self.assertTrue(invoked)
-        self.assertTrue(evidence)
-        never = json.dumps({"type": "tool_use", "name": "Read",
-                            "status": "completed",
-                            "input": {"file_path": "/ws/inputs/data.csv"}})
-        self.assertEqual(sb.detect_trigger(never, [sp]), (False, []))   # mounted but unread => False
-
-    def test_trigger_eval_uses_the_one_owner(self):
-        self.assertIs(tr.detect_trigger, sb.detect_trigger)
+        skill = "/ws/skills/good-readme/SKILL.md"
+        events = {
+            # label: (one completed event, expected (invoked, evidence))
+            "a Read of the mounted SKILL.md": (
+                {"type": "tool_use", "name": "Read", "input": {"file_path": skill}}, (True, [skill])),
+            "a file_read of the mounted SKILL.md": (
+                {"type": "file_read", "path": skill}, (True, [skill])),
+            "a command array that cats it": (
+                {"type": "command", "command": ["bash", "-lc", f"cat {skill}"]},
+                (True, [f"bash -lc cat {skill}"])),
+            # mounted but unread => False
+            "a Read of an input file": (
+                {"type": "tool_use", "name": "Read", "input": {"file_path": "/ws/inputs/data.csv"}}, (False, [])),
+            # the skill's bare name is not its mounted path
+            "a repo file under a dir named like the skill": (
+                {"type": "file_read", "path": "good-readme/README.md"}, (False, [])),
+        }
+        for label, (event, expected) in events.items():
+            with self.subTest(label):
+                stream = json.dumps({**event, "status": "completed"})
+                self.assertEqual(sb.detect_trigger(stream, [Path(skill)]), expected)
 
 
 class JettyReferencesUploadTests(unittest.TestCase):
@@ -643,7 +937,6 @@ class JettyReferencesUploadTests(unittest.TestCase):
     even with no materialized ablations, so Jetty matches codex's dir mount."""
 
     def test_with_skill_uploads_references_without_ablations(self):
-        import argparse
         with tempfile.TemporaryDirectory() as td:
             root = Path(td); rp = root / "repo"; sd = rp / "skills" / "good-pr"; (sd / "references").mkdir(parents=True)
             (sd / "SKILL.md").write_text("---\nname: good-pr\ndescription: d. Use it.\n---\n\n# B\n\nSee [g](references/g.md).\n", encoding="utf-8")
@@ -655,7 +948,8 @@ class JettyReferencesUploadTests(unittest.TestCase):
                  "ablations": []}
             p = rp / "evals" / "shared-benchmark.json"; p.write_text(json.dumps(m), encoding="utf-8")
             out = root / "jetty.jsonl"
-            sb.export_jetty(argparse.Namespace(manifest=str(p), out=str(out)))
+            code, _, stderr = run_cli("export-jetty", p, "--out", out)
+            self.assertEqual(code, 0, stderr)
             payloads = [json.loads(l) for l in out.read_text(encoding="utf-8").splitlines()]
             ws = next(pl for pl in payloads if pl["harness"]["variant"] == "with_skill")
             hints = [f["remote_path_hint"] for f in ws["upload_plan"]["files"] if f["role"] == "skill"]
@@ -696,36 +990,29 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             time.sleep(0.01)
         self.fail(f"process {pid} is still running after {timeout:.1f}s")
 
-    def _one_with_skill_task(self, root: Path) -> tuple[Path, str]:
-        case = {"id": "c", "split": "tune", "prompt": "do it",
-                "assertions": [{"name": "a", "type": "contains", "value": "token"}]}
-        manifest = make_eval_repo(root, cases=[case])
-        rows = [r for r in sb.prepared_task_rows(manifest, sb.validate_manifest(manifest)) if r["variant"] == "with_skill"]
-        tasks = root / "tasks.jsonl"
-        tasks.write_text(json.dumps(rows[0]) + "\n", encoding="utf-8")
-        return tasks, rows[0]["run_dir"]
-
     def test_codex_and_claude_produce_the_same_contract_shape(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            tasks, run_dir = self._one_with_skill_task(root)
+            _, tasks, run_dir = write_with_skill_task(root)
 
             fake_codex = root / "fake_codex.py"
             fake_codex.write_text(
                 "import json, pathlib, sys\n_ = sys.stdin.read()\n"
                 "assert '--output-last-message' in sys.argv\n"
                 "pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('token from codex')\n"
-                "print(json.dumps({'role': 'assistant', 'content': 'trace from codex',"
-                " 'usage': {'input_tokens': 4, 'output_tokens': 6}}))\n",
+                + FAKE_CODEX_TURN,
                 encoding="utf-8")
             codex_runs = root / "codex-runs"
-            sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(codex_runs),
-                                         codex_cmd=f"{sys.executable} {fake_codex}", timeout=30))
+            code, _, stderr = run_cli("run-codex", "--tasks", tasks, "--runs", codex_runs,
+                                      "--codex-cmd", f"{sys.executable} {fake_codex}", "--timeout", "30")
+            self.assertEqual(code, 0, stderr)
 
-            claude_bin = stub_claude(root / "claude_stub.py", answer="token from claude")
+            claude_bin = stub_claude_stream(root / "claude_stub.py", answer="token from claude")
             claude_runs = root / "claude-runs"
-            sb.run_claude(argparse.Namespace(tasks=str(tasks), runs=str(claude_runs),
-                                             model="claude-haiku-4-5-20251001", claude_bin=str(claude_bin), timeout=30))
+            code, _, stderr = run_cli("run-claude", "--tasks", tasks, "--runs", claude_runs,
+                                      "--model", "claude-haiku-4-5-20251001", "--claude-bin", claude_bin,
+                                      "--timeout", "30")
+            self.assertEqual(code, 0, stderr)
 
             codex_base = codex_runs / run_dir
             claude_base = claude_runs / run_dir
@@ -741,10 +1028,13 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertEqual(claude_meta["provider"], "claude")
             # Telemetry is an explicit block carrying the real normalized values,
             # not merely a present key — a regression dropping the numbers must fail.
-            self.assertEqual(codex_meta["usage_normalized"]["total_tokens"], 10)   # 4+6 from the trace
+            self.assertEqual(codex_meta["usage_normalized"]["total_tokens"], 10)   # 4+6 from turn.completed
             self.assertEqual(codex_meta["usage_normalized"]["source"], "trace_normalized")
-            self.assertEqual(claude_meta["usage_normalized"]["total_tokens"], 33)  # 11+22 from the envelope
+            self.assertEqual(claude_meta["usage_normalized"]["total_tokens"], 33)  # 11+22 from the result event
             self.assertEqual(claude_meta["usage_normalized"]["source"], "provider_reported")
+            # The one report reader agrees with the persisted blocks.
+            self.assertEqual(sb.run_cost_facts(codex_meta)["total_tokens"], 10)
+            self.assertEqual(sb.run_cost_facts(claude_meta)["total_tokens"], 33)
             self.assertIn("source", codex_meta["cost_normalized"])
             self.assertIn("source", claude_meta["cost_normalized"])
             # The whole-writer consolidation means both providers land on the same
@@ -757,7 +1047,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
     def test_run_agent_dispatches_registered_claude_and_codex_backends(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            tasks, run_dir = self._one_with_skill_task(root)
+            _, tasks, run_dir = write_with_skill_task(root)
             fake_codex = root / "fake_codex.py"
             fake_codex.write_text(
                 "import json, pathlib, sys\n_ = sys.stdin.read()\n"
@@ -768,18 +1058,22 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                 "assert not codex_home.is_relative_to(pathlib.Path.cwd())\n"
                 "assert not (pathlib.Path.cwd() / '.codex' / 'auth.json').exists()\n"
                 "pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('token from codex')\n"
-                "print(json.dumps({'role': 'assistant', 'content': 'trace from codex'}))\n",
+                + FAKE_CODEX_TURN,
                 encoding="utf-8")
             codex_runs = root / "agent-codex"
-            sb.run_agent(argparse.Namespace(agent="codex", tasks=str(tasks), runs=str(codex_runs), model="gpt-mini",
-                                            codex_cmd=f"{sys.executable} {fake_codex}", claude_bin="claude", timeout=30))
+            code, _, stderr = run_cli("run-agent", "--agent", "codex", "--tasks", tasks, "--runs", codex_runs,
+                                      "--model", "gpt-mini", "--codex-cmd", f"{sys.executable} {fake_codex}",
+                                      "--timeout", "30")
+            self.assertEqual(code, 0, stderr)
             self.assertIn("token from codex", (codex_runs / run_dir / "output.md").read_text(encoding="utf-8"))
             self.assertEqual(json.loads((codex_runs / run_dir / "metadata.json").read_text(encoding="utf-8"))["model"], "gpt-mini")
 
-            claude_bin = stub_claude(root / "claude_stub.py", answer="token from claude")
+            claude_bin = stub_claude_stream(root / "claude_stub.py", answer="token from claude")
             claude_runs = root / "agent-claude"
-            sb.run_agent(argparse.Namespace(agent="claude", tasks=str(tasks), runs=str(claude_runs), model="claude-haiku-4-5-20251001",
-                                            codex_cmd="codex exec --json", claude_bin=str(claude_bin), timeout=30))
+            code, _, stderr = run_cli("run-agent", "--agent", "claude", "--tasks", tasks, "--runs", claude_runs,
+                                      "--model", "claude-haiku-4-5-20251001", "--claude-bin", claude_bin,
+                                      "--timeout", "30")
+            self.assertEqual(code, 0, stderr)
             self.assertIn("token from claude", (claude_runs / run_dir / "output.md").read_text(encoding="utf-8"))
 
     def test_codex_cleanup_race_preserves_artifacts_and_next_task(self):
@@ -811,9 +1105,9 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             runs = root / "runs"
             with mock.patch.object(sb.shutil, "rmtree", side_effect=fail_each_codex_cleanup_once), \
                  mock.patch.object(sb.time, "sleep", return_value=None):
-                self.assertEqual(sb.run_codex(SimpleNamespace(
-                    tasks=str(tasks), runs=str(runs),
-                    codex_cmd=f"{sys.executable} {fake_codex}", timeout=30)), 0)
+                code, _, stderr = run_cli("run-codex", "--tasks", tasks, "--runs", runs,
+                                          "--codex-cmd", f"{sys.executable} {fake_codex}", "--timeout", "30")
+                self.assertEqual(code, 0, stderr)
 
             self.assertEqual(len(raced), 2)
             for row in rows:
@@ -924,9 +1218,9 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                 with mock.patch.object(sb.tempfile, "mkdtemp", side_effect=record_invoke_temp), \
                      mock.patch.object(sb.shutil, "rmtree", side_effect=retain_invoke_temp), \
                      mock.patch.object(sb.time, "sleep", return_value=None):
-                    self.assertEqual(sb.run_codex(SimpleNamespace(
-                        tasks=str(tasks), runs=str(runs),
-                        codex_cmd=f"{sys.executable} {fake_codex}", timeout=30)), 0)
+                    code, _, stderr = run_cli("run-codex", "--tasks", tasks, "--runs", runs,
+                                              "--codex-cmd", f"{sys.executable} {fake_codex}", "--timeout", "30")
+                    self.assertEqual(code, 0, stderr)
 
                 self.assertEqual(len(invoke_temps), 2)
                 self.assertEqual(len(set(invoke_temps)), 2)
@@ -1096,13 +1390,36 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                 except ProcessLookupError:
                     pass
 
+    def test_runner_commands_reject_missing_or_empty_tasks_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            empty = root / "empty.jsonl"
+            empty.write_text("\n", encoding="utf-8")
+            files = {"missing": (root / "missing.jsonl", "tasks file not found"),
+                     "empty": (empty, "tasks file has no prepared tasks")}
+            commands = (["run-agent", "--agent", "codex"], ["run-codex"], ["run-claude"], ["run-subagent"])
+            for command in commands:
+                for kind, (tasks, message) in files.items():
+                    argv = ["skill-benchmark", *command, "--tasks", str(tasks), "--runs", str(root / "runs")]
+                    stderr = io.StringIO()
+                    with self.subTest(command=command[0], tasks=kind), \
+                         mock.patch.object(sys, "argv", argv), \
+                         contextlib.redirect_stderr(stderr), \
+                         self.assertRaises(SystemExit) as raised:
+                        sb.main()
+                    self.assertEqual(raised.exception.code, 1)
+                    self.assertEqual(stderr.getvalue(), f"FAIL: {message}: {tasks}\n")
+            self.assertFalse((root / "runs").exists())
+
     def test_run_agent_writes_failure_artifact_when_native_command_is_missing(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            tasks, run_dir = self._one_with_skill_task(root)
+            _, tasks, run_dir = write_with_skill_task(root)
             runs = root / "runs"
-            sb.run_agent(argparse.Namespace(agent="codex", tasks=str(tasks), runs=str(runs), model="gpt-mini",
-                                            codex_cmd=str(root / "missing-codex"), claude_bin="claude", timeout=30))
+            code, _, stderr = run_cli("run-agent", "--agent", "codex", "--tasks", tasks, "--runs", runs,
+                                      "--model", "gpt-mini", "--codex-cmd", root / "missing-codex",
+                                      "--timeout", "30")
+            self.assertEqual(code, 0, stderr)
             base = runs / run_dir
             text = (base / "output.md").read_text(encoding="utf-8")
             meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
@@ -1124,7 +1441,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertEqual(meta["returncode"], 0)  # actual process exit is preserved
             self.assertFalse(meta["provider_response_complete"])
             self.assertNotIn(trace, text)
-            self.assertFalse(sb.execution_valid(sb.read_metadata_base(base), text))
+            self.assertFalse(sb.execution_valid(sb.read_metrics_base(base), text))
 
     def test_native_structured_adapters_reject_invalid_utf8_answer_channels(self):
         claude_bytes = (
@@ -1212,7 +1529,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertEqual((base / "output.md").read_text(encoding="utf-8"), "second")
             self.assertFalse((base / "trace.jsonl").exists())
             self.assertFalse((base / "grading.json").exists())
-            self.assertTrue(sb.read_metadata_base(base)["artifact_set_complete"])
+            self.assertTrue(sb.read_metrics_base(base)["artifact_set_complete"])
 
     def test_atomic_run_replacement_restores_previous_commit_on_install_failure(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1231,7 +1548,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                 sb.write_runner_outcome(
                     base, am.RunnerOutcome(provider="subagent", answer="new", returncode=0))
             self.assertEqual((base / "output.md").read_text(encoding="utf-8"), "old")
-            self.assertTrue(sb.read_metadata_base(base)["artifact_set_complete"])
+            self.assertTrue(sb.read_metrics_base(base)["artifact_set_complete"])
 
     def test_artifact_commit_is_required_and_detects_post_commit_mutation(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1239,11 +1556,11 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             sb.write_runner_outcome(
                 base, am.RunnerOutcome(provider="subagent", answer="hi", returncode=0))
             text = (base / "output.md").read_text(encoding="utf-8")
-            committed = sb.read_metadata_base(base)
+            committed = sb.read_metrics_base(base)
             self.assertTrue(committed["artifact_set_complete"])
             self.assertTrue(am.execution_valid(committed, text))
             (base / "output.md").write_text("tampered", encoding="utf-8")
-            tampered = sb.read_metadata_base(base)
+            tampered = sb.read_metrics_base(base)
             self.assertFalse(tampered["artifact_set_complete"])
             self.assertFalse(am.execution_valid(tampered, "tampered"))
 
@@ -1284,12 +1601,12 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["returncode"], 0)  # protocol failure does not rewrite process evidence
             self.assertFalse(meta["provider_response_complete"])
-            self.assertFalse(am.execution_valid(sb.read_metadata_base(base), text))
+            self.assertFalse(am.execution_valid(sb.read_metrics_base(base), text))
 
     def test_run_agent_dispatches_registered_vibe_backend(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            tasks, run_dir = self._one_with_skill_task(root)
+            _, tasks, run_dir = write_with_skill_task(root)
             fake_vibe = root / "fake_vibe.py"
             fake_vibe.write_text(
                 "import json, os, pathlib, sys\n"
@@ -1309,8 +1626,10 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                 " 'usage': {'input_tokens': 5, 'output_tokens': 7}, 'cost_usd': 0.02}))\n",
                 encoding="utf-8")
             runs = root / "vibe-runs"
-            sb.run_agent(argparse.Namespace(agent="vibe", tasks=str(tasks), runs=str(runs), model="mistral-test",
-                                            codex_cmd="codex exec --json", claude_bin="claude", vibe_cmd=f"{sys.executable} {fake_vibe}", timeout=30))
+            code, _, stderr = run_cli("run-agent", "--agent", "vibe", "--tasks", tasks, "--runs", runs,
+                                      "--model", "mistral-test", "--vibe-cmd", f"{sys.executable} {fake_vibe}",
+                                      "--timeout", "30")
+            self.assertEqual(code, 0, stderr)
             base = runs / run_dir
             self.assertIn("token from vibe", (base / "output.md").read_text(encoding="utf-8"))
             meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
@@ -1328,15 +1647,17 @@ class RunnerOutcomeContractTests(unittest.TestCase):
     def test_vibe_success_without_usage_writes_explicit_missing_telemetry(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            tasks, run_dir = self._one_with_skill_task(root)
+            _, tasks, run_dir = write_with_skill_task(root)
             fake_vibe = root / "fake_vibe_no_usage.py"
             fake_vibe.write_text(
                 "import json\n"
                 "print(json.dumps({'role': 'assistant', 'content': 'token from vibe'}))\n",
                 encoding="utf-8")
             runs = root / "vibe-runs"
-            sb.run_agent(argparse.Namespace(agent="vibe", tasks=str(tasks), runs=str(runs), model="mistral-test",
-                                            codex_cmd="codex exec --json", claude_bin="claude", vibe_cmd=f"{sys.executable} {fake_vibe}", timeout=30))
+            code, _, stderr = run_cli("run-agent", "--agent", "vibe", "--tasks", tasks, "--runs", runs,
+                                      "--model", "mistral-test", "--vibe-cmd", f"{sys.executable} {fake_vibe}",
+                                      "--timeout", "30")
+            self.assertEqual(code, 0, stderr)
             base = runs / run_dir
             meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["provider"], "vibe")
@@ -1372,10 +1693,11 @@ class RunnerOutcomeContractTests(unittest.TestCase):
     def test_vibe_missing_binary_uses_vibe_failure_marker(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            tasks, run_dir = self._one_with_skill_task(root)
+            _, tasks, run_dir = write_with_skill_task(root)
             runs = root / "runs"
-            sb.run_agent(argparse.Namespace(agent="vibe", tasks=str(tasks), runs=str(runs), model=None,
-                                            codex_cmd="codex exec --json", claude_bin="claude", vibe_cmd=str(root / "missing-vibe"), timeout=30))
+            code, _, stderr = run_cli("run-agent", "--agent", "vibe", "--tasks", tasks, "--runs", runs,
+                                      "--vibe-cmd", root / "missing-vibe", "--timeout", "30")
+            self.assertEqual(code, 0, stderr)
             base = runs / run_dir
             text = (base / "output.md").read_text(encoding="utf-8")
             meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
@@ -1383,24 +1705,88 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertEqual(meta["returncode"], 127)
             self.assertFalse(sb.execution_valid(meta, text))
 
-    def test_codex_empty_output_writes_explicit_missing_telemetry(self):
-        # The PR's headline consistency fix: an empty Codex run now goes through the
-        # shared writer, so it gets explicit missing telemetry and schema-2 metrics
-        # (was schema-1 metadata with no normalized blocks before the consolidation).
+    def test_codex_empty_output_is_a_failure_not_an_empty_answer(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            tasks, run_dir = self._one_with_skill_task(root)
+            _, tasks, run_dir = write_with_skill_task(root)
             silent = root / "silent_codex.py"
             silent.write_text("import sys\n_ = sys.stdin.read()\n", encoding="utf-8")  # emits nothing
             runs = root / "runs"
-            sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(runs),
-                                         codex_cmd=f"{sys.executable} {silent}", timeout=30))
+            code, _, stderr = run_cli("run-codex", "--tasks", tasks, "--runs", runs,
+                                      "--codex-cmd", f"{sys.executable} {silent}", "--timeout", "30")
+            self.assertEqual(code, 0, stderr)   # the failed run is recorded, not the command
             base = runs / run_dir
-            self.assertIn("no final answer", (base / "output.md").read_text(encoding="utf-8"))
-            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
-            self.assertEqual(meta["usage_normalized"], {"source": "missing"})
-            self.assertEqual(meta["cost_normalized"], {"source": "missing"})
-            self.assertEqual(json.loads((base / "metrics.json").read_text())["schema_version"], 2)
+            text = (base / "output.md").read_text(encoding="utf-8")
+            self.assertTrue(text.startswith(f"{sb.CODEX_FAILURE}: provider produced no final answer"), text)
+            self.assertFalse(sb.execution_valid(sb.read_metrics_base(base), text))
+
+    def test_vibe_run_says_its_output_carries_no_stop_reason(self):
+        # Vibe's --output streaming writes one LLMMessage per line (Vibe 2.22,
+        # vibe/core/output_formatters.py); none of its fields says why the
+        # model stopped, and a turn or price limit exits 1 instead. So the
+        # stop is unavailable, and the record says why rather than guessing.
+        message = {"content": None, "images": None, "injected": False, "reasoning_content": None,
+                   "reasoning_state": None, "reasoning_signature": None,
+                   "reasoning_message_id": None, "tool_calls": None, "name": None,
+                   "tool_call_id": None, "message_id": "m1", "user_display_content": None}
+        stream = [{**message, "role": "user", "content": "Task prompt"},
+                  {**message, "role": "assistant", "content": "alpha", "message_id": "m2"}]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _, tasks, run_dir = write_with_skill_task(root)
+            fake_vibe = root / "fake_vibe.py"
+            fake_vibe.write_text(
+                "import json\n"
+                f"for message in {stream!r}:\n"
+                "    print(json.dumps(message))\n", encoding="utf-8")
+            code, _, stderr = run_cli(
+                "run-agent", "--agent", "vibe", "--tasks", tasks, "--runs", root / "runs",
+                "--model", "devstral-small-latest", "--vibe-cmd", f"{sys.executable} {fake_vibe}")
+            meta = sb.read_metrics_base(root / "runs" / run_dir)
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual((meta["stop_class"], meta["stop_reason"], meta["stop_source"]),
+                         ("unavailable", None, "vibe output carries no stop reason"))
+        self.assertEqual(meta["served_model_check"], "unavailable")
+        self.assertTrue(am.execution_valid(meta, "alpha"))
+
+    def test_a_vibe_2_23_history_entry_stream_carries_answer_tool_calls_and_skill_load(self):
+        # Vibe 2.23 and later write public history entries, not LLMMessage
+        # dumps (tests/fixtures/vibe/README.md: built from Vibe 2.25.8's own
+        # code, not recorded). The stream loads the `demo` skill, reads its
+        # SKILL.md and answers; the expected values are read off the fixture.
+        fixture = ROOT / "tests" / "fixtures" / "vibe" / "streaming.2.25.8.skill-load.jsonl"
+        case = {"id": "case-1", "split": "tune", "prompt": "Review this pull request description.",
+                "assertions": [{"name": "loaded-skill", "type": "skill_invoked", "expected": True},
+                               {"name": "answered", "type": "contains", "value": "demo skill"}]}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = make_eval_repo(root, cases=[case])
+            tasks, runs, bench = root / "tasks.jsonl", root / "runs", root / "benchmark.json"
+            fake_vibe = root / "fake_vibe.py"
+            fake_vibe.write_text(f"import sys\nsys.stdout.write(open({str(fixture)!r}, encoding='utf-8').read())\n",
+                                 encoding="utf-8")
+            for argv in (("prepare", manifest, "--out", tasks),
+                         ("run-agent", "--agent", "vibe", "--tasks", tasks, "--runs", runs,
+                          "--vibe-cmd", f"{sys.executable} {fake_vibe}"),
+                         ("benchmark", manifest, "--runs", runs, "--out", bench)):
+                code, _, stderr = run_cli(*argv)
+                self.assertEqual(code, 0, f"{argv[0]}: {stderr}")
+            base = runs / "case-1" / "with_skill"
+            output = (base / "output.md").read_text(encoding="utf-8")
+            metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
+            events = json.loads((base / "events.json").read_text(encoding="utf-8"))["events"]
+            row = next(row for row in json.loads(bench.read_text(encoding="utf-8"))["results"]
+                       if row["variant"] == "with_skill")
+        self.assertEqual(output, "Reviewed with the demo skill.")
+        self.assertEqual(metrics.get("trace_protocol_errors"), None)
+        self.assertTrue(metrics["trace_observation_complete"])
+        self.assertEqual([(e["type"], e["name"], e["input_summary"]) for e in events
+                          if e["status"] == "completed" and e.get("name")],
+                         # A read of a SKILL.md is a skill load too, as for run-claude.
+                         [("skill_load", "skill", "demo"),
+                          ("skill_load", "read_file", "/work/.agents/skills/demo/SKILL.md")])
+        self.assertEqual({a["name"]: a["passed"] for a in row["assertions"]},
+                         {"loaded-skill": True, "answered": True})
 
 
 class TraceDialectRegistryTests(unittest.TestCase):
@@ -1432,60 +1818,6 @@ class TraceDialectRegistryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             sb.GENERIC_TRACE_DIALECT.flatten(records, record_lines=[3])
 
-    def test_generic_dialect_has_no_terminal_stream_semantics(self):
-        self.assertEqual(sb.GENERIC_TRACE_DIALECT.stream_semantics([], None), (None, None))
-
-    def test_claude_dialect_owns_the_stream_flatten(self):
-        self.assertIs(sb.TRACE_DIALECTS["claude"].flatten, sb.claude_stream_flat_records)
-        self.assertIs(sb.trace_dialect_for("Claude"), sb.TRACE_DIALECTS["claude"])
-
-    def test_claude_completed_tool_lifecycle_counts_exactly_once(self):
-        records = [
-            {"type": "assistant", "message": {"role": "assistant", "content": [
-                {"type": "tool_use", "id": "call-1", "name": "Read",
-                 "input": {"file_path": "/tmp/a"}},
-            ]}},
-            {"type": "user", "message": {"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "call-1", "content": "ok"},
-            ]}},
-        ]
-        events, metrics = sb.normalize_trace_records(records, source="claude")
-        lifecycle = [event for event in events["events"]
-                     if event["type"] in {"tool_call", "file_read"}]
-        self.assertEqual([event["status"] for event in lifecycle],
-                         ["in_progress", "completed"])
-        self.assertEqual(metrics["tool_calls"], 1)
-        self.assertNotIn("trace_protocol_errors", metrics)
-
-    def test_claude_dangling_and_unmatched_calls_are_protocol_invalid(self):
-        for records, phrase in (
-            ([{"type": "assistant", "message": {"content": [
-                {"type": "tool_use", "id": "call-1", "name": "Read", "input": {}},
-            ]}}], "no matching tool_result"),
-            ([{"type": "user", "message": {"content": [
-                {"type": "tool_result", "tool_use_id": "missing", "content": "x"},
-            ]}}], "unmatched Claude tool_result"),
-        ):
-            with self.subTest(phrase=phrase):
-                _, metrics = sb.normalize_trace_records(records, source="claude")
-                self.assertTrue(any(phrase in error
-                                    for error in metrics["trace_protocol_errors"]))
-
-    def test_claude_malformed_message_and_lifecycle_fields_are_protocol_invalid(self):
-        malformed = [
-            {"type": "assistant", "message": {"content": {"type": "tool_use"}}},
-            {"type": "assistant", "message": {"content": [
-                {"type": "tool_use", "id": 1, "name": "Read", "input": {}},
-                {"type": "tool_use", "id": "x", "name": "", "input": {}},
-                {"type": "tool_use", "id": "y", "name": "Read", "input": []},
-            ]}},
-            {"type": "user", "message": {"content": [
-                {"type": "tool_result", "tool_use_id": "x", "is_error": "false"},
-            ]}},
-        ]
-        _, metrics = sb.normalize_trace_records(malformed, source="claude")
-        self.assertGreaterEqual(len(metrics["trace_protocol_errors"]), 5)
-
     def test_claude_protocol_error_makes_trace_signal_unavailable(self):
         raw = json.dumps({
             "type": "assistant", "message": {"content": [
@@ -1509,15 +1841,48 @@ class TraceDialectRegistryTests(unittest.TestCase):
         self.assertFalse(passed)
         self.assertIn("trace_observation_incomplete", evidence)
 
-    def test_pi_dialect_resolves_cumulative_terminal_usage(self):
-        # The retry-then-success stream carries per-attempt usage; the dialect
-        # must resolve the FINAL attempt's cumulative usage, not a sum of
-        # attempts, and report no failure for a recovered stream.
-        raw = (ROOT / "tests" / "fixtures" / "pi" / "retry-then-success.jsonl").read_text(encoding="utf-8")
-        records, _ = sb.parse_trace_jsonl_text(raw)
-        terminal_usage, failure = sb.TRACE_DIALECTS["pi"].stream_semantics(records, None)
-        self.assertIsNone(failure)
-        self.assertEqual(sb.usage_number(terminal_usage, "total_tokens"), 13.0)
+    def test_the_vibe_dialect_reads_each_record_shape_by_its_own_rules(self):
+        # Vibe 2.22 wrote LLMMessage dumps; 2.23 and later write public history
+        # entries (tests/fixtures/vibe/README.md). The first record picks the
+        # parser, and each shape keeps its own terminal-answer rule.
+        fixture = ROOT / "tests" / "fixtures" / "vibe" / "streaming.2.25.8.skill-load.jsonl"
+        entries = [json.loads(line) for line in fixture.read_text(encoding="utf-8").splitlines()]
+        effect, answer = entries[2], entries[-1]
+        # A session-title notice as Vibe 2.25.8's EventProjector writes it.
+        notice = {"id": "notice-1", "sessionId": answer["sessionId"], "turnId": "turn-1",
+                  "createdAt": 1790979551670, "updatedAt": 1790979551670, "generationStatus": "completed",
+                  "relatedEntryId": None, "type": "notice", "level": "info", "message": "Session title updated",
+                  "detail": {"kind": "session_title_updated", "title": "Review a pull request"}}
+        llm_messages = [
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "call-1", "function": {"name": "skill", "arguments": json.dumps({"name": "demo"})}}]},
+            {"role": "tool", "tool_call_id": "call-1", "content": "loaded"},
+            {"role": "assistant", "content": "done"}]
+        terminal = "Vibe trace must end with one non-empty assistant response"
+        # (label, records, trace protocol errors, skill invoked)
+        cases = (
+            ("2.22 LLMMessage stream", llm_messages, [], True),
+            ("2.25.8 history entries", entries, [], True),
+            ("a notice after the answer is metadata", [*entries, notice], [], True),
+            ("a tool call after the answer", [*entries, {**effect, "id": "late"}], [terminal], True),
+            ("a tool the harness does not enable", [
+                *entries[:2], {**effect, "detail": {**effect["detail"], "toolName": "bash"}}, *entries[3:]],
+             ["Vibe tool call function 'bash' is unsupported"], True),
+            ("an entry Vibe had not finished", [
+                *entries[:-1], {**answer, "generationStatus": "in_progress"}],
+             ["Vibe history entry 'msg-assistant-2' is not completed"], True),
+            ("an LLMMessage record in a history-entry stream", [*entries, llm_messages[-1]],
+             ["Vibe history entry id must be a non-empty string"], True),
+        )
+        for label, records, errors, invoked in cases:
+            with self.subTest(label), tempfile.TemporaryDirectory() as td:
+                sb.write_trace_artifacts(
+                    Path(td) / "run", "".join(json.dumps(record) + "\n" for record in records),
+                    source="vibe", process_observation_complete=True, provider_response_complete=True)
+                metrics = json.loads((Path(td) / "run" / "metrics.json").read_text(encoding="utf-8"))
+                self.assertEqual(metrics.get("trace_protocol_errors", []), errors)
+                self.assertEqual(metrics["trace_observation_complete"], not errors)
+                self.assertIs(metrics["skill_invoked"], invoked)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,10 @@ as a split, case kind, or execution arm in typed code.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 ABLATION_VARIANT_PREFIX = "ablation:"
 
@@ -172,3 +175,87 @@ def ablation_id_of(variant: object) -> str | None:
     if not value.startswith(ABLATION_VARIANT_PREFIX):
         return None
     return value.removeprefix(ABLATION_VARIANT_PREFIX)
+
+
+JUDGE_TASK_DELIMITER = "::"
+
+
+@dataclass(frozen=True)
+class RunCoordinate:
+    """Which case, model, arm and repetition one run belongs to.
+
+    Every per-run record shares this key: result rows, judge tasks, human
+    judgements and experimental pairs. Before this type each spelled the tuple
+    its own way (the judge task id string, the pair key, the feedback key),
+    and each validated the parts separately.
+    """
+
+    case_id: CaseId
+    variant: ExecutionVariant
+    run_number: RunNumber
+    model: ModelId | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "case_id", CaseId.parse(self.case_id))
+        object.__setattr__(self, "variant", ExecutionVariant.parse(self.variant))
+        object.__setattr__(self, "run_number", RunNumber.parse(self.run_number))
+        if self.model is not None:
+            object.__setattr__(self, "model", ModelId.parse(self.model))
+
+    @classmethod
+    def of(cls, case_id: object, variant: object, run_number: object,
+           model: object = None) -> RunCoordinate:
+        """Validate untrusted parts strictly: the run number must be an integer."""
+        return cls(CaseId.parse(case_id), ExecutionVariant.parse(variant),
+                   RunNumber.parse(run_number),
+                   None if model is None else ModelId.parse(model))
+
+    @classmethod
+    def parse(cls, case_id: object, variant: object, run_number: object = 1,
+              model: object = None) -> RunCoordinate:
+        """Validate form or file input: a run number may arrive as text and
+        defaults to 1, and an empty model means none."""
+        if isinstance(run_number, str) and run_number.strip().isdigit():
+            run_number = int(run_number)
+        if run_number in (None, ""):
+            run_number = 1
+        return cls.of(case_id, variant, run_number, None if model == "" else model)
+
+    @classmethod
+    def from_row(cls, row: Mapping[str, Any]) -> RunCoordinate:
+        if not isinstance(row, Mapping):
+            raise ValueError("run coordinate row must be an object")
+        return cls.parse(row.get("case_id"), row.get("variant"),
+                         row.get("run_number", 1), row.get("model"))
+
+    @property
+    def key(self) -> tuple[str, str, str, int]:
+        """A sortable tuple; an unmodelled run sorts before any model."""
+        return (str(self.case_id), str(self.model or ""), str(self.variant), int(self.run_number))
+
+    def judge_task_id(self, assertion_label: str) -> str:
+        """One verdict key per (case, model, variant, run, assertion).
+
+        The model segment appears only on model-fanned runs; single-model ids
+        keep their historical shape.
+        """
+        if not isinstance(assertion_label, str) or not assertion_label:
+            raise ValueError("judge task assertion must be a non-empty string")
+        for name, value in (("case_id", self.case_id), ("variant", self.variant),
+                            ("assertion", assertion_label), ("model", self.model)):
+            if value is not None and JUDGE_TASK_DELIMITER in value:
+                raise ValueError(
+                    f"judge task {name} cannot contain reserved delimiter "
+                    f"'{JUDGE_TASK_DELIMITER}'")
+        segments = [str(self.case_id)]
+        if self.model is not None:
+            segments.append(str(self.model))
+        segments += [str(self.variant), f"run-{int(self.run_number)}", assertion_label]
+        return JUDGE_TASK_DELIMITER.join(segments)
+
+    def as_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"case_id": str(self.case_id), "variant": str(self.variant),
+                               "run_number": int(self.run_number)}
+        if self.model is not None:
+            out["model"] = str(self.model)
+        return out

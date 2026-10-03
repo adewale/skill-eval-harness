@@ -258,7 +258,7 @@ def attest_answer_design(
                 if not variant_root.exists():
                     continue
                 for run_number, base in sb.discover_run_bases_under(variant_root):
-                    metadata = sb.read_metadata_base(base)
+                    metadata = sb.read_metrics_base(base)
                     row_model = metadata.get("model", model)
                     old = coordinates.get((row_model, run_number), (False, False))
                     coordinates[(row_model, run_number)] = (
@@ -302,7 +302,15 @@ def attest_answer_design(
         "identities": identities,
     }
     design = {**payload, "design_sha256": sb.canonical_json_sha256(payload)}
-    sb.persist_answer_design_value(runs, design)
+    validated = sb.validate_answer_design(design)
+    runs.mkdir(parents=True, exist_ok=True)
+    design_path = runs / sb.ANSWER_DESIGN_NAME
+    if design_path.exists():
+        existing = sb.validate_answer_design(json.loads(design_path.read_text(encoding="utf-8")))
+        if existing != validated:
+            sb.die("runs directory already carries a different answer design")
+    else:
+        sb.write_json(design_path, validated)
     for identity in identities:
         base = runs / identity["run_dir"]
         if not base.exists():
@@ -372,39 +380,6 @@ def result_row(
     return row
 
 
-def judge_task(
-    case_id: str = "c",
-    variant: str = "with_skill",
-    run_number: int = 1,
-    *,
-    assertion: dict[str, Any] | None = None,
-    prompt: str = "judge it",
-    output_path: str = "",
-    **over: Any,
-) -> dict[str, Any]:
-    """One judge task row shaped like collect_judge_tasks/grade_case_variant emit."""
-    assertion = assertion or {"name": "j", "type": "judge", "prompt": "Is it good?"}
-    task = {
-        "judge_task_id": f"{case_id}::{variant}::run-{run_number}::{assertion.get('name', 'j')}",
-        "case_id": case_id,
-        "variant": variant,
-        "run_number": run_number,
-        "prompt": prompt,
-        "output_path": output_path,
-        "assertion": assertion,
-    }
-    task.update(over)
-    return task
-
-
-def file_judge_cmd(tmp: Path, verdict: dict[str, Any]) -> str:
-    """A judge command that ignores its input and emits a fixed verdict —
-    deterministic, offline, no model."""
-    verdict_path = tmp / "verdict.json"
-    verdict_path.write_text(json.dumps(verdict), encoding="utf-8")
-    return f"cat {verdict_path}"
-
-
 def claude_stream_records(
     *,
     answer: str = "STREAM ANSWER token-XYZ",
@@ -413,6 +388,9 @@ def claude_stream_records(
     out_tok: int = 22,
     result_event: bool = True,
     orphan_tool: bool = False,
+    served_model: str | None = None,
+    stop_reason: str | None = None,
+    subtype: str = "success",
 ) -> list[dict[str, Any]]:
     """The ONE canonical `claude -p --output-format stream-json` event sequence,
     shared by the parser/normalizer tests and the stream stub: init, a Bash
@@ -437,11 +415,21 @@ def claude_stream_records(
     if orphan_tool:
         records.append({"type": "assistant", "message": {"role": "assistant", "content": [
             {"type": "tool_use", "id": "toolu_9", "name": "Grep", "input": {"pattern": "x"}}]}})
+    if served_model is not None:
+        # Claude Code 2.1.x stamps each assistant message with the model that
+        # served it (recorded in tests/fixtures/claude/stream-json.plugin-skill.jsonl).
+        for record in records:
+            if record["type"] == "assistant":
+                record["message"]["model"] = served_model
     if result_event:
-        records.append({"type": "result", "subtype": "success", "result": answer,
-                        "total_cost_usd": cost, "duration_ms": 1200,
-                        "usage": {"input_tokens": in_tok, "output_tokens": out_tok,
-                                  "cache_read_input_tokens": 100, "cache_creation_input_tokens": 5}})
+        result: dict[str, Any] = {
+            "type": "result", "subtype": subtype, "result": answer,
+            "total_cost_usd": cost, "duration_ms": 1200,
+            "usage": {"input_tokens": in_tok, "output_tokens": out_tok,
+                      "cache_read_input_tokens": 100, "cache_creation_input_tokens": 5}}
+        if stop_reason is not None:
+            result["stop_reason"] = stop_reason
+        records.append(result)
     return records
 
 
@@ -453,20 +441,29 @@ def stub_claude_stream(
     in_tok: int = 11,
     out_tok: int = 22,
     returncode: int = 0,
+    served_model: str | None = None,
+    stop_reason: str | None = None,
+    probe_path: Path | None = None,
+    trailing_records: list[dict[str, Any]] | None = None,
 ) -> Path:
     """A fake `claude` executable for the stream-json answer path: it emits the
     canonical claude_stream_records sequence verbatim, and ONLY when
     stream-json was actually requested — so a backend that silently falls back
     to the single-envelope format fails the protocol instead of passing by
-    accident."""
+    accident. With probe_path it records its argv; trailing_records are written
+    after the result event, as Claude Code 2.1.269 writes a `system` record."""
     stream_text = "\n".join(
         json.dumps(record)
-        for record in claude_stream_records(answer=answer, cost=cost, in_tok=in_tok, out_tok=out_tok)
+        for record in [*claude_stream_records(answer=answer, cost=cost, in_tok=in_tok, out_tok=out_tok,
+                                              served_model=served_model, stop_reason=stop_reason),
+                       *(trailing_records or [])]
     ) + "\n"
+    probe = ("" if probe_path is None else
+             f"import json\nopen({json.dumps(str(probe_path))}, 'w').write(json.dumps(sys.argv[1:]))\n")
     body = f'''#!/usr/bin/env python3
 import sys
 _ = sys.stdin.read()
-if "stream-json" not in sys.argv:
+{probe}if "stream-json" not in sys.argv:
     sys.stdout.write("stream stub invoked without --output-format stream-json")
     sys.exit(1)
 sys.stdout.write({json.dumps(stream_text)})
@@ -488,7 +485,8 @@ def stub_claude(
     probe_path: Path | None = None,
 ) -> Path:
     """A fake `claude` executable: reads the prompt on stdin and emits the
-    `claude -p --output-format json` envelope. With probe_path it also records
+    `claude -p --output-format json` envelope, and refuses a stream-json request
+    (use stub_claude_stream for the answer path). With probe_path it also records
     its argv and the listing of any --add-dir it was given (the argv-capture
     variant the tool-using-judge tests need)."""
     probe_snippet = ""
@@ -506,6 +504,9 @@ open({json.dumps(str(probe_path))}, "w").write(json.dumps(probe))
 import sys, json
 _ = sys.stdin.read()
 {probe_snippet}
+if "stream-json" in sys.argv:
+    sys.stdout.write("envelope stub invoked with --output-format stream-json")
+    sys.exit(1)
 env = {{"type":"result","result":{json.dumps(answer)},
        "total_cost_usd":{cost},
        "usage":{{"input_tokens":{in_tok},"output_tokens":{out_tok},
@@ -516,3 +517,322 @@ sys.exit({returncode})
     path.write_text(body, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return path
+
+
+# --- lane4: Jetty executor fixtures -------------------------------------
+# One attested payload builder and one scripted client for every test that
+# drives execute_jetty_payloads/run_jetty (previously two payload builders, an
+# inlined third, and a dozen hand-written client classes).
+
+
+def attest_jetty_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Stamp the task-contract digest the executor re-derives before any
+    network I/O. Re-attest after an edit the test means to be genuine; skip it
+    to model a payload that changed after attestation."""
+    import skill_benchmark as sb
+
+    payload["harness"]["jetty_task_contract_sha256"] = sb.jetty_task_contract_sha256(payload)
+    return payload
+
+
+def jetty_task_upload(content: Any = "{}") -> dict[str, Any]:
+    """The task-JSON upload item an exported Jetty payload carries."""
+    return {"role": "task", "placeholder": "upload://task",
+            "remote_path_hint": "tasks/task.json", "content": content}
+
+
+def jetty_payload(
+    *,
+    harness: dict[str, Any] | None = None,
+    files: list[dict[str, Any]] | None = None,
+    messages: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """An attested, executable run-jetty payload for case-1/with_skill in
+    collection "c", task "t". `harness` entries override that identity;
+    `files` ride one bundled upload, as export-jetty plans them."""
+    payload: dict[str, Any] = {
+        "harness": {
+            "executable": True, "case_id": "case-1", "variant": "with_skill",
+            "run_number": 1, "run_dir": "case-1/with_skill", **(harness or {}),
+        },
+        "jetty_request": {
+            "model": "m",
+            "messages": messages or [],
+            "jetty": {"collection": "c", "task": "t", "agent": "claude-code",
+                      "model_provider": "anthropic", "snapshot": "s"},
+        },
+        "upload_plan": {"files": files or []},
+    }
+    if files:
+        payload["upload_plan"]["bundle"] = {
+            "placeholder": "upload://bundle", "archive_name": "bundle.zip"}
+        payload["jetty_request"]["jetty"]["file_paths"] = ["upload://bundle"]
+    return attest_jetty_payload(payload)
+
+
+class FakeJettyClient:
+    """A scripted Jetty client that counts every remote call. By default it
+    acknowledges `trajectory_id`, polls it to `status` under
+    `<collection>/<task>/0000`, and (with `artifact=True`) lists one output.md
+    for download. Pass a response to replace only the surface under test."""
+
+    def __init__(
+        self,
+        *,
+        trajectory_id: str = "trajectory-1",
+        status: str = "completed",
+        artifact: bool = False,
+        submission: dict[str, Any] | None = None,
+        submit_error: BaseException | None = None,
+        poll_response: dict[str, Any] | None = None,
+        detail_response: dict[str, Any] | None = None,
+    ) -> None:
+        self.trajectory_id = trajectory_id
+        self.status = status
+        self.artifact = artifact
+        self.submission = submission
+        self.submit_error = submit_error
+        self.poll_response = poll_response
+        self.detail_response = detail_response
+        self.bundle: tuple[str, bytes] | None = None
+        self.submitted: dict[str, Any] | None = None
+        self.upload_calls = self.submit_calls = self.poll_calls = 0
+        self.fetch_calls = self.download_calls = 0
+
+    def upload_bundle(self, archive_name: str, data: bytes) -> str:
+        self.upload_calls += 1
+        self.bundle = (archive_name, data)
+        return "remote-bundle"
+
+    def submit(self, request: dict[str, Any]) -> dict[str, Any]:
+        self.submit_calls += 1
+        self.submitted = request
+        if self.submit_error is not None:
+            raise self.submit_error
+        if self.submission is not None:
+            return json.loads(json.dumps(self.submission))
+        return {"trajectory_id": self.trajectory_id}
+
+    def poll(self, collection: str, task: str, trajectory_id: str, **_: Any) -> dict[str, Any]:
+        self.poll_calls += 1
+        if self.poll_response is not None:
+            return json.loads(json.dumps(self.poll_response))
+        return {"status": self.status, "trajectory_id": self.trajectory_id,
+                "storage_path": f"{collection}/{task}/0000"}
+
+    def fetch_trajectory(self, collection: str, task: str, trajectory_id: str) -> dict[str, Any]:
+        self.fetch_calls += 1
+        if self.detail_response is not None:
+            return json.loads(json.dumps(self.detail_response))
+        storage = f"{collection}/{task}/0000"
+        results = ([{"path": f"{storage}/{self.trajectory_id}.run.0000.app--results--output.md",
+                     "content_type": "text/markdown"}] if self.artifact else [])
+        return {"status": "completed", "trajectory_id": self.trajectory_id,
+                "storage_path": storage,
+                "steps": {"run": {"outputs": {"success": True, "results_files": results}}}}
+
+    def download_file(self, storage_path: str) -> bytes:
+        self.download_calls += 1
+        return b"done"
+
+
+# --------------------------------------------------------------------------- #
+# lane3: answer-runner fixtures
+# --------------------------------------------------------------------------- #
+
+
+def write_with_skill_task(root: Path, **repo: Any) -> tuple[Path, Path, str]:
+    """An eval repo under root (make_eval_repo's keywords) and a tasks.jsonl
+    holding its first with_skill prepared task, the input every answer-runner
+    command reads. Returns (manifest, tasks, run_dir)."""
+    import skill_benchmark as sb
+
+    manifest = make_eval_repo(root, **repo)
+    row = next(r for r in sb.prepared_task_rows(manifest, sb.validate_manifest(manifest))
+               if r["variant"] == "with_skill")
+    tasks = root / "tasks.jsonl"
+    tasks.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    return manifest, tasks, row["run_dir"]
+
+
+# --------------------------------------------------------------------------- #
+# lane B: negative-control assertions
+# --------------------------------------------------------------------------- #
+
+
+def assert_dies(test: Any, callback: Any, message: str) -> None:
+    """Assert that callback() stops through the harness's die(): SystemExit
+    with `message` in what it printed to stderr. A bare assertRaises(SystemExit)
+    also passes when an earlier, unrelated guard fires; the message names the
+    guard the control is for."""
+    import contextlib
+    import io
+
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr), test.assertRaises(SystemExit):
+        callback()
+    test.assertIn(message, stderr.getvalue())
+
+
+# --------------------------------------------------------------------------- #
+# lane D: the command line a user reaches
+# --------------------------------------------------------------------------- #
+
+
+def run_cli(*argv: str | Path) -> tuple[int, str, str]:
+    """Run `skill-benchmark ARGV` in process through the real parser, the
+    CLIInvocation validation edge, and main()'s dispatch table: the path a user
+    reaches, unlike calling a handler with a hand-built namespace. Returns
+    (exit code, stdout, stderr); a SystemExit from a parser error, die(), or a
+    refused gate becomes the exit code."""
+    import contextlib
+    import io
+    from unittest import mock
+
+    import skill_benchmark as sb
+
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with mock.patch.object(sys, "argv", ["skill-benchmark", *map(str, argv)]), \
+            contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        try:
+            code = sb.main()
+        except SystemExit as exc:
+            if isinstance(exc.code, str):
+                print(exc.code, file=stderr)
+            code = exc.code if isinstance(exc.code, int) else int(exc.code is not None)
+    return code, stdout.getvalue(), stderr.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# lane M: judge verdicts from the real `judge` command
+# --------------------------------------------------------------------------- #
+
+
+def judge_with_stub(manifest: Path, runs: Path, out: Path, *, passes_on: str,
+                    scored: bool = False) -> Path:
+    """Write judge verdicts for every judge task under `runs` through the real
+    `skill-benchmark judge` command, with a local stub judge (no model) that
+    passes an answer exactly when `passes_on` appears in its prompt. `scored`
+    adds a normalized score, 1.0 on a pass and 0.0 on a fail."""
+    stub = out.parent / "stub_judge.py"
+    score = "'score': 1.0 if hit else 0.0, " if scored else ""
+    stub.write_text(
+        "import json, sys\n"
+        f"hit = {passes_on!r} in sys.stdin.read()\n"
+        f"print(json.dumps({{{score}'passed': hit, 'rationale': 'stub'}}))\n",
+        encoding="utf-8")
+    code, _, stderr = run_cli("judge", manifest, "--runs", runs,
+                              "--judge-cmd", f"{sys.executable} {stub}", "--out", out)
+    if code != 0:
+        raise AssertionError(f"judge stub failed: {stderr}")
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# lane G: recorded Claude streams that continue after `result`
+# --------------------------------------------------------------------------- #
+
+CLAUDE_FIXTURES = ROOT / "tests" / "fixtures" / "claude"
+# The only shape PR #85 reported for the record Claude Code 2.1.269 writes
+# after `result` (commit 8b7ef17 kept no copy of the stream).
+HAND_BUILT_TRAILING_RECORD = {"type": "system", "subtype": "task_summary"}
+NO_TRAILING_RECORDING = ("no recorded stream in tests/fixtures/claude/ continues after `result` yet; "
+                         "record one with scripts/record_claude_stream.py")
+
+
+def claude_records_after_result(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The records a Claude stream carries after its first `result` event."""
+    for index, record in enumerate(records):
+        if record.get("type") == "result":
+            return records[index + 1:]
+    return []
+
+
+def recorded_claude_streams_after_result() -> list[Path]:
+    """Every recorded stream in tests/fixtures/claude/ whose `result` event is
+    followed by more records, so a committed recording is exercised with no
+    test edits."""
+    found: list[Path] = []
+    for path in sorted(CLAUDE_FIXTURES.glob("*.jsonl")):
+        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if claude_records_after_result(records):
+            found.append(path)
+    return found
+
+
+def claude_trailing_record_sources() -> list[tuple[str, list[dict[str, Any]]]]:
+    """(source, records after `result`): the hand-built record, then those of
+    every recording that has some. While no recording exists, the hand-built
+    source's label says so, so each subTest names the gap instead of the loop
+    passing over nothing."""
+    recorded = recorded_claude_streams_after_result()
+    label = "hand-built task_summary" + ("" if recorded else f" ({NO_TRAILING_RECORDING})")
+    sources = [(label, [dict(HAND_BUILT_TRAILING_RECORD)])]
+    for path in recorded:
+        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        sources.append((f"recorded {path.name}", claude_records_after_result(records)))
+    return sources
+
+
+def claude_streams_ending_after_result() -> list[tuple[str, str]]:
+    """(source, stream text) for every recording whose `result` is followed by
+    more records. Until one exists, the plugin-skill recording with the
+    hand-built record appended stands in, labelled as such."""
+    recorded = recorded_claude_streams_after_result()
+    if recorded:
+        return [(f"recorded {path.name}", path.read_text(encoding="utf-8")) for path in recorded]
+    stand_in = (CLAUDE_FIXTURES / "stream-json.plugin-skill.jsonl").read_text(encoding="utf-8")
+    return [(f"stream-json.plugin-skill.jsonl + hand-built task_summary ({NO_TRAILING_RECORDING})",
+             stand_in.rstrip("\n") + "\n" + json.dumps(HAND_BUILT_TRAILING_RECORD) + "\n")]
+
+
+# --------------------------------------------------------------------------- #
+# lane S: judges that answer on their own score scale
+# --------------------------------------------------------------------------- #
+
+
+def judge_with_scores(manifest: Path, runs: Path, out: Path, *,
+                      scores: dict[str, float]) -> Path:
+    """Write judge verdicts through the real `skill-benchmark judge` command
+    with a local stub judge (no model) that answers only a `score`: the score
+    of the first marker in `scores` that appears in its prompt. For judges
+    that declare a `score_scale`, whose pass/fail the harness derives."""
+    stub = out.parent / "score_judge.py"
+    stub.write_text(
+        "import json, sys\n"
+        "prompt = sys.stdin.read()\n"
+        f"scores = {scores!r}\n"
+        "score = next(value for marker, value in scores.items() if marker in prompt)\n"
+        "print(json.dumps({'score': score, 'rationale': 'stub'}))\n",
+        encoding="utf-8")
+    code, _, stderr = run_cli("judge", manifest, "--runs", runs,
+                              "--judge-cmd", f"{sys.executable} {stub}", "--out", out)
+    if code != 0:
+        raise AssertionError(f"judge stub failed: {stderr}")
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# lane F: what may follow Claude's terminal `result` record
+# --------------------------------------------------------------------------- #
+
+# (label, record, may follow `result`): the rule is exactly one `result`, and
+# no session content after it; any other record is metadata. Hand-built: the
+# only recorded trailing shape is system/task_summary (#85). `rate_limit_event`
+# is a record type Claude Code writes (the plugin-skill recording dropped one,
+# tests/fixtures/claude/README.md); its fields here are illustrative.
+CLAUDE_POST_RESULT_RECORDS: list[tuple[str, dict[str, Any], bool]] = [
+    ("system task_summary", {"type": "system", "subtype": "task_summary"}, True),
+    ("rate_limit_event", {"type": "rate_limit_event", "session_id": "s",
+                          "rate_limit_info": {"status": "allowed", "rateLimitType": "five_hour"}}, True),
+    ("unknown metadata type", {"type": "session_metrics", "session_id": "s", "detail": {"turns": 3}}, True),
+    ("assistant", {"type": "assistant", "message": {
+        "role": "assistant", "content": [{"type": "text", "text": "late"}]}}, False),
+    ("user", {"type": "user", "message": {"role": "user", "content": "more"}}, False),
+    ("second result", {"type": "result", "subtype": "success", "result": "second attempt",
+                       "total_cost_usd": 0.09}, False),
+    ("stream_event", {"type": "stream_event", "event": {
+        "type": "content_block_delta", "delta": {"type": "text_delta", "text": "late"}}}, False),
+    ("unknown type carrying a message", {"type": "session_turn", "message": {
+        "role": "assistant", "content": [{"type": "text", "text": "late"}]}}, False),
+]

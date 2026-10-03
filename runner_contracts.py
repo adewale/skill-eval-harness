@@ -5,7 +5,6 @@ states. Artifact writers consume the union exhaustively and never repair boolean
 """
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -13,6 +12,7 @@ from typing import Any, TypeAlias
 
 from invocation_contracts import InvocationState
 from json_contracts import freeze_json_mapping, validate_json_text
+from telemetry import finite_nonnegative, validate_raw_usage
 
 
 class Provider(str, Enum):
@@ -22,23 +22,6 @@ class Provider(str, Enum):
     VIBE = "vibe"
     SUBAGENT = "subagent"
     JETTY = "jetty"
-
-
-def _finite_nonnegative(value: Any, label: str, *, integer: bool = False) -> int | float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
-        raise ValueError(f"{label} must be finite and non-negative")
-    if isinstance(value, float) and not math.isfinite(value):
-        raise ValueError(f"{label} must be finite and non-negative")
-    if not integer:
-        try:
-            converted = float(value)
-        except OverflowError as exc:
-            raise ValueError(f"{label} must be finite and non-negative") from exc
-        if not math.isfinite(converted):
-            raise ValueError(f"{label} must be finite and non-negative")
-    if integer and (not isinstance(value, int) or isinstance(value, bool)):
-        raise ValueError(f"{label} must be a non-negative integer")
-    return value
 
 
 _RESERVED_EVIDENCE_KEYS = frozenset({
@@ -56,16 +39,6 @@ _RESERVED_EVIDENCE_KEYS = frozenset({
 })
 
 
-def _validate_usage(value: Any, label: str) -> None:
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            _validate_usage(item, f"{label}.{key}")
-        return
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{label} must contain only numeric measurements")
-    _finite_nonnegative(value, label, integer=label.casefold().endswith("tokens"))
-
-
 @dataclass(frozen=True)
 class OutcomeContext:
     provider: Provider
@@ -80,18 +53,26 @@ class OutcomeContext:
     metrics_extra: Mapping[str, Any] = field(default_factory=dict)
     environment: Mapping[str, Any] | None = None
     diagnose_returncode: bool = True
+    # The provider whose wire format the trace is in, when it is not the
+    # runner's own: run-subagent's default backend drives Claude's CLI.
+    trace_source: Provider | None = None
 
     def __post_init__(self) -> None:
         try:
             object.__setattr__(self, "provider", Provider(self.provider))
         except ValueError as exc:
             raise ValueError(f"unknown runner provider {self.provider!r}") from exc
+        if self.trace_source is not None:
+            try:
+                object.__setattr__(self, "trace_source", Provider(self.trace_source))
+            except ValueError as exc:
+                raise ValueError(f"unknown trace source {self.trace_source!r}") from exc
         if self.model is not None and (not isinstance(self.model, str) or not self.model.strip()):
             raise ValueError("runner model must be None or a non-empty string")
         if self.model is not None:
             validate_json_text(self.model, "runner model")
         if self.elapsed_ms is not None:
-            _finite_nonnegative(self.elapsed_ms, "elapsed_ms", integer=True)
+            finite_nonnegative(self.elapsed_ms, "elapsed_ms", integer=True)
             if self.elapsed_ms > 2**63 - 1:
                 raise ValueError("elapsed_ms exceeds the supported duration range")
         if not isinstance(self.stderr, str) or not isinstance(self.trace_text, str):
@@ -101,11 +82,11 @@ class OutcomeContext:
         if not isinstance(self.trace_utf8_valid, bool):
             raise TypeError("trace_utf8_valid must be boolean")
         if self.cost_usd is not None:
-            _finite_nonnegative(self.cost_usd, "cost_usd")
+            finite_nonnegative(self.cost_usd, "cost_usd")
         if self.usage is not None:
             if not isinstance(self.usage, Mapping):
                 raise TypeError("usage must be a mapping or None")
-            _validate_usage(self.usage, "usage")
+            validate_raw_usage(self.usage, "usage")
             object.__setattr__(self, "usage", freeze_json_mapping(self.usage, "usage"))
         for label, values in (("metadata_extra", self.metadata_extra),
                               ("metrics_extra", self.metrics_extra)):
@@ -253,7 +234,8 @@ def RunnerOutcome(*, provider: str, answer: str | None = None,
                   metrics_extra: Mapping[str, Any] | None = None,
                   environment: Mapping[str, Any] | None = None,
                   diagnose_returncode: bool = True,
-                  invocation_state: InvocationState | str | None = None) -> AnswerOutcome:
+                  invocation_state: InvocationState | str | None = None,
+                  trace_source: str | None = None) -> AnswerOutcome:
     """Strict compatibility factory for the historical constructor spelling."""
     if not isinstance(timed_out, bool):
         raise TypeError("timed_out must be boolean")
@@ -283,6 +265,7 @@ def RunnerOutcome(*, provider: str, answer: str | None = None,
         metadata_extra={} if metadata_extra is None else metadata_extra,
         metrics_extra={} if metrics_extra is None else metrics_extra,
         environment=environment, diagnose_returncode=diagnose_returncode,
+        trace_source=None if trace_source is None else Provider(trace_source),
     )
     if timed_out:
         if returncode not in {None, 124}:
@@ -304,12 +287,3 @@ def RunnerOutcome(*, provider: str, answer: str | None = None,
     if answer is None or not answer.strip():
         return ProviderFailed(context, returncode=0, reason="provider produced no final answer")
     return Completed(context, answer=answer)
-
-
-def classify_runner_result(*, provider: str, answer: str | None, returncode: int,
-                           timed_out: bool, elapsed_ms: int | None, stderr: str = "",
-                           error: str | None = None, timeout_s: int | None = None,
-                           **context: Any) -> AnswerOutcome:
-    return RunnerOutcome(provider=provider, answer=answer, returncode=returncode,
-                         timed_out=timed_out, elapsed_ms=elapsed_ms, stderr=stderr,
-                         error=error, timeout_s=timeout_s, **context)

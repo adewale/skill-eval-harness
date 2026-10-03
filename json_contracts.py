@@ -35,26 +35,39 @@ def validate_json_value(value: Any, label: str) -> None:
     _validate_json_value(value, label, depth=0, ancestors=set())
 
 
+class StrictJSONViolation(json.JSONDecodeError):
+    """Syntactically valid JSON the harness refuses: a duplicate object key or a
+    non-finite number. A reader that skips ordinary non-JSON lines must still
+    stop on these, so they are a type to catch rather than a message to match."""
+
+
 def unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise json.JSONDecodeError(f"duplicate object key: {key!r}", "", 0)
+            raise StrictJSONViolation(f"duplicate object key: {key!r}", "", 0)
         result[key] = value
     return result
 
 
+def reject_nonfinite_constant(constant: str) -> Any:
+    raise StrictJSONViolation(
+        f"non-finite numeric constant is not valid JSON: {constant}", "", 0)
+
+
+def strict_json_decoder() -> json.JSONDecoder:
+    """A decoder with the strict hooks, for callers that scan with raw_decode."""
+    return json.JSONDecoder(object_pairs_hook=unique_json_object,
+                            parse_constant=reject_nonfinite_constant)
+
+
 def strict_json_loads(value: str | bytes | bytearray) -> Any:
     """Parse strict, persistable JSON without last-key-wins shadowing."""
-    def reject_constant(constant: str) -> Any:
-        raise json.JSONDecodeError(
-            f"non-finite numeric constant is not valid JSON: {constant}", "", 0)
-
     try:
         parsed = json.loads(
             value,
             object_pairs_hook=unique_json_object,
-            parse_constant=reject_constant,
+            parse_constant=reject_nonfinite_constant,
         )
         validate_json_value(parsed, "strict JSON")
         return parsed

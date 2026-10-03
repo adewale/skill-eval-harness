@@ -1,13 +1,16 @@
-import contextlib
-import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
-from helpers import attach_jetty_task_contract, make_eval_repo
+from helpers import (
+    attach_jetty_task_contract,
+    demo_manifest,
+    make_eval_repo,
+    run_cli,
+    write_demo_manifest,
+)
 
 import skill_benchmark as sb
 
@@ -62,23 +65,32 @@ class RunArtifactOwnershipTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "multiple output aliases"):
                 sb.read_output_base(base)
 
-    def test_metadata_and_metrics_use_one_conflict_rejecting_merge(self):
+    def test_sidecars_merge_agreeing_fields_and_reject_conflicting_ones(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
             (base / "metadata.json").write_text(
                 json.dumps({"returncode": 0, "provider": "test"}),
                 encoding="utf-8",
             )
-            (base / "metrics.json").write_text(
+            metrics = base / "metrics.json"
+            metrics.write_text(
+                json.dumps({"returncode": 0, "total_tokens": 5}),
+                encoding="utf-8",
+            )
+            merged = sb.read_metrics_base(base)
+            self.assertEqual(
+                (merged["returncode"], merged["provider"], merged["total_tokens"]),
+                (0, "test", 5),
+            )
+
+            metrics.write_text(
                 json.dumps({"returncode": 1, "total_tokens": 5}),
                 encoding="utf-8",
             )
-
-            for reader in (sb.read_metadata_base, sb.read_metrics_base):
-                result = reader(base)
-                self.assertFalse(result["metadata_artifact_valid"])
-                self.assertIn("conflicting field 'returncode'", result["metadata_error"])
-                self.assertNotIn("total_tokens", result)
+            rejected = sb.read_metrics_base(base)
+            self.assertFalse(rejected["metadata_artifact_valid"])
+            self.assertIn("conflicting field 'returncode'", rejected["metadata_error"])
+            self.assertNotIn("total_tokens", rejected)
 
     def test_invalid_lower_precedence_sidecar_is_not_ignored(self):
         with tempfile.TemporaryDirectory() as td:
@@ -88,55 +100,14 @@ class RunArtifactOwnershipTests(unittest.TestCase):
             )
             (base / "metrics.json").write_text("{not-json", encoding="utf-8")
 
-            for reader in (sb.read_metadata_base, sb.read_metrics_base):
-                result = reader(base)
-                self.assertFalse(result["metadata_artifact_valid"])
-                self.assertIn("invalid JSON in metrics.json", result["metadata_error"])
-
-    def test_nonconflicting_sidecars_merge_identically_for_every_reader(self):
-        with tempfile.TemporaryDirectory() as td:
-            base = Path(td)
-            (base / "metadata.json").write_text(
-                json.dumps({"returncode": 0, "provider": "test"}),
-                encoding="utf-8",
-            )
-            (base / "metrics.json").write_text(
-                json.dumps({"returncode": 0, "total_tokens": 5}),
-                encoding="utf-8",
-            )
-
-            metadata = sb.read_metadata_base(base)
-            metrics = sb.read_metrics_base(base)
-            self.assertEqual(metadata, metrics)
-            self.assertEqual(metadata["returncode"], 0)
-            self.assertEqual(metadata["total_tokens"], 5)
+            result = sb.read_metrics_base(base)
+            self.assertFalse(result["metadata_artifact_valid"])
+            self.assertIn("invalid JSON in metrics.json", result["metadata_error"])
 
 
 class JettyImportTransactionTests(unittest.TestCase):
     def make_import(self, root: Path) -> tuple[Path, list[dict], dict]:
-        repo = root / "repo"
-        (repo / "skill").mkdir(parents=True)
-        (repo / "skill" / "SKILL.md").write_text(
-            "---\nname: demo\ndescription: Demo\n---\n", encoding="utf-8"
-        )
-        (repo / "evals").mkdir()
-        manifest = repo / "evals" / "shared-benchmark.json"
-        manifest.write_text(json.dumps({
-            "version": 1,
-            "skill_name": "demo",
-            "skill_paths": ["skill/SKILL.md"],
-            "variants": ["with_skill", "without_skill"],
-            "cases": [{
-                "id": "case-1",
-                "split": "tune",
-                "kind": "behavior",
-                "prompt": "Say alpha.",
-                "assertions": [
-                    {"name": "has-alpha", "type": "contains", "value": "alpha"}
-                ],
-            }],
-            "ablations": [],
-        }), encoding="utf-8")
+        manifest = write_demo_manifest(root, demo_manifest())
         validated = sb.validate_manifest(manifest)
         tasks = sb.prepared_task_rows(manifest, validated, models=["model-a"])
         design = sb.answer_design_from_tasks(tasks)
@@ -168,12 +139,16 @@ class JettyImportTransactionTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def invoke(self, manifest: Path, records_path: Path, runs: Path) -> None:
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
-            sb.import_jetty_results(SimpleNamespace(
-                manifest=str(manifest), jetty_runs=str(records_path), runs=str(runs)
-            ))
+    def invoke(self, manifest: Path, records_path: Path, runs: Path) -> tuple[int, str, str]:
+        return run_cli("import-jetty-results", "--manifest", manifest,
+                       "--jetty-runs", records_path, "--runs", runs)
+
+    def assert_import_rejected(
+        self, manifest: Path, records_path: Path, runs: Path, message: str,
+    ) -> None:
+        code, _, stderr = self.invoke(manifest, records_path, runs)
+        self.assertEqual(code, 1, stderr)
+        self.assertIn(message, stderr)
 
     def test_preflight_failure_writes_neither_design_nor_any_run(self):
         with tempfile.TemporaryDirectory() as td:
@@ -187,8 +162,8 @@ class JettyImportTransactionTests(unittest.TestCase):
             records_path = root / "jetty.jsonl"
             self.write_records(records_path, records)
 
-            with self.assertRaises(SystemExit):
-                self.invoke(manifest, records_path, runs)
+            self.assert_import_rejected(
+                manifest, records_path, runs, "unsafe or ambiguous path")
 
             self.assertFalse((runs / sb.ANSWER_DESIGN_NAME).exists())
             self.assertEqual(
@@ -206,8 +181,9 @@ class JettyImportTransactionTests(unittest.TestCase):
             records_path = root / "jetty.jsonl"
             self.write_records(records_path, records)
 
-            with self.assertRaises(SystemExit):
-                self.invoke(manifest, records_path, runs)
+            self.assert_import_rejected(
+                manifest, records_path, runs,
+                "harness identity changed after task attestation")
 
             self.assertFalse((runs / sb.ANSWER_DESIGN_NAME).exists())
             self.assertFalse(runs.exists())
@@ -238,8 +214,9 @@ class JettyImportTransactionTests(unittest.TestCase):
                 return real_replace(source, destination)
 
             with mock.patch.object(sb.os, "replace", side_effect=fail_second_install):
-                with self.assertRaises(SystemExit):
-                    self.invoke(manifest, records_path, runs)
+                self.assert_import_rejected(
+                    manifest, records_path, runs,
+                    "simulated second install failure")
 
             self.assertFalse((runs / sb.ANSWER_DESIGN_NAME).exists())
             for index, destination in enumerate(destinations, 1):
@@ -258,7 +235,8 @@ class JettyImportTransactionTests(unittest.TestCase):
             records_path = root / "jetty.jsonl"
             self.write_records(records_path, records)
 
-            self.invoke(manifest, records_path, runs)
+            code, _, stderr = self.invoke(manifest, records_path, runs)
+            self.assertEqual(code, 0, stderr)
 
             persisted = json.loads(
                 (runs / sb.ANSWER_DESIGN_NAME).read_text(encoding="utf-8")
@@ -267,7 +245,7 @@ class JettyImportTransactionTests(unittest.TestCase):
             for record in records:
                 destination = runs / record["harness"]["run_dir"]
                 self.assertTrue(sb.artifact_commit_valid(destination))
-                metadata = sb.read_metadata_base(destination)
+                metadata = sb.read_metrics_base(destination)
                 self.assertTrue(metadata["artifact_set_complete"])
                 self.assertEqual(metadata["answer_design_sha256"], design["design_sha256"])
 
