@@ -21,10 +21,12 @@ class AssertionObservationTests(unittest.TestCase):
         }
 
     # Every (skipped, availability, passed) row shape, with the state it must
-    # grade as and the availability its projection must carry. Hand-derived
-    # from the grading rules: a skipped row is dropped from every count
-    # whatever it observed; a partial or unobserved row is unavailable, never
-    # a pass or a failure; only a complete observed row is satisfied/failed.
+    # grade as and the availability its projection must carry. The states are
+    # hand-derived from the grading rules: a skipped row is dropped from every
+    # count whatever it observed; a partial or unobserved row is unavailable,
+    # never a pass or a failure; only a complete observed row is
+    # satisfied/failed. A skipped row keeps the availability it was read with,
+    # so its serialized row re-reads as the same observation.
     STATE_TABLE = (
         # skipped, availability, passed, state, projected availability
         (False, "complete", True, gc.AssertionState.SATISFIED, "complete"),
@@ -43,7 +45,9 @@ class AssertionObservationTests(unittest.TestCase):
 
     def test_every_row_shape_grades_as_exactly_one_state(self):
         for skipped, availability, passed, state, projected in self.STATE_TABLE:
-            raw = self.row(passed=passed, availability=availability)
+            # An unobserved result has no score either.
+            raw = self.row(passed=passed, availability=availability,
+                           score=None if passed is None else 1.0)
             if skipped:
                 raw.update(skipped=True, skip_reason="prerequisite 'grounded' failed")
             with self.subTest(skipped=skipped, availability=availability, passed=passed):
@@ -116,9 +120,10 @@ class JudgeTaskTests(unittest.TestCase):
         self.assertEqual(task.to_row(), self.task_row())
 
     def test_bad_digest_and_run_identity_fail_before_judging(self):
-        for digest in ("short", "A" * 64, "sha1:" + "a" * 64, "a" * 65):
-            with self.subTest(digest=digest), self.assertRaises(ValueError):
-                gc.JudgeTask.from_row({**self.task_row(), "judge_input_sha256": digest})
+        for key in ("judge_input_sha256", "trajectory_steps_sha256"):
+            for digest in ("short", "A" * 64, "sha1:" + "a" * 64, "a" * 65):
+                with self.subTest(key=key, digest=digest), self.assertRaises(ValueError):
+                    gc.JudgeTask.from_row({**self.task_row(), key: digest})
         with self.assertRaises(ValueError):
             gc.JudgeTask.from_row({**self.task_row(), "run_number": 0})
 

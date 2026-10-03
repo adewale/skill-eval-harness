@@ -186,6 +186,14 @@ class AggregateTests(unittest.TestCase):
                 self.assertEqual(aggregate.observed_count, observed)
                 self.assertEqual(aggregate.unavailable_count, mix.count("unavailable"))
                 self.assertEqual(aggregate.not_applicable_count, mix.count("not_applicable"))
+                # Every row that is not counted in the total says why.
+                expected_reasons = {
+                    reason: count for reason, count in (
+                        ("trace_absent", mix.count("unavailable")),
+                        ("not_applicable:offline_stub", mix.count("not_applicable")),
+                    ) if count
+                }
+                self.assertEqual(dict(aggregate.reason_counts), expected_reasons)
                 if observed == len(mix):
                     self.assertEqual(aggregate.availability, "complete")
                     self.assertEqual(aggregate.value, 3 * observed)
@@ -197,6 +205,7 @@ class AggregateTests(unittest.TestCase):
                     self.assertEqual(aggregate.availability, "unavailable")
                 else:
                     self.assertEqual(aggregate.availability, "not_applicable")
+                    self.assertEqual(aggregate.reason, "not_applicable:offline_stub")
 
     def test_unavailable_rows_do_not_change_known_subtotal(self):
         complete = aggregate_numeric([
