@@ -22,7 +22,7 @@ General eval frameworks (openai/evals, vitest-evals, viteval) score one output a
 | Is this eval safe to spend model budget on? | `validate --strict-leakage --leakage-min-chars 1 --check-ablations` and `audit-manifest --fail-on-blockers`. |
 | Can I trust this LLM judge or rubric result? | `judge`, `compare-judges`, `judge-robustness`, and `judge-alignment`. |
 | Could the eval be contaminated by leaked answer keys or memorized canaries? | Prompt leakage lint plus `contamination` over generated outputs. |
-| Can this become a CI gate? | `suite-run`, `report --format junit|github`, and readiness blockers from `audit-manifest`. |
+| Can this become a CI gate? | `report --fail-on regressions` (an exit code on critical vetoes, broken regression guards and negative lift, not the averaged lift), `suite-run`, and readiness blockers from `audit-manifest`. |
 
 ## Core loop
 

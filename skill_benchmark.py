@@ -17740,9 +17740,91 @@ def md_table(headers: Sequence[str], rows: Iterable[Sequence[Any]], *, align: st
     return lines
 
 
-def github_summary_from_report(report: dict[str, Any]) -> str:
+def _gated_reports(report: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """A benchmark report, or each child of an aggregate (multi-skill) report."""
+    children = report.get("reports")
+    return children if isinstance(children, list) and children else [report]
+
+
+def report_regression_findings(report: Mapping[str, Any]) -> list[Finding]:
+    """The named regressions `report --fail-on` gates on, as findings.
+
+    The averaged lift is what hides a regression on one case, so a critical
+    veto or a failing regression guard is raised even when overall lift is
+    positive. Case-level kinds read the with_skill arm only: the baseline
+    failing is the point of the experiment, and an ablation or old_skill arm
+    failing is the regression it exists to measure. Unscorable attempts are
+    not quality failures; incompleteness is the gate's own fail-closed rule."""
+    found: list[Finding] = []
+    for child in _gated_reports(report):
+        skill = str(child.get("skill_name") or "skill")
+        treatment = [row for row in child.get("results", []) or []
+                     if row.get("variant") == "with_skill" and scorable_run(row)]
+
+        def raise_(kind: FindingKind, message: str, case_id: str | None = None,
+                   model: str | None = None, *, skill: str = skill) -> None:
+            where = skill + (f"/{case_id}" if case_id else "") + (f" [{model}]" if model else "")
+            found.append(Finding(kind, f"{where}: {message}", evidence={
+                "skill_name": skill, "case_id": case_id, "model": model or None}))
+
+        vetoes: dict[tuple[str, str], tuple[int, set[str]]] = {}
+        guards: dict[tuple[str, str], list[float]] = {}
+        for row in treatment:
+            key = (str(row.get("case_id")), str(row.get("model") or ""))
+            if row.get("vetoed"):
+                runs, names = vetoes.get(key, (0, set()))
+                vetoes[key] = (runs + 1, names | {str(name) for name in row.get("critical_failures", []) or []})
+            rate = row.get("objective_pass_rate")
+            if (row.get("eval_intent") == "regression"
+                    and isinstance(rate, (int, float)) and not isinstance(rate, bool)):
+                guards.setdefault(key, []).append(float(rate))
+        for (case_id, model), (runs, names) in sorted(vetoes.items()):
+            raise_(FindingKind.CRITICAL_VETO, "with_skill vetoed by critical assertion(s) "
+                   f"{', '.join(sorted(names)) or '(unnamed)'} in {runs} run(s)", case_id, model)
+        # A guard's steady state is passing (G5), so any with_skill run below
+        # 1.0 is a regression: there is no threshold to tune.
+        for (case_id, model), rates in sorted(guards.items()):
+            failing = sum(1 for rate in rates if rate < 1.0)
+            if failing:
+                raise_(FindingKind.REGRESSION_GUARD_FAILING,
+                       f"with_skill objective pass rate {statistics.mean(rates):.2f} "
+                       f"({failing} of {len(rates)} run(s) below 1.00)", case_id, model)
+        delta = (child.get("paired_summary") or {}).get("absolute_delta")
+        if isinstance(delta, (int, float)) and not isinstance(delta, bool) and delta < 0:
+            raise_(FindingKind.NEGATIVE_LIFT, f"overall lift {delta:.3f} (with − without, "
+                   "objective): the skill measures worse than baseline")
+    return found
+
+
+def report_incomplete_reason(report: Mapping[str, Any]) -> str | None:
+    """Why a benchmark report cannot be gated as complete, or None."""
+    parts = []
+    for child in _gated_reports(report):
+        if child.get("availability") == "complete":
+            continue
+        labels = [incomplete_label(str(reason)) for reason in child.get("incomplete_reasons") or []]
+        parts.append(f"{child.get('skill_name') or 'skill'}: experiment evidence is incomplete"
+                     + (f" ({', '.join(labels)})" if labels else ""))
+    if report.get("availability") not in (None, "complete") and not parts:
+        parts.append("experiment evidence is incomplete")
+    return "; ".join(parts) or None
+
+
+def report_gate(report: Mapping[str, Any], policy: gate_policy.GatePolicy) -> tuple[gate_policy.GateDecision, list[Finding]]:
+    """Decide `report --fail-on` and return the regression findings it matched."""
+    found = report_regression_findings(report)
+    incomplete = report_incomplete_reason(report)
+    decision = policy.decide(found, complete=incomplete is None, incomplete_reason=incomplete)
+    return decision, [finding for finding in found if policy.matches(finding)]
+
+
+def github_summary_from_report(report: dict[str, Any], *, gate: tuple[str, gate_policy.GateDecision, list[Finding]] | None = None) -> str:
     """GitHub job-summary markdown plus ::warning annotations keyed to case_id.
-    Pipe to $GITHUB_STEP_SUMMARY; the annotation lines act on plain stdout."""
+    Annotation lines act only on the step's stdout, never inside the
+    $GITHUB_STEP_SUMMARY file, so tee the output rather than redirecting it.
+    With a `gate` (tokens, decision, matched findings from report --fail-on)
+    the summary gains a Gate section and each matched case-level finding an
+    ::error; without one the output is unchanged."""
     skill = str(report.get("skill_name") or "skill")
     paired = report.get("paired_summary", {}) or {}
     summary = report.get("summary", {}) or {}
@@ -17789,20 +17871,48 @@ def github_summary_from_report(report: dict[str, Any]) -> str:
     if report.get("availability") != "complete":
         annotations.append(
             f"::error title=skill-eval {skill}::incomplete experiment evidence")
+    if gate is not None:
+        tokens, decision, matched = gate
+        lines.extend(["", f"## Gate (`--fail-on {tokens}`)", ""])
+        if decision.failed:
+            lines.append(f"**Failed:** {len(decision.reasons)} reason(s)")
+            lines.append("")
+            lines.extend(f"- {reason}" for reason in decision.reasons)
+        else:
+            lines.append("**Passed:** no matching findings")
+        # Negative lift and incompleteness already carry an ::error above; a
+        # case-level regression is otherwise only a ::warning.
+        annotations.extend(
+            f"::error title=skill-eval gate {finding.kind.value}::{finding.message}"
+            for finding in matched
+            if isinstance(finding.evidence, Mapping) and finding.evidence.get("case_id"))
     return "\n".join(lines + ([""] + annotations if annotations else [])) + "\n"
 
 
 def report_command(args: argparse.Namespace) -> int:
+    """Serialize a benchmark.json for CI. The rendering never fails a job;
+    `--fail-on` does, through the shared gate policy (which fails closed on an
+    incomplete report)."""
+    policy = None
+    if getattr(args, "fail_on", None):
+        try:
+            policy = gate_policy.parse_fail_on(args.fail_on)
+        except ValueError as exc:
+            die(str(exc))
     report = load_json(Path(args.benchmark))
+    gate = None
+    if policy is not None:
+        decision, matched = report_gate(report, policy)
+        gate = (policy.name.removeprefix("fail-on:"), decision, matched)
     if args.format == "junit":
         rendered = junit_xml_from_report(report)
     else:
-        rendered = github_summary_from_report(report)
+        rendered = github_summary_from_report(report, gate=gate)
     if args.out:
         emit_text(rendered, args.out)
     else:
         print(rendered, end="")
-    return 0
+    return gate_exit(gate[1], "fail-on") if gate is not None else 0
 
 
 def aggregate(args: argparse.Namespace) -> int:
@@ -21540,7 +21650,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("report", help="serialize a benchmark.json for CI: JUnit XML or GitHub job-summary markdown + annotations")
     p.add_argument("--benchmark", required=True, help="benchmark.json produced by `skill-benchmark benchmark --out`")
     p.add_argument("--format", choices=["junit", "github"], required=True)
-    p.add_argument("--out", help="output path (e.g. junit.xml, or a file appended to $GITHUB_STEP_SUMMARY)")
+    p.add_argument("--out", help="output path (e.g. junit.xml); for GitHub annotations to act, tee stdout into $GITHUB_STEP_SUMMARY instead")
+    p.add_argument("--fail-on", action="append", metavar="KINDS", help="exit non-zero on these finding kinds, severities or presets; `regressions` is critical-veto, regression-guard-failing and negative-lift, read on the with_skill arm; comma-separated, repeatable; fails closed on an incomplete report")
 
     p = sub.add_parser("compare-judges", help="flag judge-sensitivity across judged benchmark reports")
     p.add_argument("--report", action="append", metavar="NAME=PATH", help="judge label = judged benchmark report JSON (repeatable)")

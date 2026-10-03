@@ -103,7 +103,16 @@ JUDGE_ROBUSTNESS = GatePolicy("judge-robustness", frozenset({
     FindingKind.PASSES_MASTER_KEY_CONTROL,
     FindingKind.JUDGE_CALL_INCOMPLETE,
 }))
-PRESETS = {policy.name: policy for policy in (READINESS, SELF_JUDGING, CONTAMINATION, JUDGE_ROBUSTNESS)}
+# A graded benchmark's named regressions: what `report --fail-on` gates a CI job on.
+# The averaged lift alone is what hides a regression on one case, so these
+# read each declared case in the with_skill arm.
+REGRESSIONS = GatePolicy("regressions", frozenset({
+    FindingKind.CRITICAL_VETO,
+    FindingKind.REGRESSION_GUARD_FAILING,
+    FindingKind.NEGATIVE_LIFT,
+}))
+PRESETS = {policy.name: policy for policy in (
+    READINESS, SELF_JUDGING, CONTAMINATION, JUDGE_ROBUSTNESS, REGRESSIONS)}
 
 
 def parse_fail_on(values: Iterable[str]) -> GatePolicy:

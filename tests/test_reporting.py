@@ -38,6 +38,7 @@ from helpers import (
     write_good_pr_skill as _skill,
 )
 
+import gate_policy as gp
 import skill_benchmark as sb
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -175,6 +176,148 @@ class ReportFormatsTests(unittest.TestCase):
                       if line.startswith("**Experiment status:**")]
         self.assertEqual(report["incomplete_reasons"], ["deferred_judge_verdicts"])
         self.assertEqual(status, ["**Experiment status:** incomplete (deferred judge verdicts)"])
+
+
+class ReportGateTests(unittest.TestCase):
+    """`report --fail-on`: the shared gate policy over a graded benchmark's
+    named regressions, so a CI job never rests on the averaged headline alone."""
+
+    @staticmethod
+    def _report(results, *, delta=0.5, availability="complete", skill="demo", reasons=()):
+        return {
+            "availability": availability, "skill_name": skill,
+            "answer_design": {"complete": availability == "complete"},
+            "incomplete_reasons": list(reasons), "summary": {}, "case_flags": [],
+            "results": results, "paired_summary": {"absolute_delta": delta},
+        }
+
+    @staticmethod
+    def _vetoed(case_id="c1", variant="with_skill", **over):
+        return result_row(case_id, variant, rate=0.0, vetoed=True,
+                          critical_failures=["no-secrets"], **over)
+
+    @staticmethod
+    def _kinds(report):
+        return [(f.kind.value, f.evidence["case_id"]) for f in sb.report_regression_findings(report)]
+
+    def _cli(self, report, fmt, *fail_on):
+        with tempfile.TemporaryDirectory() as td:
+            bench = Path(td) / "benchmark.json"
+            bench.write_text(json.dumps(report), encoding="utf-8")
+            out = Path(td) / "rendered"
+            argv = ["report", "--benchmark", bench, "--format", fmt, "--out", out]
+            for token in fail_on:
+                argv += ["--fail-on", token]
+            code, _, stderr = run_cli(*argv)
+            return code, out.read_text(encoding="utf-8") if out.exists() else "", stderr
+
+    def test_critical_veto_is_raised_while_overall_lift_stays_positive(self):
+        report = self._report([result_row("c1"), self._vetoed("c2"),
+                               result_row("c2", "without_skill", rate=0.0)], delta=0.5)
+        (finding,) = sb.report_regression_findings(report)
+        self.assertIs(finding.kind, sb.FindingKind.CRITICAL_VETO)
+        self.assertEqual(finding.message, "demo/c2: with_skill vetoed by critical assertion(s) no-secrets in 1 run(s)")
+
+    def test_only_the_with_skill_arm_can_raise_a_case_regression(self):
+        # The baseline failing is the experiment; an ablation or old_skill arm
+        # failing is the regression it exists to measure.
+        rows = [result_row("c1", eval_intent="regression")]
+        rows += [self._vetoed("c1", variant, eval_intent="regression")
+                 for variant in ("without_skill", "ablation:no-rule", "old_skill")]
+        self.assertEqual(self._kinds(self._report(rows)), [])
+
+    def test_regression_guard_fails_on_any_with_skill_run_below_one(self):
+        rows = [result_row("guard", rate=1.0, eval_intent="regression", run_number=1),
+                result_row("guard", rate=0.5, eval_intent="regression", run_number=2),
+                result_row("probe", rate=0.0, eval_intent="capability"),
+                result_row("held", rate=1.0, eval_intent="regression")]
+        (finding,) = sb.report_regression_findings(self._report(rows))
+        self.assertIs(finding.kind, sb.FindingKind.REGRESSION_GUARD_FAILING)
+        self.assertIn("demo/guard: with_skill objective pass rate 0.75 (1 of 2 run(s) below 1.00)", finding.message)
+
+    def test_unscorable_attempt_is_incompleteness_not_a_regression(self):
+        report = self._report([result_row("guard", rate=0.0, missing=True, eval_intent="regression")],
+                              availability="partial", reasons=["unscorable_attempts"])
+        self.assertEqual(self._kinds(report), [])
+        decision, _ = sb.report_gate(report, gp.REGRESSIONS)
+        self.assertTrue(decision.failed)   # the shared policy fails closed
+        self.assertIn("demo: experiment evidence is incomplete", decision.reasons[0])
+
+    def test_negative_lift_and_per_model_and_per_skill_identity(self):
+        self.assertEqual(self._kinds(self._report([result_row("c1")], delta=-0.25)), [("negative-lift", None)])
+        rows = [self._vetoed("c1", model="m1"), self._vetoed("c1", model="m2"), result_row("c1", model="m3")]
+        self.assertEqual([f.evidence["model"] for f in sb.report_regression_findings(self._report(rows))], ["m1", "m2"])
+        aggregate = {"availability": "complete", "reports": [
+            self._report([result_row("c1")], skill="alpha"), self._report([self._vetoed("c1")], skill="beta")]}
+        self.assertEqual([f.evidence["skill_name"] for f in sb.report_regression_findings(aggregate)], ["beta"])
+
+    def test_the_policy_decides_only_the_kinds_it_names(self):
+        report = self._report([self._vetoed("c1", eval_intent="regression"),
+                               result_row("c1", "without_skill", rate=0.0)], delta=-0.1)
+        decision, matched = sb.report_gate(report, gp.parse_fail_on(["critical-veto"]))
+        self.assertEqual([f.kind.value for f in matched], ["critical-veto"])
+        self.assertEqual(decision.reasons, ("critical-veto: demo/c1: with_skill vetoed by critical assertion(s) no-secrets in 1 run(s)",))
+        decision, matched = sb.report_gate(report, gp.REGRESSIONS)
+        self.assertEqual({f.kind.value for f in matched}, {"critical-veto", "regression-guard-failing", "negative-lift"})
+        self.assertTrue(sb.report_gate(report, gp.parse_fail_on(["recommended"]))[0].failed is False)
+
+    def test_without_fail_on_output_and_exit_are_unchanged(self):
+        report = self._report([self._vetoed("c1", eval_intent="regression")], delta=-0.5,
+                              availability="partial", reasons=["unscorable_attempts"])
+        for fmt, render in (("github", sb.github_summary_from_report), ("junit", sb.junit_xml_from_report)):
+            with self.subTest(fmt=fmt):
+                self.assertEqual(self._cli(report, fmt), (0, render(report), ""))
+
+    def test_failing_gate_exits_one_names_each_reason_and_still_writes_output(self):
+        report = self._report([self._vetoed("c1", eval_intent="regression"),
+                               result_row("c1", "without_skill", rate=0.0, eval_intent="regression")])
+        code, rendered, stderr = self._cli(report, "github", "regressions")
+        self.assertEqual(code, 1)
+        self.assertEqual(stderr.splitlines(), [
+            "fail-on: critical-veto: demo/c1: with_skill vetoed by critical assertion(s) no-secrets in 1 run(s)",
+            "fail-on: regression-guard-failing: demo/c1: with_skill objective pass rate 0.00 (1 of 1 run(s) below 1.00)",
+        ])
+        self.assertIn("## Gate (`--fail-on regressions`)", rendered)
+        self.assertIn("**Failed:** 2 reason(s)", rendered)
+        self.assertIn("::error title=skill-eval gate critical-veto::demo/c1:", rendered)
+        code, rendered, _ = self._cli(report, "junit", "critical-veto,negative-lift")
+        self.assertEqual(code, 1)
+        self.assertEqual(rendered, sb.junit_xml_from_report(report))   # the exit code is the gate, not the XML
+
+    def test_passing_gate_exits_zero_and_an_unknown_token_stops_before_rendering(self):
+        report = self._report([result_row("c1", eval_intent="regression"), result_row("c1", "without_skill", rate=0.0)])
+        code, rendered, stderr = self._cli(report, "github", "regressions")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn("**Passed:** no matching findings", rendered)
+        self.assertNotIn("::error", rendered)
+        code, rendered, stderr = self._cli(report, "github", "critcal-veto")
+        self.assertEqual((code, rendered), (1, ""))
+        self.assertIn("unknown --fail-on token 'critcal-veto'", stderr)
+
+    def test_graded_regression_fails_the_gate_while_overall_lift_stays_positive(self):
+        """End to end through the real grader: a critical regression guard
+        breaks while another case keeps the averaged lift positive."""
+        guard = {"id": "guard", "split": "tune", "kind": "behavior", "prompt": "review it",
+                 "eval_intent": "regression",
+                 "assertions": [{"name": "labels-severity", "type": "contains", "value": "Severity:",
+                                 "severity": "critical"}]}
+        probe = {"id": "probe", "split": "tune", "kind": "behavior", "prompt": "review that",
+                 "assertions": [{"name": "cites-line", "type": "contains", "value": "line"}]}
+        outputs = {("guard", "with_skill"): "no label", ("guard", "without_skill"): "no label",
+                   ("probe", "with_skill"): "see line 3", ("probe", "without_skill"): "looks fine"}
+        with tempfile.TemporaryDirectory() as td:
+            path = make_eval_repo(Path(td), cases=[guard, probe])
+            runs = Path(td) / "runs"
+            for (case_id, variant), text in outputs.items():
+                write_run(runs / case_id / variant, text)
+            attest_answer_design(path, runs)
+            report = sb.build_benchmark_report(path, runs)
+        self.assertEqual(report["availability"], "complete")
+        self.assertGreater(report["paired_summary"]["absolute_delta"], 0)
+        decision, matched = sb.report_gate(report, gp.REGRESSIONS)
+        self.assertTrue(decision.failed)
+        self.assertEqual({(f.kind.value, f.evidence["case_id"]) for f in matched},
+                         {("critical-veto", "guard"), ("regression-guard-failing", "guard")})
 
 
 class MultiModelFanOutTests(unittest.TestCase):

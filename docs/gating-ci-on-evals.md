@@ -8,10 +8,11 @@ check, merge on green. But an eval is not a test (see
 manifest can be green because it is *good* or because it is *too weak to fail*. So a
 useful gate has two independent jobs, and they key on different things:
 
-1. **Did the graded outputs regress?** — `report --format junit|github` turns
-   `benchmark.json` into CI-readable output. It reports but does not gate: the
-   command exits 0 on every benchmark (see [What report can and cannot
-   fail](#what-report-can-and-cannot-fail)).
+1. **Did the graded outputs regress?** — `report --fail-on regressions` exits 1 on a
+   *named* regression: a critical veto, a broken regression guard, or negative lift, and
+   on incomplete evidence. `--format junit|github` renders the same result for people;
+   the rendering alone never fails a job (see [The first gate: fail on what you
+   declared](#the-first-gate-fail-on-what-you-declared)).
 2. **Is the manifest itself strong enough to trust the green?** — `audit-manifest
    --fail-on-blockers` fails when the suite has structural blockers (no adversarial
    coverage, a leak-saturated case, an instruction-simulated ablation masquerading
@@ -35,12 +36,16 @@ python3 $HARNESS benchmark evals/shared-benchmark.json --runs /tmp/demo-runs \
   --variant with_skill --variant without_skill \
   --judge-results /tmp/demo-judge.jsonl --out /tmp/demo-benchmark.json
 
-python3 $HARNESS report --benchmark /tmp/demo-benchmark.json --format github
+python3 $HARNESS report --benchmark /tmp/demo-benchmark.json --format github \
+  --fail-on regressions
+echo "exit=$?"
 ```
 
 The demo's `c-review` case has a judge assertion, so the benchmark needs the judge
 verdicts; without `--judge-results` the report reads "Experiment status: incomplete" and
-withholds the lift. Real output (2026-09-30, Python 3.11, six runs per arm):
+withholds the lift, and the gate fails closed on it (`fail-on: demo-reviewer: experiment
+evidence is incomplete (deferred judge verdicts)`, exit 1). Real output (2026-10-03,
+Python 3.11, six runs per arm):
 
 ```text
 # Skill eval — demo-reviewer
@@ -51,11 +56,16 @@ withholds the lift. Real output (2026-09-30, Python 3.11, six runs per arm):
 |---|---|---|---|---|---|---|
 | with_skill | 2 | 12 | 1.00 | 1.00 | 0 | 0 |
 | without_skill | 2 | 12 | 0.00 | 0.00 | 0 | 0 |
+
+## Gate (`--fail-on regressions`)
+
+**Passed:** no matching findings
+exit=0
 ```
 
 `--format github` writes a job-summary table (and annotations) straight into a GitHub
 Actions run. `--format junit` writes the same result as JUnit XML, one `<testcase>` per
-case/variant/run, which any CI that reads JUnit will render and gate on. The same run,
+case/model/variant/run, which any CI that reads JUnit will render. The same run,
 reformatted and trimmed to `run-1` of each arm:
 
 ```text
@@ -75,28 +85,73 @@ actionable-review: no justification for the finding, or the concrete gap (the mi
 
 The `without_skill` failures are *expected* here — that arm exists to prove the skill is
 what passes the cases. Which is the first subtlety of gating an eval: you do not gate on
-"all testcases green." What you want to gate on is the **lift** and **named
-regressions**, not the raw pass count, and `report` gates on neither.
+"all testcases green." A CI job that fails on JUnit failures fails this healthy suite and
+a broken one alike. The gate is `--fail-on`'s exit code, not the XML, which the flag
+leaves unchanged; annotations mark a run without changing any exit code.
 
-## What report can and cannot fail
+## The first gate: fail on what you declared
 
-`report` exits 0 whatever the benchmark says, so the CI step that runs it never fails a
-PR. With `--format github` it prints `::warning` annotations for flagged cases and
-`::error` annotations for a negative overall lift or incomplete evidence; annotations
-mark the run without changing the step's exit code, and they act only when printed to
-stdout, so the recipe below, which appends the output to `$GITHUB_STEP_SUMMARY`, shows
-them as plain text. With `--format junit`, your CI's JUnit reader decides, and it counts
-every `<failure>`, including the expected `without_skill` misses above. A job that fails
-on JUnit failures therefore blocks every honest suite. A `report --fail-on` option that
-exits non-zero on named conditions exists on the unmerged branch
-`claude/twitter-thread-analysis-nrvg2d`; it is not on main.
+A pass/fail on the averaged lift is the wrong gate, because the headline mean is what
+hides a regression: an edit that breaks one case while another keeps passing still shows
+positive lift. `report --fail-on` uses the same gate policy as `audit-manifest --fail-on`,
+over three finding kinds that `report` raises from a graded benchmark (the `regressions`
+preset names all three):
+
+| kind | raised when | declared by |
+|---|---|---|
+| `critical-veto` | a `with_skill` run is vetoed by a `severity: "critical"` assertion | the assertion |
+| `regression-guard-failing` | a `with_skill` run of an `eval_intent: "regression"` case scores below 1.00 objective | the case |
+| `negative-lift` | overall paired lift (with − without, objective) is below zero | — |
+
+The case-level kinds read the `with_skill` arm only. The baseline failing is the point of
+the experiment, and an ablation or `old_skill` arm failing is the regression it exists to
+measure. They fire even when the lift is positive, which is when a regression hides. Like
+every `--fail-on`, the gate fails closed on an incomplete report (deferred judge verdicts,
+missing arms, crashed runs), so a critical assertion that never got graded cannot pass by
+default. Each reason prints to stderr as `fail-on: <kind>: <message>`; with
+`--format github` the summary gains a Gate section and each case-level reason an
+`::error`.
+
+Watch it on the demo. Make the careless edit from
+[did-my-skill-edit-regress.md](did-my-skill-edit-regress.md) (delete the
+`## Severity rules` section from `skills/demo/SKILL.md`), then re-run, re-judge, and
+re-grade into a fresh runs directory. The lift falls from 1.00 to 0.25 but stays
+positive, and nothing in the stock manifest is declared a guard, so `--fail-on
+regressions` **passes**. The case flags saw the damage; nothing was declared
+must-not-break, so nothing blocks. Now declare `c-adversarial` a regression guard
+(`"eval_intent": "regression"` on the case) and grade the same edit. Real output
+(2026-10-03, four runs per arm, trimmed; the `fail-on:` line is stderr):
+
+```text
+- `c-adversarial`: floor: fails in both arms; no objective lift; with-skill failure (with=0.00, without=0.00)
+- `c-review`: with-skill failure (with=0.50, without=0.00)
+
+## Gate (`--fail-on regressions`)
+
+**Failed:** 1 reason(s)
+
+- regression-guard-failing: demo-reviewer/c-adversarial: with_skill objective pass rate 0.00 (4 of 4 run(s) below 1.00)
+…
+::error title=skill-eval gate regression-guard-failing::demo-reviewer/c-adversarial: with_skill objective pass rate 0.00 (4 of 4 run(s) below 1.00)
+fail-on: regression-guard-failing: demo-reviewer/c-adversarial: with_skill objective pass rate 0.00 (4 of 4 run(s) below 1.00)
+exit=1
+```
+
+(`git checkout skills/ evals/` restores the demo.) Deciding what goes in the gate means
+deciding which cases and assertions you declare. Capability cases are reported, never
+gated case by case. A one-run dip on a case the skill is still improving at is noise until
+it clears the paired significance gate. Promote a case to `eval_intent: "regression"` once
+it must never break, and mark prohibitions `severity: "critical"`
+([authoring-evals.md](authoring-evals.md)). `tests/test_example_demo.py` pins all three
+demo outcomes.
 
 Before trusting a lift, read two fields of `benchmark.json`. `paired_summary.interval`
 says whether this run's lift excludes zero at 95%. `paired_summary.noise_check.verdict`
 says whether the eval can resolve a lift of the size you care about (`resolvable`) or
 why not (`too-few-cases-moved`, `noise-exceeds-headroom`, and so on; pass `benchmark
---min-lift` to set the size). Neither field drives an exit code, so a gate that needs
-them has to read the JSON itself.
+--min-lift` to set the size). Neither field drives `report`'s exit code, so a gate that
+needs them has to read the JSON itself (`audit-manifest --runs --fail-on
+underpowered-eval` gates on the noise check).
 
 ## The second gate: is the manifest strong enough?
 
@@ -140,7 +195,7 @@ the declared judge model is the model under test.
 
 When you do want a finding to fail the build, name it. `--fail-on` takes finding kinds,
 severities (`required`, `recommended`) or preset names (`blockers`, `strict-judge`,
-`contamination`, `judge-robustness`), comma-separated and repeatable, and exits 1 when a
+`contamination`, `judge-robustness`, `regressions`), comma-separated and repeatable, and exits 1 when a
 matching finding fires. `--fail-on floor-eval,underpowered-eval` fails a suite whose runs
 show a case failing in both arms or noise too wide to resolve the lift; `--fail-on
 required` fails on every required finding. An unknown token is an error, not a gate that
@@ -153,17 +208,22 @@ The accepted kinds and each one's default severity are listed in
 The recipe for a skill repo's `.github/workflows/`:
 
 ```yaml
-# report exits 0: this step records lift and flags but never fails on a regression
 - name: Grade skill eval
   run: |
+    set -o pipefail   # the gate's exit code must survive the tee
     skill-benchmark benchmark evals/shared-benchmark.json \
       --runs eval-runs/latest --variant with_skill --variant without_skill \
-      --out benchmark.json
-    skill-benchmark report --benchmark benchmark.json --format github >> "$GITHUB_STEP_SUMMARY"
+      --out benchmark.json   # add --judge-results if the manifest has judge assertions
+    skill-benchmark report --benchmark benchmark.json --format github \
+      --fail-on regressions | tee -a "$GITHUB_STEP_SUMMARY"
 
 - name: Fail if the manifest is too weak to trust
   run: skill-benchmark audit-manifest evals/shared-benchmark.json --fail-on-blockers
 ```
+
+Tee the report; do not redirect it. GitHub acts on `::error`/`::warning` lines only when
+they reach the step's stdout. Lines appended straight to `$GITHUB_STEP_SUMMARY` render as
+plain text.
 
 For a full-suite gate across many skills, `suite-run` adds a preflight with cost
 ceilings (`--max-estimated-cost-usd`) so a PR job can refuse to start a run that would
@@ -171,6 +231,13 @@ blow its budget — the operational half of the same gate.
 
 ## Reading a failing gate, symptom by symptom
 
+- **`fail-on: critical-veto: …` or `fail-on: regression-guard-failing: …`** → something
+  you declared must-not-break broke in the `with_skill` arm, named by skill, case, and
+  model. Open that run's `output.md` ([why-did-this-run-fail.md](why-did-this-run-fail.md)).
+  It fails even when the lift headline is green; that is the point.
+- **`fail-on: <skill>: experiment evidence is incomplete (…)`** → evidence is missing
+  (deferred judge verdicts, missing arms, crashed runs), not a quality verdict. Run the
+  judge or re-run the attempts.
 - **Lift dropped vs. the last run** → a real regression, or a noisy sample, and the
   `benchmark.json` `significance` block cannot tell you which: it tests this run's
   lift against zero, not against the last run's lift. To compare two versions of the
@@ -205,8 +272,10 @@ blow its budget — the operational half of the same gate.
   never call a model or the network (a guard test patches `subprocess`/`urllib` to raise
   in the grade path). Your CI grades deterministically; the only model calls are the
   earlier, explicit runner step that produced the outputs.
-- **Gate on lift and named regressions, not raw pass count.** The `without_skill` arm is
-  *supposed* to fail. A gate that counts total green would block every honest suite.
+- **Gate on named regressions, not raw pass count or the headline alone.** The
+  `without_skill` arm is *supposed* to fail, so a gate that counts total green would block
+  every honest suite. The averaged lift can stay positive while a guard breaks, so
+  `--fail-on regressions` reads each declared case in the `with_skill` arm.
 - **A green benchmark is not a green skill-loads.** The answer runners force-load the
   skill; passing them says nothing about autonomous activation. If activation matters for
   your gate, add a `skill-trigger-matrix` check — see
@@ -217,11 +286,13 @@ blow its budget — the operational half of the same gate.
 
 ## Where this stops
 
-This journey gets a PR to fail on an untrustworthy manifest and to report lift and case
-flags on every run. Failing a PR on a regression takes a check of your own on
-`benchmark.json`, because `report --fail-on` is not merged. Whichever check you use does
-not decide *whether the regression is worth blocking on* — a confirmed drop on a
-regression-guard case is a hard stop, but a soft-severity dip may be acceptable. That
-judgment lives in the severity tiers you set on each assertion
-([authoring-evals.md](authoring-evals.md)); this gate only enforces the tiers you
-already chose.
+This journey gets a PR to fail on a declared regression or an untrustworthy manifest. It
+does not decide *what is worth blocking on*: a critical veto or a broken regression guard
+is a hard stop, while a dip on a capability case or a soft-severity assertion is only
+reported. That judgment lives in the severities and intents you declare
+([authoring-evals.md](authoring-evals.md)); `--fail-on` enforces only what you declared,
+and the careless-edit example above passes it until you do. It also gates one report: a
+drop relative to the last merged skill is the `old_skill` arm's `paired_edit_summary`
+above. `regression-guard-failing` reads objective assertions only, so a judge-only guard
+does not raise it; until you have calibrated the judge
+([can-i-trust-my-judge.md](can-i-trust-my-judge.md)), keep guards on deterministic checks.

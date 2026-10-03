@@ -391,10 +391,13 @@ reading guide, honesty rules, boundary — is written down in [`docs/README.md`]
       rubber-stamp's kappa-0.0 / control-leak-1.0 / lift-erosion signature — runs with no model
       (real 2026-07-09 output; guarded by `tests/test_example_demo.py`).
 - [x] **"How do I gate my skill repo's CI on this?"** — [`docs/gating-ci-on-evals.md`](docs/gating-ci-on-evals.md):
-      the two-gate recipe (`report --format junit|github` for regressions +
-      `audit-manifest --fail-on-blockers` for manifest trust), a workflow file, and the
-      "gate on lift/named regressions, not raw pass count" reading guide. Runnable offline on
-      `examples/demo-skill` (real report/junit/readiness output, refreshed 2026-09-30).
+      the two-gate recipe (`report --fail-on regressions` for declared regressions: critical
+      vetoes, broken regression guards, negative lift +
+      `audit-manifest --fail-on-blockers` for manifest trust), a workflow file that tees
+      annotations to stdout, and the "gate on named regressions, not raw pass count or the
+      headline alone" reading guide. Runnable offline on `examples/demo-skill` (real
+      report/junit/readiness output, refreshed 2026-09-30; gate output 2026-10-03, its three
+      demo outcomes guarded by `tests/test_example_demo.py`).
 - [x] **"How do I port my existing evals into the harness?"** — [`docs/porting-existing-evals.md`](docs/porting-existing-evals.md):
       `dataset_files` JSONL + one template case as the mechanical seam, then the additions the
       source framework had no slot for (paired baseline, splits, leakage-safe assertions),

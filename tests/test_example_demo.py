@@ -2,6 +2,8 @@
 deterministic stub 'model') -> report, and the two materialized ablations each
 confirm a regression on a distinct assertion. Runs in CI with no model/API."""
 import json
+import re
+import shutil
 import sys
 import tempfile
 import unittest
@@ -104,6 +106,65 @@ class DemoExampleTests(unittest.TestCase):
                            if mark["id"] == "noise-below-min-lift")
         self.assertEqual(noise_notes, [
             "the benchmark is incomplete: judge assertions have no verdicts; pass --judge-results"])
+
+
+class DemoGateTests(unittest.TestCase):
+    """Pins what docs/gating-ci-on-evals.md pastes, through the commands it
+    shows: `report --fail-on regressions` passes the healthy demo, still passes
+    a careless SKILL.md edit when nothing is declared (the gate enforces
+    declarations, not the averaged headline), and fails that same edit by name
+    once c-adversarial is declared a regression guard."""
+
+    def _gate(self, *, careless_edit: bool, guard: bool) -> tuple[int, str, str]:
+        tmp = tempfile.TemporaryDirectory(prefix="demo-gate-")
+        self.addCleanup(tmp.cleanup)
+        td = Path(tmp.name)
+        demo = td / "demo"
+        shutil.copytree(DEMO, demo)
+        mp = demo / "evals" / "shared-benchmark.json"
+        if guard:
+            manifest = json.loads(mp.read_text(encoding="utf-8"))
+            for case in manifest["cases"]:
+                if case["id"] == "c-adversarial":
+                    case["eval_intent"] = "regression"
+            mp.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        if careless_edit:
+            skill = demo / "skills" / "demo" / "SKILL.md"
+            text = skill.read_text(encoding="utf-8")
+            edited = re.sub(r"## Severity rules\n.*?(?=\n## )", "", text, flags=re.DOTALL)
+            self.assertNotEqual(edited, text)
+            skill.write_text(edited, encoding="utf-8")
+        arms = ("--variant", "with_skill", "--variant", "without_skill")
+        steps = [
+            ("prepare", mp, "--split", "tune", "--runs-per-variant", "4", "--out", td / "tasks.jsonl"),
+            ("run-codex", "--tasks", td / "tasks.jsonl", "--runs", td / "runs",
+             "--codex-cmd", f"{sys.executable} {demo / 'stub_runner.py'}", "--timeout", "120"),
+            ("judge", mp, "--runs", td / "runs", *arms,
+             "--judge-cmd", f"{sys.executable} {demo / 'stub_judge.py'}", "--out", td / "judge.jsonl"),
+            ("benchmark", mp, "--runs", td / "runs", *arms,
+             "--judge-results", td / "judge.jsonl", "--out", td / "bench.json"),
+        ]
+        for argv in steps:
+            code, _, stderr = run_cli(*argv)
+            self.assertEqual(code, 0, f"{argv[0]}: {stderr}")
+        return run_cli("report", "--benchmark", td / "bench.json", "--format", "github",
+                       "--fail-on", "regressions")
+
+    def test_healthy_demo_passes(self):
+        code, stdout, stderr = self._gate(careless_edit=False, guard=False)
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn("**Passed:** no matching findings", stdout)
+
+    def test_careless_edit_passes_when_nothing_is_declared(self):
+        code, stdout, stderr = self._gate(careless_edit=True, guard=False)
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn("**Lift (with − without, objective):** 0.25 − 0.00 = **0.25**", stdout)
+
+    def test_careless_edit_fails_a_declared_regression_guard_by_name(self):
+        code, _, stderr = self._gate(careless_edit=True, guard=True)
+        self.assertEqual((code, stderr), (1, (
+            "fail-on: regression-guard-failing: demo-reviewer/c-adversarial: "
+            "with_skill objective pass rate 0.00 (4 of 4 run(s) below 1.00)\n")))
 
 
 class DemoJudgeTests(unittest.TestCase):

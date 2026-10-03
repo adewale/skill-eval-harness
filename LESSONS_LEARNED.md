@@ -895,3 +895,28 @@ number built on it is about a different experiment.
   what breaks the contract (session content after the end), not whatever is unfamiliar.
 - Keep a runbook of live checks (`docs/live-verification.md`) for everything CI can only fake, and
   run it after any CLI upgrade.
+
+
+## 2026-10-03 — A documented gate is not a gate until something exits non-zero
+
+**Problem:** The gating walkthrough said to "gate on the lift and on named regressions" and
+called a drop on a regression-guard case "a hard stop", but `report` returned 0
+unconditionally and the recipe redirected its output into `$GITHUB_STEP_SUMMARY`, where
+annotations never act. On the demo, a careless `SKILL.md` edit that took a declared
+critical regression guard from 1.00 to 0.00 left every command at exit 0. The one `::error`
+condition was negative *overall* lift, and the headline stayed at +0.25. The analysis layer
+said "the aggregate lies"; the automated decision still read only the aggregate.
+
+**Lesson:** A guarantee in prose needs an executable owner and a test that fails when the
+promise breaks. A gate has to key on the same named, per-case evidence the analysis uses,
+because the averaged headline is exactly what hides a regression on one case. When the
+harness already has one gate policy, the new gate is new finding kinds and a preset in it,
+not a second vocabulary.
+
+**Rule:**
+- Every "gate on X" sentence in the docs maps to a `--fail-on` token whose exit code
+  enforces X, and a test drives it through the real CLI and asserts the non-zero exit.
+- Case-level gate kinds read the treatment arm only; the baseline, ablation, and
+  `old_skill` arms failing is the experiment working.
+- CI recipes are run, not just read: tee with `pipefail`, never a bare redirect, whenever
+  the output carries workflow commands.

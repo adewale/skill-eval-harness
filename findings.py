@@ -206,6 +206,10 @@ class FindingKind(str, Enum):
     MANY_REFERENCES = "many-references"
     REFERENCES_TOO_LARGE = "references-too-large"
     MANY_MODULES = "many-modules"
+    # Named regressions in a graded benchmark (report --fail-on).
+    CRITICAL_VETO = "critical-veto"
+    REGRESSION_GUARD_FAILING = "regression-guard-failing"
+    NEGATIVE_LIFT = "negative-lift"
     # Contamination (contamination).
     CANARY_HIT = "canary-hit"
     OUTPUT_ANSWER_OVERLAP = "output-answer-overlap"
@@ -292,6 +296,9 @@ _SPECS: dict[FindingKind, KindSpec] = {
     FindingKind.MANY_REFERENCES: KindSpec(_S, _REC),
     FindingKind.REFERENCES_TOO_LARGE: KindSpec(_S, _REC),
     FindingKind.MANY_MODULES: KindSpec(_S, _REC),
+    FindingKind.CRITICAL_VETO: KindSpec(_S, _REQ),
+    FindingKind.REGRESSION_GUARD_FAILING: KindSpec(_S, _REQ),
+    FindingKind.NEGATIVE_LIFT: KindSpec(_S, _REQ),
     FindingKind.CANARY_HIT: KindSpec(_E, _REQ),
     FindingKind.OUTPUT_ANSWER_OVERLAP: KindSpec(_E, _REC),
     FindingKind.RELEASED_BEFORE_CUTOFF: KindSpec(_E, _REC),

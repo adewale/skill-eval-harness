@@ -316,11 +316,15 @@ A case whose two arms score the same extreme stops discriminating in one of two 
 
 ## CI report formats
 
-`report` serializes a `benchmark.json` for CI: `--format junit` writes one `<testcase>` per case/variant/run with evidence on failures and the paired lift as suite properties; `--format github` writes job-summary markdown plus `::warning` annotations per flagged case (and an `::error` on negative lift); a partial report opens with its experiment status, naming each of the report's `incomplete_reasons` once.
+`report` serializes a `benchmark.json` for CI: `--format junit` writes one `<testcase>` per case/model/variant/run with evidence on failures and the paired lift as suite properties; `--format github` writes job-summary markdown plus `::warning` annotations per flagged case (and an `::error` on negative lift or incomplete evidence); a partial report opens with its experiment status, naming each of the report's `incomplete_reasons` once.
+
+The rendering never sets the exit code; `--fail-on` does, through the same gate policy and tokens as `audit-manifest --fail-on`. From a graded benchmark `report` raises three finding kinds: `critical-veto` (a `with_skill` run vetoed by a critical assertion), `regression-guard-failing` (a `with_skill` run of an `eval_intent: "regression"` case below 1.00 objective), and `negative-lift`; the `regressions` preset names all three. The case-level kinds read only the `with_skill` arm and fire even when overall lift is positive. The gate fails closed on an incomplete report, prints each reason to stderr as `fail-on: <kind>: <message>`, and exits 1. With `--format github` the summary gains a Gate section and each case-level reason an `::error`; the JUnit XML is unchanged. Without `--fail-on`, output and exit status are unchanged.
 
 ```bash
-skill-benchmark report --benchmark benchmark.json --format junit --out junit.xml
-skill-benchmark report --benchmark benchmark.json --format github --out "$GITHUB_STEP_SUMMARY"
+skill-benchmark report --benchmark benchmark.json --format junit --out junit.xml --fail-on regressions
+# annotations act only on stdout: tee into the step summary, never redirect
+skill-benchmark report --benchmark benchmark.json --format github --fail-on regressions \
+  | tee -a "$GITHUB_STEP_SUMMARY"
 ```
 
 The full CI gating recipe — both report formats plus the manifest-trust gate — is [`gating-ci-on-evals.md`](gating-ci-on-evals.md).
@@ -441,9 +445,9 @@ What each mark asks, and why the harness uses these five rather than the hillcli
 skill-benchmark audit-manifest evals/shared-benchmark.json --fail-on-blockers
 ```
 
-`--strict-judge` exits non-zero on a `judge-is-model-under-test` finding. For anything else, `--fail-on KINDS` takes finding kinds, severities (`required`, `recommended`), or presets, comma-separated and repeatable, and exits 1 when a finding or readiness blocker matches; each reason is printed to stderr as `fail-on: <kind>: <message>`. An unknown token stops the command before any work (`unknown --fail-on token 'florr-eval': use a finding kind, a severity, or one of: blockers, contamination, judge-robustness, recommended, required, strict-judge`). When `--runs` points at an incomplete benchmark, `--fail-on` fails closed rather than passing on findings it never computed.
+`--strict-judge` exits non-zero on a `judge-is-model-under-test` finding. For anything else, `--fail-on KINDS` takes finding kinds, severities (`required`, `recommended`), or presets, comma-separated and repeatable, and exits 1 when a finding or readiness blocker matches; each reason is printed to stderr as `fail-on: <kind>: <message>`. An unknown token stops the command before any work (`unknown --fail-on token 'florr-eval': use a finding kind, a severity, or one of: blockers, contamination, judge-robustness, recommended, regressions, required, strict-judge`). When `--runs` points at an incomplete benchmark, `--fail-on` fails closed rather than passing on findings it never computed.
 
-The presets are the same policies the older flags apply (`gate_policy.PRESETS`): `blockers` is the six readiness kinds that `--fail-on-blockers` gates on, and `strict-judge` is `judge-is-model-under-test`. `contamination` (`canary-hit`, `output-answer-overlap`, `released-before-cutoff`) and `judge-robustness` (`order-flip-inconsistent`, `passes-empty-control`, `passes-master-key-control`, `judge-call-incomplete`) are the policies `contamination --fail-on-contamination` and `judge-robustness --fail-on-findings` apply in their own commands, and like `--fail-on` they fail closed on incomplete evidence; `audit-manifest` does not run those checks, so in its `--fail-on` those two presets match nothing. `--strict` is a grading option, not a gate: it changes how verdicts score, not whether the command fails.
+The presets are the same policies the older flags apply (`gate_policy.PRESETS`): `blockers` is the six readiness kinds that `--fail-on-blockers` gates on, and `strict-judge` is `judge-is-model-under-test`. `contamination` (`canary-hit`, `output-answer-overlap`, `released-before-cutoff`) and `judge-robustness` (`order-flip-inconsistent`, `passes-empty-control`, `passes-master-key-control`, `judge-call-incomplete`) are the policies `contamination --fail-on-contamination` and `judge-robustness --fail-on-findings` apply in their own commands, and like `--fail-on` they fail closed on incomplete evidence; `audit-manifest` does not run those checks, so in its `--fail-on` those two presets match nothing. Likewise `regressions` (`critical-veto`, `regression-guard-failing`, `negative-lift`) is the policy for `report --fail-on` ([CI report formats](#ci-report-formats)) and matches nothing in `audit-manifest`. `--strict` is a grading option, not a gate: it changes how verdicts score, not whether the command fails.
 
 The systematic way to upgrade a suite is to drive those blockers to empty, repo by repo: materialize the ablations (`materialize-ablations` / declare a `mechanism`+`target`), de-leak the leak-saturated cases (move the answer out of the prompt, or assert a downstream consequence), and add adversarial cases where missing — then the gate goes green. The walkthrough is [`gating-ci-on-evals.md`](gating-ci-on-evals.md).
 
@@ -504,6 +508,9 @@ Every finding the harness emits has a registered kind in `findings.FindingKind`,
 | `many-references` | skill | recommended | `profile-skill` |
 | `references-too-large` | skill | recommended | `profile-skill` |
 | `many-modules` | skill | recommended | `profile-skill` |
+| `critical-veto` | skill | required | `report --fail-on` |
+| `regression-guard-failing` | skill | required | `report --fail-on` |
+| `negative-lift` | skill | required | `report --fail-on` |
 | `canary-hit` | eval | required | `contamination` |
 | `output-answer-overlap` | eval | recommended | `contamination` |
 | `released-before-cutoff` | eval | recommended | `contamination` |

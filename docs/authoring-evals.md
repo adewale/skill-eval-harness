@@ -247,7 +247,8 @@ failure across twenty runs is a catastrophe, not a 95% pass rate (the "valley-do
 Mark these `severity: "critical"` — an `excludes_any` / `not_regex` for the forbidden state, or a
 `script` oracle that exits non-zero on it, with `"severity": "critical"` set. A critical failure
 vetoes the run, collapses its rates to 0.0, and is surfaced on its own (a `critical-failure`
-flag), so no graded mean elsewhere can bury it. `adewale/guardrails-skill` encodes exactly these
+flag), so no graded mean elsewhere can bury it; `report --fail-on regressions` turns a `with_skill`
+veto into a failing CI job ([gating-ci-on-evals.md](gating-ci-on-evals.md)). `adewale/guardrails-skill` encodes exactly these
 fences ("never write outside the results directory," "do not report success if a check failed").
 One caution: a hard prohibition that is too broad makes a skill obstinate, so pair each with a
 negative case proving the skill still does the reasonable thing.
