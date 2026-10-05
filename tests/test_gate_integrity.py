@@ -282,7 +282,7 @@ class WorkflowGateTests(unittest.TestCase):
         self.pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
     def test_every_gate_runs_unconditionally_and_can_fail(self):
-        self.assertEqual(set(self.workflows), {"ci.yml", "publish.yml"})
+        self.assertEqual(set(self.workflows), {"ci.yml", "downstream-consumers.yml", "publish.yml"})
         self.assertEqual(
             workflow_violations(self.workflows, REQUIRED_GATE_COMMANDS, self.pyproject), [])
 

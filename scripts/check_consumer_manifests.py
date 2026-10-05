@@ -46,7 +46,7 @@ def run_gate(argv: list[str], workspace_root: Path) -> tuple[int, str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     parser.add_argument("--workspace-root", required=True,
                         help="directory holding one checkout per consumer repository")
     parser.add_argument("--list", default=str(DEFAULT_LIST),
