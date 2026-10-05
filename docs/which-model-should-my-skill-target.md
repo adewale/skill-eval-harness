@@ -28,9 +28,17 @@ python3 $H prepare evals/shared-benchmark.json --split tune \
   --models haiku,sonnet,opus --out /tmp/model-tasks.jsonl
 python3 $H run-codex --tasks /tmp/model-tasks.jsonl --runs /tmp/model-runs \
   --codex-cmd "python3 $(pwd)/stub_runner.py"
+python3 $H judge evals/shared-benchmark.json --runs /tmp/model-runs \
+  --variant with_skill --variant without_skill \
+  --judge-cmd "python3 $(pwd)/stub_judge.py" --out /tmp/model-judge.jsonl
 python3 $H benchmark evals/shared-benchmark.json --runs /tmp/model-runs \
-  --variant with_skill --variant without_skill --out /tmp/model-bench.json
+  --variant with_skill --variant without_skill \
+  --judge-results /tmp/model-judge.jsonl --out /tmp/model-bench.json
 ```
+
+The `judge` step grades `c-review`'s `actionable-review` assertion with the demo's offline
+stub judge. Without it the report is partial and every `ranking` entry's `lift`,
+`with_skill`, and `without_skill` read `null`.
 
 `prepare` emitted **12 rows** — 2 answer cases × 2 variants × 3 models — and stamped
 each with a `model` and a model-segmented `run_dir` (`c-review/haiku/with_skill`, …).
@@ -38,7 +46,7 @@ each with a `model` and a model-segmented `run_dir` (`c-review/haiku/with_skill`
 run's metadata, so no extra flag is needed to grade the three tiers apart.
 
 Here is the real `model_analysis` block from `/tmp/model-bench.json` (2026-07-06,
-Python 3.11):
+Python 3.11; re-run with the judge step 2026-09-29, unchanged):
 
 ```json
 "ranking": [
@@ -54,8 +62,8 @@ only produce that one number. `stub_runner.py` answers by reading the skill tree
 the harness mounted. It is deterministic and **model-blind**: it never reads the
 `model` label the row carries. So all three model rows run through the same stub and
 produce the same output, and `by_model` / `paired_summary.by_model` show the same
-delta three times. This is exactly analogous to the token journey's "runtime pairs 0
-/ `None`" shape ([`is-my-skill-worth-its-tokens.md`](is-my-skill-worth-its-tokens.md)):
+delta three times. This is exactly analogous to the token journey's "twelve runtime
+pairs, every delta `—`" shape ([`is-my-skill-worth-its-tokens.md`](is-my-skill-worth-its-tokens.md)):
 the offline run proves the *plumbing* — that rows fan per model, the model axis
 threads through grading into the report, and `ranking` / `lift_losers` populate — but
 it cannot prove *divergence*, because the thing that makes tiers differ (a real model
@@ -103,12 +111,38 @@ the weakest tier you support sets the bound, and a skill's value is a property o
 
 ## What keeps the measurement honest
 
-- **Per-model lift is a paired delta and needs repeats.** A single run per (case,
-  model) cell is a coin flip, exactly like every other lift number in the harness. Use
-  `prepare --runs-per-variant` to replicate before you rank tiers; a marginal ordering
-  over n=1 cells is noise. The offline block above shows `significant_at_0_05: false`
-  precisely because it is underpowered — read the significance field, not just the
-  lift.
+- **Stronger tiers should score higher in each arm, not in lift.** The blog post
+  [Automating eval design and hillclimbing with
+  Claude](https://claude.dev/blog/automating-eval-design-and-hillclimbing/) lists
+  "Performance improves with stronger models and more thinking" as a property of a
+  well-designed eval. In a paired eval that expectation applies to each arm's absolute
+  pass rate in `by_model`: a stronger tier's `with_skill` and `without_skill` rates
+  should each sit at or above a weaker tier's. Lift can shrink on a stronger tier
+  because its base model needs the skill less, and that is not an inversion. The
+  inversion to chase is a stronger tier scoring *lower* than a weaker one in the same
+  arm: when that happens, the same post says, "ambiguous tasks or a miscalibrated
+  grader often are hobbling performance," so open the cases before you rank. This check
+  is a per-arm diagnostic, not one of the harness's eval-health marks
+  ([why](comparing-with-claude-api-evals.md#five-marks-of-a-lift-eval)).
+- **Pin effort before comparing tiers.** Unless you pass `--effort` to `run-claude`,
+  `run-codex`, or `run-agent`, each tier runs at its CLI's default effort, and those
+  defaults differ by model and CLI version: per the claude-api skill, Claude Opus
+  5.5's API default is `medium` while Claude Opus 5's is `high`. A tier comparison
+  at defaults can then measure an effort gap as a model gap. Every run records
+  `effort.applied_by: "backend_default"` in that case, and a multi-model report whose
+  runs all used defaults says so in `run_endings.notes` ("every run used its backend's
+  default effort; defaults differ by model, so pin --effort before reading a
+  cross-model comparison"); the offline fan-out above carries exactly that note. Gemini
+  and Vibe have no known effort control, so `--effort` is refused on them before any
+  run starts.
+- **Per-model lift is a paired delta, and its test counts cases.** A single run per
+  (case, model) cell is a coin flip, so `prepare --runs-per-variant` steadies each
+  cell's rate before you rank tiers. Repeats do not add cases, though: each tier's
+  significance test runs over its cases, and no tier can reach p ≤ 0.05 until at least
+  6 of them move the same way (see **Inference unit** in
+  [`vocabulary.md`](vocabulary.md#report-signals)). To make a tier ranking significant,
+  add cases. The offline block above shows `significant_at_0_05: false` precisely
+  because it is underpowered — read the significance field, not just the lift.
 - **An offline stub cannot tell you which model to pick.** It is model-blind by
   construction, so its identical-across-tiers ranking proves the pipeline and nothing
   about model choice. Only a runner that actually varies by capability
@@ -128,9 +162,15 @@ the weakest tier you support sets the bound, and a skill's value is a property o
 
 This journey ranks the tiers you fanned over, on the cases you have. It does **not**
 tell you the *cheapest* tier that still clears your bar — lift per tier says nothing
-about dollars per tier; that trade-off is the cost journey,
+about dollars per tier, and the cost ledger does not price tiers either: `cost-summary`
+groups spend by case, variant, runner, and ablation, never by model. To compare,
+read each tier's `by_model.<model>.with_skill` pass rate beside that tier's spend,
+summed from the `cost_normalized` block each run's `metadata.json` records next to its
+`model`, or from a separate `cost-summary` over a runs directory that holds one tier.
+The harness reports both numbers and never picks the model for you; the per-skill
+cost questions are in
 [`is-my-skill-worth-its-tokens.md`](is-my-skill-worth-its-tokens.md). And it assumes
 the skill actually *loaded* on each tier; whether the description routes on a given
 model is a separate, prior question answered by
 [`tuning-skill-activation.md`](tuning-skill-activation.md). Rank tiers here, price them
-there, and confirm they load before you trust either number.
+from their runs' spend, and confirm they load before you trust either number.

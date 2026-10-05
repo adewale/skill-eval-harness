@@ -15,32 +15,9 @@ from typing import Any
 
 from json_contracts import (
     freeze_json_mapping,
+    strict_json_loads,
     validate_json_text,
-    validate_json_value,
 )
-
-
-def _reject_constant(value: str) -> None:
-    raise ValueError(f"non-finite numeric constant {value!r}")
-
-
-def _object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in out:
-            raise ValueError(f"duplicate object key {key!r}")
-        out[key] = value
-    return out
-
-
-def _strict_json_loads(text: str) -> Any:
-    value = json.loads(
-        text,
-        parse_constant=_reject_constant,
-        object_pairs_hook=_object_without_duplicates,
-    )
-    validate_json_value(value, "Gemini JSON")
-    return value
 
 
 def _nonempty_string(value: Any, label: str) -> str:
@@ -273,7 +250,7 @@ class GeminiStream:
             if not line.strip():
                 continue
             try:
-                value = _strict_json_loads(line)
+                value = strict_json_loads(line)
             except (json.JSONDecodeError, TypeError, ValueError, RecursionError) as exc:
                 return cls.invalid(
                     f"malformed JSONL at line {line_number}: {exc}",
@@ -579,7 +556,7 @@ class GeminiJsonResponse:
         if not isinstance(raw_text, str):
             raise TypeError("Gemini JSON output must be text")
         try:
-            value = _strict_json_loads(raw_text)
+            value = strict_json_loads(raw_text)
         except (json.JSONDecodeError, TypeError, ValueError, RecursionError) as exc:
             return cls(protocol_error=f"malformed Gemini JSON: {exc}")
         if not isinstance(value, Mapping):

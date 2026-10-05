@@ -90,6 +90,10 @@ channel can promote another channel.
 - Provenance applies only to available values: `provider_reported`,
   `trace_normalized`, `price_table_estimated`, `estimated`, or `legacy_unverified`.
   `missing` is no longer provenance; it is an unavailable state.
+  *Update (2026-09-30): provenance now also includes `process_measured` (a duration the
+  harness times around the provider process), and usage sources and cost sources are
+  separate sets, so a cost is never a bare `estimated`. The current lists live in
+  [`commands.md`](commands.md#cost-telemetry-tokens-and-dollars).*
 - Money is exact (`Decimal` internally and a canonical decimal string on the wire),
   non-negative, and always carries an ISO currency. A non-USD amount must not be
   called `cost_usd`.
@@ -115,6 +119,14 @@ A comparison policy declares which dimensions may differ. A normal with/without
 experiment may intentionally differ in variant and materialized skill tree, but not in
 case, repetition, model configuration, billing scope, or population. This avoids both
 false matches and an overly rigid raw-dictionary equality check.
+
+Effort is part of that model configuration. Each answer run records
+`effort: {requested, applied_by}`, where an unpinned run records the `backend-default`
+marker (spelled `backend_default` since 2026-09-30) because defaults differ by model and CLI version. Pair construction from result
+rows (`experimental_pairs.pairs_from_rows`) blocks a with/without pair whose arms ran at
+different effort as `effort_mismatch`, and a pair where only one arm recorded effort as
+`effort_unrecorded_on_one_arm`, since that arm cannot be shown to share the other's level.
+Two runs that both predate effort recording still pair.
 
 ## Scope
 
@@ -181,7 +193,7 @@ It owns:
 6. pair matching, comparison, and ratio construction; and
 7. JSON/Markdown display helpers.
 
-`skill_benchmark.py`, `run_pi_trigger_eval.py`, and `run_trigger_matrix.py` consume this API.
+`skill_benchmark.py` and `run_trigger_matrix.py` (which `run_pi_trigger_eval.py` wraps) consume this API.
 Compatibility fields (`usage_normalized`, `cost_normalized`, `cost_usd`, `total_tokens`) are read
 through boundary adapters; derived comparisons and aggregates do not use `... or 0` fallbacks.
 
@@ -251,7 +263,7 @@ available.
 
 ### Phase 4 — compatibility, documentation, and removal of bypasses
 
-- [x] Add `migrate-telemetry --check|--write`
+- [x] Add `migrate-telemetry` (it writes by default; `--check` reports without writing)
   with atomic writes, dry-run output, backups, and idempotence.
 - [x] Read old artifacts through the adapter. Legacy numeric values are
   `legacy_unverified` and are not eligible for causal ratios unless repaired with a

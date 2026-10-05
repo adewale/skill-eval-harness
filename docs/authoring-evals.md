@@ -34,7 +34,7 @@ Pick the success goals the skill owns. The harness stores these per case in `suc
 |---|---|---|
 | `outcome` | Did it produce the right result? | `contains*`, `regex`, `file_exists`, `json_field_equals`, `golden_output`, `similarity`, `structured_output`, `script` |
 | `process` | Did it work the right way? | `skill_invoked`, `command_ran`, `command_order`, `tool_call`, `tool_count_le` |
-| `style` | Is it phrased and structured well? | `judge` / `rubric` / `factuality`, with anchored `graded_dimensions` |
+| `style` | Is it phrased and structured well? | `judge` / `rubric` / `factuality` as yes/no claims; anchored `graded_dimensions` for ordinal properties |
 | `efficiency` | Did it stay within budget? | `total_tokens_le`, `elapsed_seconds_le`, `command_count_le` |
 
 Keep the definition small and must-pass. Encode the behaviors whose regression would
@@ -52,8 +52,41 @@ better" channel — and never moves a pass rate; a `critical` failure vetoes the
 
 ## Step 1 — Write prompts only
 
-Author 8 to 20 cases as prompts with `expected_behavior` notes and no `assertions` yet. Mix
-the kinds on purpose:
+Author cases as prompts with `expected_behavior` notes and no `assertions` yet. Draw them from
+these sources in this order, which is the order the `/claude-api build-eval` guide in the
+claude-api skill uses (the reasoning is in
+[Automating eval design and hillclimbing with Claude](https://claude.dev/blog/automating-eval-design-and-hillclimbing/)):
+
+1. **Real sessions and requests** where the skill should have helped. Before a transcript becomes
+   a committed fixture, check whether a retention policy will force you to delete it and whether
+   it holds PII that cannot sit in the repo.
+2. **Bug reports and manual fixes.** A correction you made by hand after the skill ran is a case
+   the skill failed.
+3. **Five to ten hand-written seeds.** These lean toward what is memorable to you rather than
+   what is frequent, so treat them as seeds, not the whole set.
+4. **Synthesized variants of those seeds**, never cases invented from the skill's text with
+   nothing real to anchor them.
+
+Record where each case came from in its `source` field: `production`, `bug-report`,
+`hand-written`, `synthesized`, or `imported` for a case carried over from another suite.
+`audit-manifest` counts the sources, and a suite that records none, or only synthesized cases,
+gets a finding against eval-health mark 1 (realistic cases).
+
+A case earns its place when you can say why it is hard, and the reason is one a domain expert
+would name. "Today's model fails it" does not count: a set picked that way measures one model's
+failure fingerprint, and its lift shrinks when the next model arrives.
+
+Size the suite in cases, not runs. The paired significance test treats each case as one unit
+(its repeats are averaged into one rate per arm first), and a case whose lift is zero cannot
+move the test. With k cases that moved, the smallest achievable p is 2/2^k, so fewer than 6
+moved cases can never reach p ≤ 0.05 (2/2^5 = 0.0625). Aim for 15 or more cases so that at least
+6 can move. Repeats sharpen each case's rate; they do not add cases. After a run,
+`paired_summary.noise_check` reports `cases_moved`, `smallest_achievable_p`, and a `verdict`;
+`paired_summary.interval` gives the 95% range for the lift (unbounded with 5 or fewer cases); and
+`benchmark --min-lift 0.1` checks whether the eval's noise floor is below the smallest lift you
+would act on.
+
+Mix the kinds on purpose:
 
 - **Positive** (`pos-*`): the skill should fire and help.
 - **Negative** (`neg-*`): the skill should not fire, or should decline.
@@ -160,13 +193,50 @@ Open the outputs and write the smallest assertions that capture the behavior, in
    `metrics.json`). These fail closed without evidence by design. Scope them per variant:
    `skill_invoked=true` for `with_skill`, `false` for `without_skill`.
 3. **`script` oracle**, when a keyword check is too weak. Opt in with `--allow-scripts`; print a
-   `{"score", "max_score"}` line to make it a graded oracle.
+   `{"score", "max_score"}` line to make it a graded oracle. A script defaults to the `demo`
+   oracle tier, and a case graded only by `demo`/`live` oracles trips `weak-oracle-only` in
+   `audit-manifest`; once you have verified that a script checks the real end state (it builds or
+   renders the result and inspects it), mark it `"oracle": "strong"`.
 4. **`judge` / `rubric`** last, for qualitative properties. The harness defers these and picks
-   no model; you supply `--judge-cmd` (or `--judge-model`). Reach for anchored `graded_dimensions`
-   when you need *how much better*, not just pass/fail.
+   no model; you supply `--judge-cmd` (or `--judge-model`). Write the rubric as checkable claims:
+   several yes/no judge assertions (soft by default), each checking one property ("names the
+   missing test", "does not invent an API parameter"), rather than one judge asked how good the
+   answer is. The run records the fraction met as `soft_passed` / `soft_total`; `graded_score`
+   averages only verdicts that include a `score` (optional in the plain judge contract), so have
+   the judge return `score` 1 or 0 if you want the fraction in the paired `graded` channel. A judge
+   that scores on its own scale (1–5, say) declares `score_scale: [1, 5]` so the channel can
+   normalize it; without it, a 1–5 score leaves the channel `partial`. Keep
+   anchored 1-5 `graded_dimensions` for properties that are ordinal, where a 3 sits between a 2
+   and a 4. When a property is fuzzy and the question is which arm did better, compare the arms
+   directly: `compare-tasks` exports each run's `with_skill` and `without_skill` outputs as a
+   blind A/B pair in random order, and `compare-results` maps your judge's answers back to arms
+   and counts wins (it runs no significance test).
 
 If `validate` warns that a value is in the prompt, replace the keyword with a scoped regex, a
 fixture-backed check, a script oracle, or a judge.
+
+Before trusting the assertions, grade two answers whose verdict you already know: a reference
+answer written by hand and an answer that only restates the prompt. The reference must pass every
+gate and the echo must fail. A failing reference means an assertion rejects a correct answer; a
+passing echo means an assertion leaks.
+
+Where a case has a deterministic known answer, declare it and let `audit-manifest` run that check
+on every audit. Put it inline as `reference_answer` on a `tune` case; a `holdout` or `holdback`
+case must name a private file with `reference_answer_ref` instead, because a known answer is an
+answer key. The audit's known-answer check runs the case's gate text checks (`contains`,
+`contains_any`, `contains_all`, `excludes_any`, `regex`, `not_regex`) on the reference answer and on
+the prompt echoed back, and reports `reference-answer-fails` or `null-answer-passes` against
+eval-health mark 2. The reference answer never reaches a runner.
+
+For checks the audit cannot run on a string (files, scripts, JSON fields), grade the pair by hand:
+put them in a scratch run layout (`<case_id>/with_skill/run-1/output.md` for the reference,
+`<case_id>/without_skill/run-1/output.md` for the echo) and run `benchmark` on it. Do not use an
+empty file as the bad answer, because an empty output is recorded as `missing_output` and never
+scored. Process assertions fail closed without trace evidence, so neither check covers them.
+
+Then read about five graded failures in each arm of a real run. If more than about one in ten
+are assertion errors rather than real misses, fix the assertions before a full run. Misgrades on
+`without_skill` matter most, because a correct baseline answer marked wrong inflates lift.
 
 Two patterns from the hardest grading domains are worth copying. First, **check both presence
 and absence**: a strong oracle confirms the good traits are there *and* the bad ones are not.
@@ -201,14 +271,53 @@ Do an analyst pass before touching the skill. Read the flags, because the headli
 hides the signal:
 
 - **Lift**: `with_skill` minus `without_skill` per case. No lift means the case does not
-  discriminate; add a harder fixture or an artifact-level check.
-- **Saturated**: every `with_skill` run passes. Weak evidence of lift, though not a skill
-  failure; when the baseline passes everything too, the case is base-saturated and
-  measures nothing.
+  discriminate, and the cause decides the fix. At the ceiling (both arms pass), the case is too
+  easy: add a harder fixture or an artifact-level check. At the floor (both arms fail every
+  scored run, flagged `floor: fails in both arms` and reported by `audit-manifest --runs` as
+  `floor-eval`), suspect the case or its assertion first: read the outputs and check whether any
+  correct answer could pass.
+- **Saturated** (`saturated/non-discriminating`): both arms pass every scored run, so the
+  case cannot show lift ([`vocabulary.md`](vocabulary.md#report-signals) separates this flag
+  from a with-skill ceiling and from a base-saturated case).
 - **Flaky**: repeated runs disagree. Investigate before trusting the number.
 - **With-skill-failed**: the skill made things worse. This is the highest-priority flag.
 - **Missing output**: not measured, which differs from measured-and-failed. Excluded from
   lift and saturation.
+
+Then rate the eval itself before you trust any lift it reports. `audit-manifest` over the same
+runs rates the five eval-health marks; pass the judge verdicts too, or a suite with judge
+assertions reads as incomplete and marks 3–5 stay `unavailable`. On the bundled demo, after the
+[demo README](../examples/demo-skill/README.md)'s prepare, run, and judge steps:
+
+```bash
+cd examples/demo-skill
+skill-benchmark audit-manifest evals/shared-benchmark.json --runs /tmp/demo-runs \
+  --judge-results /tmp/demo-judge.jsonl --format markdown --out /tmp/demo-audit.md
+```
+
+The Eval health section of `/tmp/demo-audit.md` (real output, 2026-09-30, six runs per arm):
+
+```text
+## Eval health
+
+| Mark | Question | Status | Findings |
+|---:|---|---|---|
+| 1 | Are the cases realistic, and does the skill load the way real use loads it? | concern | missing-positive-evals, missing-negative-evals, missing-adversarial-evals, missing-trigger-no-trigger-cases, case-source-unrecorded |
+| 2 | Is the grader right on known answers? | ok | — |
+| 3 | Does the baseline arm have room to move, with no case failing in both arms? | ok | — |
+| 4 | Is the noise smaller than the smallest lift worth acting on? | concern | underpowered-eval |
+| 5 | Do the arms differ only in the skill? | ok | — |
+- mark 1: activation is forced: the task tells the agent to use the skill, while real use relies on discovery (issue #48)
+- mark 2: no case declares reference_answer, so no known-good answer was graded
+```
+
+Read it mark by mark. Mark 1 is a concern because the demo has too few cases of each polarity
+and records no `source`. Mark 2 is `ok` only on the null-answer half: its note says no case
+declares a `reference_answer`, so the known-good half was never graded. Mark 4 is the
+`underpowered-eval` finding: two cases can never reach p ≤ 0.05 however many repeats run, so the
+fix is more cases. A mark that reads `unavailable` had no evidence, which is not a pass. The five
+marks, and why they differ from the hillclimbing post's four, are in
+[`comparing-with-claude-api-evals.md`](comparing-with-claude-api-evals.md#five-marks-of-a-lift-eval).
 
 ## Step 6 — Iterate, and respect the splits
 
@@ -233,14 +342,22 @@ production incident:
    right, and the first that went wrong. The break between them is where the skill lost the thread.
 2. **Classify the failure.** Most fall into a few types: the skill never loaded (trigger gap),
    it loaded but ignored a fixture (context loss), a command failed or was skipped (tool failure),
-   or it answered confidently past its evidence (overconfidence). The type points at the fix.
+   it answered confidently past its evidence (overconfidence), or the eval itself is wrong (eval
+   defect: an ambiguous case, an assertion that rejects a correct answer, or an answer cut off at
+   a length limit). Claude runs record a cut-off answer as `stop_class: truncated` in
+   `metadata.json` and the harness excludes it from scoring; the other two you find by reading
+   the case beside the output. The type points at the fix, and an eval defect is fixed in the
+   eval, not the skill.
 3. **Fix the pattern, not the incident.** If the description under-triggered, widen the
    description, not this one prompt. If a reference was ignored, fix how the skill points at
    references. A fix that only satisfies one case usually just moves the failure.
-4. **Add a regression case — then prune.** Add a case only if the failure represents a real
-   pattern, not a one-off. A suite is a memory of bugs you refuse to reintroduce, but a case that
-   never fails again and never shows lift is dead weight; drop it. Twenty cases that discriminate
-   beat two hundred that always pass.
+4. **Add a regression case — then prune, within `tune` only.** Add a case only if the failure
+   represents a real pattern, not a one-off. A suite is a memory of bugs you refuse to
+   reintroduce, but a `tune` case that never fails again and never shows lift is dead weight;
+   drop it. Never pick or drop `holdout` cases by their measured lift, or because `without_skill`
+   fails them: part of any case's measured lift is chance, so the cases kept for a large lift
+   regress toward the mean on the next run, and a holdout curated that way overstates lift.
+   Twenty cases that discriminate beat two hundred that always pass.
 
 The path matters as much as the answer. A case can produce the right final text for the wrong
 reason, so grade the trajectory (`skill_invoked`, `command_order`) alongside the output, and treat
@@ -253,7 +370,10 @@ a right answer reached the wrong way as a finding, not a pass.
   also passes) before optimizing, because the two call for opposite actions.
 - **Missing outputs counted as failures**: false no-lift flags. Mark them `missing_output`.
 - **Unbounded smoke runs**: cap thinking and require a bounded answer; capture timeouts as
-  artifacts instead of aborting the round.
+  artifacts instead of aborting the round. A capped answer that gets cut off is recorded, not
+  graded: Claude runs write `stop_class: truncated` and the run is excluded from scoring. Other
+  runners record `unavailable`, so on those read failing outputs for answers that end
+  mid-sentence.
 - **Trigger cases written as meta-prompts**: run the real user prompt, and detect skill loading
   from the copied skill path, not from a name in the output.
 - **Ablation benefit claimed from the manifest alone**: an ablation is evidence only after its

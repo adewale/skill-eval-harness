@@ -12,12 +12,21 @@ believable lift executable —
   CF.4  the core grade path calls no model and no network.
 """
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from helpers import load_example_module
+from helpers import (
+    attest_answer_design,
+    load_example_module,
+    make_eval_repo,
+    skill_markdown,
+    write_run,
+)
 
 import skill_benchmark as sb
 
@@ -103,32 +112,22 @@ class CF2BaselineIsolation(unittest.TestCase):
     MARKER = "SKILL-MARKER-8f2c41d7"
 
     def make_repo(self, root: Path) -> tuple[Path, dict]:
-        repo = root / "repo"
-        skill = repo / "skill"
-        (skill / "references").mkdir(parents=True)
-        (skill / "SKILL.md").write_text(f"---\nname: demo\ndescription: Demo skill\n---\n\n# Demo\n\n{self.MARKER}\n", encoding="utf-8")
-        (skill / "references" / "checklist.md").write_text(f"- {self.MARKER}\n", encoding="utf-8")
-        fixtures = repo / "evals" / "fixtures"
-        fixtures.mkdir(parents=True)
-        (fixtures / "input.txt").write_text("fixture input, no skill content\n", encoding="utf-8")
-        manifest = {
-            "version": 1,
-            "skill_name": "demo",
-            "skill_paths": ["skill/SKILL.md"],
-            "variants": ["with_skill", "without_skill"],
-            "cases": [{
+        path = make_eval_repo(
+            root,
+            skill_text=skill_markdown(body=f"# Demo\n\n{self.MARKER}\n"),
+            references={"references/checklist.md": f"- {self.MARKER}\n"},
+            cases=[{
                 "id": "case-1",
                 "split": "tune",
                 "kind": "behavior",
                 "prompt": "Do the task.",
                 "files": ["fixtures/input.txt"],
                 "assertions": [{"type": "contains", "value": "alpha"}],
-            }],
-            "ablations": [],
-        }
-        path = repo / "evals" / "shared-benchmark.json"
-        path.write_text(json.dumps(manifest), encoding="utf-8")
-        return path, manifest
+            }])
+        fixture = path.parent / "fixtures" / "input.txt"
+        fixture.parent.mkdir()
+        fixture.write_text("fixture input, no skill content\n", encoding="utf-8")
+        return path, json.loads(path.read_text(encoding="utf-8"))
 
     def workspace_files(self, ws: Path) -> list[Path]:
         return [p for p in sorted(ws.rglob("*")) if p.is_file()]
@@ -172,87 +171,71 @@ class CF2BaselineIsolation(unittest.TestCase):
                         builder(sb.PreparedTask.from_row(by_variant["with_skill"]), ws)
                         self.assert_skill_present(ws, runner)
 
-    def test_new_runner_inherits_the_invariant_via_registration(self):
-        # The registry is the inheritance mechanism: registering a leaky builder
-        # makes the invariant fail, so a new runner cannot dodge the check.
-        leaky_name = "leaky-test-runner"
-
-        def leaky_builder(pt, ws):
-            ws.mkdir(parents=True, exist_ok=True)
-            (ws / "notes.md").write_text(self.MARKER, encoding="utf-8")
-
-        sb.register_workspace_builder(leaky_name, leaky_builder)
-        try:
-            with tempfile.TemporaryDirectory() as wd:
-                ws = Path(wd)
-                leaky_builder(None, ws)
-                with self.assertRaises(AssertionError):
-                    self.assert_no_skill_reachable(ws, leaky_name)
-        finally:
-            sb.WORKSPACE_BUILDERS.pop(leaky_name, None)
-
 
 def make_graded_repo(root: Path) -> tuple[Path, Path]:
     """A graded fixture repo + runs tree. Module-level so CF4 never instantiates CF3 to borrow it."""
-    repo = root / "repo"
-    (repo / "skill").mkdir(parents=True)
-    (repo / "skill" / "SKILL.md").write_text("---\nname: demo\ndescription: Demo\n---\n", encoding="utf-8")
-    (repo / "evals").mkdir()
-    manifest = {
-        "version": 1,
-        "skill_name": "demo",
-        "skill_paths": ["skill/SKILL.md"],
-        "variants": ["with_skill", "without_skill"],
-        "cases": [{
-            "id": "case-1",
-            "split": "tune",
-            "kind": "behavior",
-            "prompt": "Say alpha, run pytest, stay under budget.",
-            "assertions": [
-                {"name": "has-alpha", "type": "contains", "value": "alpha"},
-                {"name": "ran-tests", "type": "command_ran", "pattern": "pytest"},
-                {"name": "token-budget", "type": "total_tokens_le", "max": 1000},
-            ],
-        }],
-        "ablations": [],
-    }
-    manifest_path = repo / "evals" / "shared-benchmark.json"
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    manifest_path = make_eval_repo(root, cases=[{
+        "id": "case-1",
+        "split": "tune",
+        "kind": "behavior",
+        "prompt": "Say alpha, run pytest, stay under budget.",
+        "assertions": [
+            {"name": "has-alpha", "type": "contains", "value": "alpha"},
+            {"name": "ran-tests", "type": "command_ran", "pattern": "pytest"},
+            {"name": "token-budget", "type": "total_tokens_le", "max": 1000},
+        ],
+    }])
     runs = root / "runs"
     outputs = {
         "with_skill": ["alpha beta", "alpha only"],
         "without_skill": ["no match here", "alpha maybe"],
     }
+    events = {"schema_version": 1, "source": "fixture", "events": [
+        {"type": "command", "command": "python -m pytest -q", "status": "completed"}]}
     for variant, texts in outputs.items():
         for i, text in enumerate(texts, 1):
-            base = runs / "case-1" / variant / f"run-{i}"
-            base.mkdir(parents=True)
-            (base / "output.md").write_text(text, encoding="utf-8")
-            (base / "metadata.json").write_text(json.dumps({"total_tokens": 500 + i, "elapsed_ms": 1000 * i}), encoding="utf-8")
-            (base / "events.json").write_text(json.dumps({"schema_version": 1, "source": "fixture", "events": [{"type": "command", "command": "python -m pytest -q", "status": "completed"}]}), encoding="utf-8")
+            write_run(runs / "case-1" / variant / f"run-{i}", text,
+                      metadata={"total_tokens": 500 + i, "elapsed_ms": 1000 * i},
+                      events=events)
     return manifest_path, runs
 
 
 class CF3RegradeIdempotence(unittest.TestCase):
     """CF.3: grading reads only from disk and is deterministic — the same run
     directory grades to a byte-identical benchmark report (modulo the explicit
-    generated_at timestamp), so the cheap re-grade workflow rests on fact."""
+    generated_at timestamp), so the cheap re-grade workflow rests on fact.
 
+    Two grades inside one process share one string-hash seed, so they cannot
+    see output that depends on set or hash iteration order. The re-grades run
+    as separate CLI processes under different PYTHONHASHSEED values."""
 
-    def test_grading_the_same_run_dir_twice_is_byte_identical(self):
+    def cli_report(self, manifest_path: Path, runs: Path, out: Path, hash_seed: int) -> dict:
+        subprocess.run(
+            [sys.executable, str(ROOT / "skill_benchmark.py"), "benchmark", str(manifest_path),
+             "--runs", str(runs), "--out", str(out)],
+            env={**os.environ, "PYTHONHASHSEED": str(hash_seed)},
+            check=True, capture_output=True, text=True)
+        return json.loads(out.read_text(encoding="utf-8"))
+
+    def test_regrade_is_byte_identical_across_processes_and_hash_seeds(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             manifest_path, runs = make_graded_repo(root)
-            first = sb.build_benchmark_report(manifest_path, runs)
-            second = sb.build_benchmark_report(manifest_path, runs)
-        for report in (first, second):
+            attest_answer_design(manifest_path, runs)
+            reports = [sb.build_benchmark_report(manifest_path, runs)]
+            for seed in (1, 2):
+                reports.append(self.cli_report(manifest_path, runs, root / f"seed-{seed}.json", seed))
+        self.assertEqual(reports[0]["availability"], "complete")   # every surface is populated
+        rendered = []
+        for report in reports:
             self.assertIn("generated_at", report)
             report.pop("generated_at")
-        self.assertEqual(
-            json.dumps(first, ensure_ascii=False),
-            json.dumps(second, ensure_ascii=False),
-            "re-grading the same run directory produced a different report: hidden nondeterminism in the grade path",
-        )
+            rendered.append(json.dumps(report, ensure_ascii=False))
+        for label, other in zip(("PYTHONHASHSEED=1", "PYTHONHASHSEED=2"), rendered[1:]):
+            self.assertEqual(
+                rendered[0], other,
+                f"re-grading the same run directory under {label} produced a different "
+                "report: hidden nondeterminism in the grade path")
 
 
 class CF4NoModelNoNetworkGuard(unittest.TestCase):

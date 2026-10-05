@@ -15,6 +15,17 @@ Run `skill-benchmark agent-capabilities` for the machine-readable registry view.
 | `subagent` | yes (`run-subagent`) | `subagent` | no | no | yes | yes, when backend returns it | `missing` unless backend emits cost | no | yes | n/a |
 | `stub` | no native answer runner; demo stub uses `run-codex --codex-cmd` | `none` | yes | yes | yes | no (not applicable) | `not_applicable` | no | no | n/a |
 
+## Effort control and stop evidence
+
+Two answer-run surfaces are not registry capabilities yet: effort is an `effort_control` attribute (with the `effort_levels` its CLI accepts) on the answer backend class, and stop and served-model evidence comes from each backend's parser. Both are recorded in run metadata ([fields](commands.md#effort-and-how-answer-runs-ended)):
+
+- `claude`: `--effort` passes `claude --effort <level>` for `low`, `medium`, `high`, `xhigh` or `max` (`minimal` is refused before any run); the stop reason comes from the stream-json terminal `result` event and the served model from assistant messages, skipping subagent turns.
+- `codex`: `--effort` passes `-c model_reasoning_effort=<level>` for every harness level; stop reason and served model are `unavailable`.
+- `gemini`: no effort control, so `run-agent --agent gemini --effort …` is refused before any run; the served model is the stream's resolved model, and the stop reason is `unavailable`.
+- `vibe`: no effort control (refused the same way); stop reason and served model are `unavailable`, because Vibe's output carries neither, and `stop_source` says so.
+- `subagent`: no `--effort` flag, so runs record `backend_default`. The default Claude backend records the stop reason and served model as `claude` does; an `--agent-cmd` reply may report `stop_class`, `stop_reason`, and `served_models` ([reply fields](commands.md#run-subagent-tasks-in-process-seam-tool-replay-multi-turn)), and a reply without them records `unavailable`.
+- `jetty`: imports record `unavailable` stop and served-model fields and `backend_default` effort; Jetty exposes no effort control.
+
 ## What changed for Gemini CLI
 
 Gemini is a first-class native answer and judge backend, with its unproven surface kept out of the registry:

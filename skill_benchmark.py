@@ -43,7 +43,7 @@ import zipfile
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass as _dataclass
 from decimal import ROUND_CEILING, Decimal
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn, Protocol, cast
 
 # Direct ``python skill_benchmark.py`` execution must share the canonical module
@@ -58,6 +58,7 @@ from yaml.constructor import ConstructorError
 from yaml.resolver import BaseResolver
 
 import experimental_pairs as pair_domain
+import gate_policy
 import report_contracts as report_domain
 import telemetry as telemetry_domain
 from ablation_model import (
@@ -81,7 +82,6 @@ from ablation_model import (
     MaterializedArm,
     Mechanism,
     OutcomeContext,
-    Population,
     PreparedTask,
     PreparedTaskDraft,
     Provenance,
@@ -128,6 +128,34 @@ from artifact_contracts import (
     observe_artifact_set,
 )
 from cli_contracts import CLICommand, CLIInvocation
+from completion_contracts import (
+    BACKEND_DEFAULT,
+    EFFORT_LEVELS,
+    EffortSetting,
+    ServedModel,
+    StopClass,
+    StopObservation,
+    claude_result_stop,
+    completion_unscorable_reason,
+    effort_identity,
+)
+from content_digests import directory_tree_sha256, file_sha256, tree_sha256
+from effect_estimates import (
+    DiscriminationFailure,
+    Estimate,
+    InferenceUnit,
+    ceiling_or_floor,
+    minimum_units_note,
+    sign_flip_test,
+)
+from findings import (
+    NON_DISCRIMINATING_FLAGS,
+    CaseFlag,
+    EvalMark,
+    Finding,
+    FindingKind,
+    eval_health,
+)
 from gemini_contracts import GeminiJsonResponse, GeminiStream
 from grading_contracts import (
     FailedAssertion,
@@ -138,6 +166,11 @@ from grading_contracts import (
     SkippedAssertion,
     UnavailableAssertion,
     assertion_observation_from_row,
+)
+from human_judgements import (
+    FeedbackStore,
+    HumanJudgement,
+    is_feedback_document,
 )
 from invocation_contracts import (
     InvocationRequest,
@@ -152,6 +185,8 @@ from jetty_contracts import (
     lifecycle_from_status,
 )
 from json_contracts import (
+    StrictJSONViolation,
+    strict_json_decoder,
     strict_json_loads,
     thaw_json_value,
     unique_json_object,
@@ -161,7 +196,9 @@ from json_contracts import (
 from judge_contracts import JudgeInvocation
 from judge_verdict import (
     BooleanVerdict,
+    Consensus,
     ConsensusVerdict,
+    resolve_consensus,
     validated_result_row,
     verdict_fields,
     verdict_from_dict,
@@ -173,9 +210,11 @@ from manifest_contracts import (
     CasePopulation,
     ExecutionVariant,
     ModelId,
+    RunCoordinate,
     RunNumber,
     Split,
 )
+from observation_contracts import COST_SOURCES, USAGE_SOURCES, Availability
 from text_contracts import (
     ComparisonProfile,
     ComparisonText,
@@ -209,17 +248,29 @@ from trigger_contracts import (
 from trigger_reporting import CompleteTriggerCohort, summarize_trigger_cohort
 
 VALID_SPLITS = frozenset(Split.values())
-TRIGGER_HARNESS_IDENTITY_VERSION = 2
+# Where a case came from (eval-health mark 1). Sources other than real use are
+# fine to have; an eval built only from synthesized cases is the risk.
+CASE_SOURCES = frozenset({"production", "bug-report", "hand-written", "synthesized", "imported"})
+# Deterministic text checks the known-answer self-test can run on a string alone.
+KNOWN_ANSWER_ASSERTIONS = frozenset({
+    "contains", "contains_any", "contains_all", "excludes_any", "regex", "not_regex"})
+# A capability suite whose without_skill arm already passes this share of runs
+# has little room to show lift; quality at lower cost is the better objective.
+SUITE_HEADROOM_CEILING = 0.95
+TRIGGER_HARNESS_IDENTITY_VERSION = 3
 # Conservative at module granularity: skill_benchmark.py still combines trigger
 # and non-trigger orchestration, so every edit to that monolith invalidates the
 # trigger identity until its owners are extracted.
 TRIGGER_IDENTITY_MODULES = (
     "ablation_model.py",
     "agent_capabilities.py",
+    "completion_contracts.py",
+    "content_digests.py",
     "experimental_pairs.py",
     "invocation_contracts.py",
     "json_contracts.py",
     "manifest_contracts.py",
+    "observation_contracts.py",
     "run_pi_trigger_eval.py",
     "run_trigger_matrix.py",
     "skill_benchmark.py",
@@ -228,9 +279,6 @@ TRIGGER_IDENTITY_MODULES = (
     "trigger_contracts.py",
     "trigger_reporting.py",
 )
-# Compatibility names for code that inspected earlier trigger identity owners.
-TRIGGER_SEMANTIC_MODULES = TRIGGER_IDENTITY_MODULES
-HARNESS_SEMANTIC_MODULES = TRIGGER_IDENTITY_MODULES
 DEFAULT_VARIANTS = list(DEFAULT_EXECUTION_VARIANTS)
 _ResultPair = pair_domain.ExperimentalPair[Mapping[str, Any]]
 _ResultPairConstruction = pair_domain.PairConstruction[Mapping[str, Any]]
@@ -310,15 +358,15 @@ ASSERTION_TYPE_FIELDS: dict[str, set[str]] = {
     "command_count_le": {"max", "value"},
     "judge": {
         "preset", "prompt", "rubric", "review_rubric", "threshold",
-        "graded_dimensions", "dynamic_rubric", "per_step",
+        "graded_dimensions", "dynamic_rubric", "per_step", "score_scale",
     },
     "rubric": {
         "preset", "prompt", "rubric", "review_rubric", "threshold",
-        "graded_dimensions", "dynamic_rubric", "per_step",
+        "graded_dimensions", "dynamic_rubric", "per_step", "score_scale",
     },
     "factuality": {
         "preset", "prompt", "rubric", "review_rubric", "threshold",
-        "graded_dimensions", "dynamic_rubric", "per_step",
+        "graded_dimensions", "dynamic_rubric", "per_step", "score_scale",
     },
 }
 # 1.1: the factuality preset is a named, anchored rubric — no new execution
@@ -475,13 +523,7 @@ def write_json(path: Path, data: Any) -> None:
         data, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
 
 
-def _atomic_write_text(
-    path: Path,
-    text: str,
-    *,
-    before_replace: Callable[[], None] | None = None,
-    after_replace: Callable[[], None] | None = None,
-) -> None:
+def _atomic_write_text(path: Path, text: str) -> None:
     """Durably replace one text file without exposing a partial new value."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, raw_tmp = tempfile.mkstemp(
@@ -492,8 +534,6 @@ def _atomic_write_text(
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
-        if before_replace is not None:
-            before_replace()
         os.replace(tmp, path)
         try:
             parent_fd = os.open(path.parent, os.O_RDONLY)
@@ -507,8 +547,6 @@ def _atomic_write_text(
                 pass
             finally:
                 os.close(parent_fd)
-        if after_replace is not None:
-            after_replace()
     finally:
         try:
             tmp.unlink()
@@ -516,29 +554,12 @@ def _atomic_write_text(
             pass
 
 
-def atomic_write_jsonl(
-    path: Path,
-    records: Iterable[dict[str, Any]],
-    *,
-    fault_inject: Callable[[str], None] | None = None,
-) -> None:
+def atomic_write_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
     """Atomically publish a complete JSONL prefix for resumable producers."""
-    text = "".join(
+    _atomic_write_text(path, "".join(
         json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n"
         for record in records
-    )
-    _atomic_write_text(
-        path,
-        text,
-        before_replace=(
-            (lambda: fault_inject("before_result_commit"))
-            if fault_inject is not None else None
-        ),
-        after_replace=(
-            (lambda: fault_inject("after_result_commit"))
-            if fault_inject is not None else None
-        ),
-    )
+    ))
 
 
 def emit_report(report: Any, out: str | Path | None) -> None:
@@ -552,6 +573,18 @@ def emit_report(report: Any, out: str | Path | None) -> None:
         print(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False))
 
 
+def emit_text(text: str, out: str | Path | None) -> None:
+    """The text twin of ``emit_report`` for markdown, HTML and JSONL output:
+    parent directories are created, so ``--out new-dir/x.md`` works for every
+    format, not only JSON."""
+    if out:
+        target = Path(out)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    else:
+        print(text)
+
+
 def iter_json_objects(text: str):
     """Yield each parseable JSON value found line-by-line in a runner's stream,
     silently skipping non-JSON lines. The one scanning loop shared by trigger
@@ -560,10 +593,10 @@ def iter_json_objects(text: str):
     for line in text.splitlines():
         try:
             yield strict_json_loads(line)
+        except StrictJSONViolation as exc:
+            raise ValueError(exc.msg) from exc
         except json.JSONDecodeError as exc:
-            if (exc.__cause__ is not None
-                    or "duplicate object key" in exc.msg
-                    or "non-finite numeric constant" in exc.msg):
+            if exc.__cause__ is not None:
                 raise ValueError(exc.msg) from exc
             continue
 
@@ -1194,6 +1227,16 @@ def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, pa
                 die(f"{where} qualitative threshold must be a finite number")
             if dims is not None and not 1 <= float(threshold) <= 5:
                 die(f"{where} graded-dimension threshold must be in [1, 5]")
+        if "score_scale" in assertion:
+            scale = judge_score_scale(assertion)
+            if scale is None:
+                die(f"{where} score_scale must be [low, high]: two finite numbers with low < high")
+            for key in ("atLeast", "graded_dimensions", "dynamic_rubric", "per_step"):
+                if key in expand_judge_preset(assertion):
+                    die(f"{where} score_scale cannot combine with {key}; it scales a plain judge's score")
+            threshold = expand_judge_preset(assertion).get("threshold", scale[1])
+            if not scale[0] <= float(threshold) <= scale[1]:
+                die(f"{where} threshold must lie on its score_scale [{scale[0]:g}, {scale[1]:g}]")
         for key in ("rubric", "review_rubric"):
             if key in assertion and (not isinstance(assertion[key], list)
                                      or not assertion[key]
@@ -1270,6 +1313,13 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
         die("manifest.skill_name is required")
     if not isinstance(manifest.get("skill_paths", []), list) or not manifest.get("skill_paths") or not all(isinstance(p, str) for p in manifest.get("skill_paths", [])):
         die("manifest.skill_paths must be a non-empty list of strings")
+    for label in ("skill_paths", "old_skill_paths"):
+        roots = manifest.get(label) or []
+        if not isinstance(roots, list) or not all(isinstance(root, str) for root in roots):
+            continue
+        for first, second, key in skill_root_key_collisions(roots):
+            die(f"manifest.{label}: {first!r} and {second!r} both mount as skill directory {key!r}; "
+                "agents list skills by directory name, so rename one directory")
     variants = manifest.get("variants", DEFAULT_VARIANTS)
     if (not isinstance(variants, list) or len(variants) != len(set(variants))
             or set(variants) != {"with_skill", "without_skill"}):
@@ -1378,6 +1428,28 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
                     or not all(isinstance(item, str) and item
                                for item in case[field])):
                 die(f"{cid}: {field} must be a list of non-empty strings")
+        source = case.get("source")
+        if source is not None and source not in CASE_SOURCES:
+            die(f"{cid}: source must be one of {sorted(CASE_SOURCES)}")
+        known_answers = [key for key in ("reference_answer", "reference_answer_ref") if key in case]
+        if len(known_answers) > 1:
+            die(f"{cid}: reference_answer and reference_answer_ref are mutually exclusive")
+        if known_answers and trigger_case:
+            die(f"{cid}: a trigger case has no answer to check; drop {known_answers[0]}")
+        if "reference_answer" in case:
+            if not isinstance(case["reference_answer"], str) or not case["reference_answer"].strip():
+                die(f"{cid}: reference_answer must be a non-empty string")
+            if split in {"holdout", "holdback"}:
+                # A known-good answer is an answer key: keep it out of public files
+                # for held-out cases, the same way prompt_ref keeps their prompts out.
+                die(f"{cid}: a {split} case must keep its known answer private; use reference_answer_ref")
+        if "reference_answer_ref" in case:
+            ref_value = case["reference_answer_ref"]
+            if not isinstance(ref_value, str) or not ref_value.strip():
+                die(f"{cid}: reference_answer_ref must be a non-empty relative path")
+            ref = path.parent / ref_value
+            if not ref.exists() and not (allow_missing_holdback and split in {"holdout", "holdback"}):
+                die(f"{cid}: reference_answer_ref does not exist: {ref}")
         files = case.get("files", [])
         if files and (not isinstance(files, list) or not all(isinstance(f, str) for f in files)):
             die(f"{cid}: files must be a list of strings")
@@ -1614,19 +1686,14 @@ def eval_contract_sha256(
         })
     oracle_trees = []
     for root in sorted(script_roots):
-        digest = hashlib.sha256()
-        for candidate in sorted(root.rglob("*")):
-            if candidate.is_symlink():
-                raise ValueError(f"script oracle tree contains a symlink: {candidate}")
-            if not candidate.is_file():
-                continue
-            relative = candidate.relative_to(root).as_posix()
-            digest.update(relative.encode("utf-8") + b"\0")
-            digest.update(candidate.read_bytes())
+        try:
+            tree_digest = directory_tree_sha256(root, reject_symlinks=True)
+        except ValueError as exc:
+            raise ValueError(f"script oracle {exc}") from exc
         oracle_trees.append({
             "path": root.relative_to(manifest_dir).as_posix()
             if root != manifest_dir else ".",
-            "sha256": digest.hexdigest(),
+            "sha256": tree_digest,
         })
     return canonical_json_sha256({
         "schema_version": 1,
@@ -1790,7 +1857,7 @@ def prepared_task_rows(
                     # Instruction-simulated: no tree, original skill mounted; its typed
                     # record is the sibling InstructionSimulated, not a Provenance.
                     record = InstructionSimulated(
-                        id=aid, population=Population(population))
+                        id=aid, population=CasePopulation(population))
             for run_number in range(1, runs_per_variant + 1):
                 for model in model_list:
                     prefix = f"{case['id']}/{model}" if (model and multi_model) else case["id"]
@@ -1952,11 +2019,7 @@ def prepared_fixture_tree_hash(pt: PreparedTask) -> str:
         if not source.is_file():
             raise ValueError(f"input fixture is not a file: {source}")
         destinations[destination] = source
-    digest = hashlib.sha256()
-    for destination, source in sorted(destinations.items()):
-        digest.update(destination.encode("utf-8") + b"\0")
-        digest.update(source.read_bytes())
-    return digest.hexdigest()
+    return tree_sha256(destinations.items())
 
 
 def manifest_case_input_fingerprint(
@@ -2186,19 +2249,6 @@ def persist_answer_design(runs: Path, tasks: list[dict[str, Any]], *,
     return design
 
 
-def persist_answer_design_value(runs: Path, value: Any) -> dict[str, Any]:
-    design = validate_answer_design(value)
-    runs.mkdir(parents=True, exist_ok=True)
-    path = runs / ANSWER_DESIGN_NAME
-    if path.exists():
-        existing = validate_answer_design(strict_json_loads(path.read_text(encoding="utf-8")))
-        if existing != design:
-            die("runs directory already carries a different answer design")
-    else:
-        write_json(path, design)
-    return design
-
-
 def answer_design_identity(design: dict[str, Any], pt: PreparedTask,
                            model: str | None) -> dict[str, Any]:
     matches = [row for row in design["identities"]
@@ -2233,16 +2283,12 @@ JETTY_SUBMIT_TIMEOUT_HINT_S = 60
 # Python-urllib/x.y agent signature outright (403, error code 1010) — every
 # request must carry a real User-Agent.
 JETTY_USER_AGENT = "skill-eval-harness"
-JETTY_TERMINAL_SUCCESS = {"completed", "complete", "succeeded", "success"}
-JETTY_TERMINAL_FAILURE = {"failed", "failure", "error", "errored", "canceled", "cancelled", "timeout", "timed_out"}
-JETTY_PENDING = {"pending", "queued", "running", "in_progress", "starting"}
 
 CODEX_HOME_FILES = ("auth.json", "config.toml")
 
 VIBE_READ_ONLY_TOOLS = ("skill", "read_file", "grep")
 VIBE_NO_TOOLS = ("re:^$",)
 
-GEMINI_AUTH_FILES = ("oauth_creds.json", "gemini-credentials.json")
 GEMINI_AUTH_ENV = (
     "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
     "GEMINI_API_KEY_AUTH_MECHANISM",
@@ -2365,12 +2411,39 @@ def resolve_skill_root(comp: dict[str, Any], skill_paths: list[str]) -> str | No
 
 
 def _skill_root_key(rel: str) -> str:
-    """Sanitized directory name for a skill root inside a built tree. The SAME
-    function must name the canonical (with_skill) tree and the materialized pre-edit
-    tree, because _hash_tree includes this directory name — any divergence would make
-    canonical_skill_tree_hash != the ablation's parent_skill_hash and break
-    TreeIdentity.same_revision_as."""
-    return re.sub(r"[^A-Za-z0-9_.-]", "_", rel)
+    """The directory a skill root is mounted under inside a built tree: the
+    skill's own directory name, sanitized (`demo` for skills/demo/SKILL.md).
+    Agents list and invoke a skill by this name, so it is the one a user's
+    install shows. The SAME function must name the canonical (with_skill) tree
+    and the materialized pre-edit tree, because skill_tree_hash includes this
+    directory name — any divergence would make canonical_skill_tree_hash != the
+    ablation's parent_skill_hash and break TreeIdentity.same_revision_as.
+    Distinct roots that share a directory name are rejected at validation
+    (skill_root_key_collisions).
+
+    The key once flattened the whole manifest path (`skills_demo_SKILL.md`),
+    which Claude Code 2.1.269 showed the model as the skill's name (PR #85).
+    A root given as a file (anything with a suffix, normally SKILL.md) names
+    its parent directory; a root at the repository top keeps the old form."""
+    path = PurePosixPath(str(rel).replace("\\", "/"))
+    name = path.parent.name if path.suffix else path.name
+    key = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+    if not key or key in {".", ".."}:
+        key = re.sub(r"[^A-Za-z0-9_.-]", "_", str(rel))
+    return key
+
+
+def skill_root_key_collisions(paths: Sequence[str]) -> list[tuple[str, str, str]]:
+    """(first root, second root, shared key) for every pair of distinct skill
+    roots that would mount under the same directory name."""
+    seen: dict[str, str] = {}
+    collisions: list[tuple[str, str, str]] = []
+    for root in paths:
+        key = _skill_root_key(root)
+        if key in seen and seen[key] != root:
+            collisions.append((seen[key], root, key))
+        seen.setdefault(key, root)
+    return collisions
 
 
 def derived_population(components: list[dict[str, Any]]) -> str:
@@ -2759,19 +2832,6 @@ def _write_text_preserving_newlines(path: Path, text_lf: str) -> None:
     path.write_bytes(out.encode("utf-8"))
 
 
-def _hash_tree(root: Path) -> str:
-    """Stable content hash of a directory tree: sorted posix relpaths plus bytes.
-    Identical inputs (same files, same content, same relative layout) hash equal,
-    so a materialized ablation's pre-edit tree and the canonical with_skill tree —
-    built by the same copier with the same key naming — produce the same hash."""
-    digest = hashlib.sha256()
-    for f in sorted(root.rglob("*")):
-        if f.is_file():
-            digest.update(f.relative_to(root).as_posix().encode("utf-8") + b"\0")
-            digest.update(f.read_bytes())
-    return digest.hexdigest()
-
-
 def skill_tree_hash(root: Path) -> str:
     """Hash an already-built skill tree at the attestation boundary.
 
@@ -2782,7 +2842,7 @@ def skill_tree_hash(root: Path) -> str:
     root = Path(root)
     if not root.is_dir():
         raise ValueError(f"skill tree is not a directory: {root}")
-    return _hash_tree(root)
+    return directory_tree_sha256(root)
 
 
 def _safe_under(base: Path, path: Path) -> Path:
@@ -2829,14 +2889,12 @@ def _reject_overlapping_skill_roots(repo_root: Path, manifest: dict[str, Any]) -
                 raise AblationError(f"skill roots {ri!r} and {rj!r} are copied from the same directory {di}; the ablated copy and an unablated copy would coexist — declare a single root")
             if di in dj.parents:
                 raise AblationError(f"skill root {ri!r} (dir {di}) is an ancestor of skill root {rj!r}; copying it would include an unablated duplicate of {rj!r} — declare non-overlapping roots")
-    # Distinct roots whose sanitized tree-key collides would overwrite each other in
-    # the built tree (an otherwise-unwrapped FileExistsError); reject as an AblationError.
-    seen_keys: dict[str, str] = {}
-    for r in manifest.get("skill_paths", []):
-        k = _skill_root_key(r)
-        if k in seen_keys:
-            raise AblationError(f"skill roots {seen_keys[k]!r} and {r!r} both map to tree key {k!r}; rename one so their built directories do not collide")
-        seen_keys[k] = r
+    # Distinct roots that mount under one directory name would overwrite each other
+    # in the built tree (an otherwise-unwrapped FileExistsError); validate_manifest
+    # refuses them first, and callers that skip it get an AblationError.
+    for first, second, key in skill_root_key_collisions(list(manifest.get("skill_paths", []))):
+        raise AblationError(f"skill roots {first!r} and {second!r} both mount as skill directory {key!r}; "
+                            "rename one so their built directories do not collide")
 
 
 def _copy_skill_root(src_dir: Path, dst_dir: Path) -> None:
@@ -2999,7 +3057,7 @@ class ValidatedAblation:
     manifest: dict[str, Any]
     ablation: dict[str, Any]
     components: tuple[dict[str, Any], ...]
-    population: Population
+    population: CasePopulation
 
     @classmethod
     def validate(cls, repo_root: Path, manifest: dict[str, Any], ablation: dict[str, Any]) -> ValidatedAblation:
@@ -3008,7 +3066,7 @@ class ValidatedAblation:
             raise AblationError(f"ablation {ablation.get('id')!r} declares no removal (instruction-simulated)")
         validate_ablation_removal(ablation, manifest)
         _reject_overlapping_skill_roots(repo_root, manifest)
-        population = Population(derived_population(comps))   # runs the layer-cohesion gate
+        population = CasePopulation(derived_population(comps))   # runs the layer-cohesion gate
         return cls(repo_root=repo_root, manifest=manifest, ablation=ablation, components=tuple(comps), population=population)
 
 
@@ -3086,8 +3144,12 @@ def validate_trigger_harness_identity(identity: Any, label: str) -> dict[str, An
     if not isinstance(identity, dict):
         raise TypeError(f"{label} harness_identity must be an object")
     payload = {key: value for key, value in identity.items() if key != "identity_sha256"}
-    if (type(identity.get("schema_version")) is not int
-            or identity.get("schema_version") != TRIGGER_HARNESS_IDENTITY_VERSION
+    version = identity.get("schema_version")
+    if type(version) is int and version != TRIGGER_HARNESS_IDENTITY_VERSION:
+        raise ValueError(
+            f"{label} was produced by trigger harness identity v{version}; this harness "
+            f"reads v{TRIGGER_HARNESS_IDENTITY_VERSION}. Regenerate the report.")
+    if (type(version) is not int
             or canonical_json_sha256(payload) != identity.get("identity_sha256")):
         raise ValueError(f"{label} harness_identity does not match its identity_sha256")
     modules = identity.get("modules")
@@ -3120,7 +3182,7 @@ def expected_provenance_for_ablation(
         id=ablation_id,
         mode=(AblationMode.INVALID_SKILL if ablation.get("invalid_skill")
               else AblationMode.MATERIALIZED),
-        population=Population(derived_population(components)),
+        population=CasePopulation(derived_population(components)),
         components=tuple(
             _expected_component(component, skill_paths)
             for component in components),
@@ -3220,7 +3282,7 @@ def materialize(validated: ValidatedAblation, out_root: Path) -> MaterializedArm
 
         # Hash the canonical (pre-edit) tree: the with_skill arm's oracle. Both arms
         # record this so the report can prove they share a skill revision.
-        parent_skill_hash = _hash_tree(tmp)
+        parent_skill_hash = skill_tree_hash(tmp)
 
         file_text: dict[Path, str] = {}
         file_ops: dict[Path, list[tuple[int, int, str]]] = {}
@@ -3269,7 +3331,7 @@ def materialize(validated: ValidatedAblation, out_root: Path) -> MaterializedArm
                 if not required_fields_present(main.read_text(encoding="utf-8-sig")):
                     raise AblationError('required frontmatter field (name/description) became empty or missing; set "invalid_skill": true to run that as an invalid-skill experiment')
 
-        skill_hash = _hash_tree(tmp)
+        skill_hash = skill_tree_hash(tmp)
         tmp.rename(dest)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -3352,7 +3414,7 @@ def canonical_skill_tree_hash(repo_root: Path, manifest: dict[str, Any]) -> str:
     tmp = Path(tempfile.mkdtemp(prefix=".canon-hash-"))
     try:
         build_canonical_skill_tree(repo_root, manifest, tmp / "tree")
-        return _hash_tree(tmp / "tree")
+        return skill_tree_hash(tmp / "tree")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -3533,9 +3595,10 @@ def jetty_archive_member_path(value: Any) -> str:
 def planned_file_surface_hash(
     files: Iterable[dict[str, Any]], *, role: str, path_prefix: str,
 ) -> str:
-    """Hash upload bytes using their model-visible relative destinations."""
-    digest = hashlib.sha256()
-    entries: list[tuple[str, bytes]] = []
+    """Hash upload bytes using their model-visible relative destinations, as
+    tree_sha256 hashes the tree they rebuild, so the plan matches the canonical
+    skill_tree_hash it is checked against."""
+    entries: list[tuple[str, bytes | Path]] = []
     seen: set[str] = set()
     for item in files:
         if item.get("role") != role:
@@ -3548,10 +3611,7 @@ def planned_file_surface_hash(
             raise ValueError(f"duplicate or empty {role} upload destination: {relative!r}")
         seen.add(relative)
         entries.append((relative, _jetty_upload_bytes(item)))
-    for relative, content in sorted(entries):
-        digest.update(relative.encode("utf-8") + b"\0")
-        digest.update(content)
-    return digest.hexdigest()
+    return tree_sha256(entries)
 
 
 def _jetty_upload_bytes(item: dict[str, Any]) -> bytes:
@@ -3989,27 +4049,6 @@ def replace_placeholders(value: Any, mapping: dict[str, str]) -> Any:
     if isinstance(value, dict):
         return {k: replace_placeholders(v, mapping) for k, v in value.items()}
     return value
-
-
-def resolved_task_upload_bytes(content: bytes, mapping: dict[str, str]) -> bytes:
-    """Resolve upload tokens in an immutable JSON task snapshot.
-
-    Remote paths are JSON-escaped before textual substitution, preserving the
-    exported task's exact formatting while keeping arbitrary provider paths
-    valid inside JSON strings.
-    """
-    try:
-        source = content.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError("Jetty task upload must be UTF-8 JSON") from exc
-    strict_json_loads(source)
-    escaped_mapping = {
-        token: json.dumps(remote, ensure_ascii=False)[1:-1]
-        for token, remote in mapping.items()
-    }
-    resolved = replace_placeholders(source, escaped_mapping)
-    strict_json_loads(resolved)
-    return resolved.encode("utf-8")
 
 
 def extract_trajectory_id(response: dict[str, Any]) -> str | None:
@@ -5338,6 +5377,17 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return [strict_json_loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def load_prepared_tasks(path: Path) -> list[dict[str, Any]]:
+    """The --tasks rows an answer-run command executes; a missing or empty file
+    is a usage error, not an empty run."""
+    if not path.is_file():
+        die(f"tasks file not found: {path}")
+    tasks = load_jsonl(path)
+    if not tasks:
+        die(f"tasks file has no prepared tasks: {path}")
+    return tasks
+
+
 def durable_jetty_result_slots(
     payloads: list[dict[str, Any]], journal: JettyAttemptJournal,
 ) -> list[dict[str, Any] | None]:
@@ -5927,10 +5977,21 @@ def _jetty_record_preflight(
             raise ValueError("no unique answer-design identity")
         harness_metadata["answer_task_sha256"] = identity_matches[0]["task_sha256"]
         harness_metadata["answer_instruction_sha256"] = identity_matches[0]["instruction_sha256"]
+    # Jetty trajectories expose no stop reason or served model, so the import
+    # records that explicitly; a report then counts these runs as unobserved
+    # rather than as predating completion evidence.
+    completion = {
+        **StopObservation.unavailable("jetty trajectory exposes no stop signal").as_metadata(),
+        **ServedModel.observe(
+            normalized.get("model") if isinstance(normalized.get("model"), str) else None,
+            []).as_metadata(),
+        **EffortSetting.default().as_metadata(),
+    }
     metadata = merge_owned_json_objects([
         ("Jetty metadata artifact", artifact_metadata(artifacts)),
         ("normalized Jetty lifecycle", normalized),
         ("harness identity", harness_metadata),
+        ("completion evidence", completion),
     ])
     trace_records = jetty_trace_records(record, artifacts, success=success)
     return {
@@ -6176,6 +6237,11 @@ def discover_case_model_roots(runs: Path, case_id: str, variants: list[str]) -> 
     return roots or [(None, base)]
 
 
+class RunLayoutError(ValueError):
+    """A runs directory whose run-N layout cannot be read. main() reports it
+    as one FAIL line naming the directory, not a traceback."""
+
+
 def discover_run_bases_under(base: Path) -> list[tuple[int, Path]]:
     """Run-instance discovery for one case/variant directory (either
     <case>/<variant> or <case>/<model>/<variant>)."""
@@ -6187,18 +6253,18 @@ def discover_run_bases_under(base: Path) -> list[tuple[int, Path]]:
         if child.is_dir() and child.name.startswith("run-"):
             match = re.fullmatch(r"run-([1-9]\d*)", child.name)
             if match is None:
-                raise ValueError(f"invalid run directory name: {child.name}")
+                raise RunLayoutError(f"invalid run directory name: {child.name}")
             n = int(match.group(1))
             if n in seen_numbers:
-                raise ValueError(f"duplicate run identity under {base}: {n}")
+                raise RunLayoutError(f"duplicate run identity under {base}: {n}")
             seen_numbers.add(n)
             run_dirs.append((n, child))
     if run_dirs:
         if any((base / name).exists() for name in OUTPUT_FILE_ALIASES):
-            raise ValueError(f"mixed root and run-N output layouts under {base}")
+            raise RunLayoutError(f"mixed root and run-N output layouts under {base}")
         expected = set(range(1, max(seen_numbers) + 1))
         if seen_numbers != expected:
-            raise ValueError(f"non-contiguous run identities under {base}")
+            raise RunLayoutError(f"non-contiguous run identities under {base}")
         return sorted(run_dirs, key=lambda x: x[0])
     return [(1, base)]
 
@@ -6213,7 +6279,7 @@ def discovered_run_units(runs: Path, case: dict[str, Any], variants: list[str]):
         for variant in variants:
             for run_number, base in discover_run_bases_under(model_root / variant):
                 text, output_path = read_output_base(base)
-                meta = read_metadata_base(base)
+                meta = read_metrics_base(base)
                 yield model_name, variant, run_number, base, text, output_path, meta
 
 
@@ -6268,15 +6334,6 @@ def discover_on_disk_run_rows(manifest: dict[str, Any], runs: Path) -> list[dict
     return rows
 
 
-def discover_run_bases(runs: Path, case_id: str, variant: str) -> list[tuple[int, Path]]:
-    """Return run instances for a case/variant in the legacy (model-less) layout:
-      runs/<case>/<variant>/output.md
-      runs/<case>/<variant>/run-<n>/output.md
-    Model-aware callers combine discover_case_model_roots with
-    discover_run_bases_under instead."""
-    return discover_run_bases_under(runs / case_id / variant)
-
-
 def discover_turn_bases(base: Path) -> list[tuple[int, Path]]:
     """Turn-indexed transcript layout for multi-turn cases (roadmap 3.1):
     <run base>/turn-<n>/output.md. A single-shot run has no turn dirs."""
@@ -6288,23 +6345,15 @@ def discover_turn_bases(base: Path) -> list[tuple[int, Path]]:
         if child.is_dir() and child.name.startswith("turn-"):
             m = re.fullmatch(r"turn-([1-9]\d*)", child.name)
             if m is None:
-                raise ValueError(f"invalid turn directory name: {child.name}")
+                raise RunLayoutError(f"invalid turn directory name: {child.name}")
             number = int(m.group(1))
             if number in seen:
-                raise ValueError(f"duplicate turn identity under {base}: {number}")
+                raise RunLayoutError(f"duplicate turn identity under {base}: {number}")
             seen.add(number)
             found.append((number, child))
     if seen and seen != set(range(1, max(seen) + 1)):
-        raise ValueError(f"non-contiguous turn identities under {base}")
+        raise RunLayoutError(f"non-contiguous turn identities under {base}")
     return sorted(found)
-
-
-def text_files_under(directory: Path) -> list[Path]:
-    if not directory.exists() or not directory.is_dir():
-        return []
-    exts = {".md", ".txt", ".json", ".jsonl", ".html", ".css", ".js", ".ts", ".py", ".vue", ".yml", ".yaml"}
-    files = [p for p in sorted(directory.rglob("*")) if p.is_file() and p.suffix.lower() in exts]
-    return files[:100]
 
 
 OUTPUT_FILE_ALIASES = (
@@ -6374,11 +6423,6 @@ def read_output_base(base: Path) -> tuple[str | None, Path]:
     return None, base / "output.md"
 
 
-def read_output(runs: Path, case_id: str, variant: str) -> tuple[str | None, Path]:
-    base = runs / case_id / variant
-    return read_output_base(base)
-
-
 def _with_committed_artifact_state(base: Path, data: dict[str, Any]) -> dict[str, Any]:
     declared_version = data.get("artifact_contract_version")
     observation = observe_artifact_set(
@@ -6409,17 +6453,6 @@ def _with_committed_artifact_state(base: Path, data: dict[str, Any]) -> dict[str
         enriched["metadata_error"] = error
         enriched["metadata_artifact_valid"] = False
     return enriched
-
-
-def read_metadata_base(base: Path) -> dict[str, Any]:
-    merged, error = read_run_sidecar_contract(base)
-    if error is not None:
-        return {"metadata_error": error, "metadata_artifact_valid": False}
-    return _with_committed_artifact_state(base, merged)
-
-
-def read_metadata(runs: Path, case_id: str, variant: str) -> dict[str, Any]:
-    return read_metadata_base(runs / case_id / variant)
 
 
 def read_json_dict_or_list(path: Path) -> Any:
@@ -6912,8 +6945,6 @@ def metric_number(metrics: dict[str, Any], *keys: str) -> int | float | None:
     return None
 
 
-USAGE_SOURCES = {"provider_reported", "trace_normalized", "estimated", "missing", "not_applicable"}
-COST_SOURCES = {"provider_reported", "trace_normalized", "price_table_estimated", "missing", "not_applicable"}
 # Every normalizer reads the leaf telemetry domain's token-usage alias table, so
 # provider payloads cannot be classified differently by two paths.
 USAGE_ALIASES = telemetry_domain.USAGE_ALIASES
@@ -7098,10 +7129,6 @@ def run_cost_facts(merged: dict[str, Any]) -> dict[str, Any]:
         "total_tokens_measurement": total_measurement,
         "cost_measurement": cost_measurement,
     }
-
-
-def missing_evidence(name: str) -> dict[str, Any]:
-    return {"passed": False, "evidence": f"missing {name} evidence"}
 
 
 def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: Path | None, metadata: dict[str, Any]) -> tuple[bool | None, str]:
@@ -7399,9 +7426,7 @@ def parse_trace_jsonl_text_with_lines(
         try:
             obj = strict_json_loads(line)
         except json.JSONDecodeError as exc:
-            if ("duplicate object key" in exc.msg
-                    or "non-finite numeric constant" in exc.msg
-                    ) and strict_json_errors:
+            if isinstance(exc, StrictJSONViolation) and strict_json_errors:
                 raise ValueError(exc.msg) from exc
             errors.append(f"line {line_number}: {exc}")
             continue
@@ -7421,10 +7446,6 @@ def parse_trace_jsonl_text_with_lines(
 def parse_trace_jsonl_text(text: str) -> tuple[list[dict[str, Any]], list[str]]:
     records, errors, _ = parse_trace_jsonl_text_with_lines(text)
     return records, errors
-
-
-def load_trace_jsonl(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
-    return parse_trace_jsonl_text(path.read_text(encoding="utf-8", errors="replace"))
 
 
 def nested_item_type(record: dict[str, Any]) -> str:
@@ -7463,12 +7484,14 @@ def normalize_trace_record(record: dict[str, Any], *, source: str, index: int, l
     name = stringify_trace_value(raw_trace_value(
         record, "tool", "tool_name", "toolName", "name"))
     tool_name = name.casefold()
-    is_write = ("file_write" in raw_type or "write" in raw_type or "edit" in raw_type
+    # Event types are matched by word, not substring: "thread.started" is not a
+    # read, and "overwrite_warning" is not a write.
+    type_words = set(re.split(r"[^a-z0-9]+", raw_type))
+    is_write = (bool(type_words & {"write", "edit"})
                 or tool_name in {"write", "edit", "multiedit", "notebookedit", "write_file"})
-    is_read = ("file_read" in raw_type or "read" in raw_type
-               or tool_name in {"read", "read_file"})
+    is_read = "read" in type_words or tool_name in {"read", "read_file"}
     skill_path = path.endswith("SKILL.md") or "/SKILL.md" in path or "\\SKILL.md" in path
-    explicit_skill_load = "skill" in raw_type and ("load" in raw_type or "read" in raw_type)
+    explicit_skill_load = "skill" in type_words and bool(type_words & {"load", "read"})
     if is_write:
         event_type = TraceEventKind.FILE_WRITE
     elif explicit_skill_load or (is_read and skill_path):
@@ -7738,9 +7761,127 @@ def identity_flat_records(records: list[dict[str, Any]], *,
             for i, record in enumerate(records, 1)]
 
 
+# Vibe's `--output streaming` record shape changed in 2.23. Through 2.22 it
+# wrote one LLMMessage dump per line (`role`, string `content`, OpenAI-style
+# `tool_calls`; vibe/core/output_formatters.py). From 2.23 it writes public
+# history entries (vibe/cli/programmatic.py, vibe/app_server/models.py): each
+# carries a `type`, fields are camelCase, a `message` entry holds its text as
+# content blocks, and one `effect` entry is one finished tool call. A stream's
+# first record says which shape it is in; each shape has its own parser.
+VIBE_HISTORY_CONTENT_ENTRY_TYPES = frozenset({"message", "reasoning", "effect", "callback"})
+VIBE_HISTORY_METADATA_ENTRY_TYPES = frozenset({"checkpoint", "notice"})
+
+
+def vibe_records_are_history_entries(records: Sequence[Mapping[str, Any]]) -> bool:
+    """True for a Vibe 2.23+ stream of public history entries, False for the
+    LLMMessage dumps Vibe 2.22 and earlier wrote (they carry no `type`)."""
+    return bool(records) and "type" in records[0]
+
+
+def vibe_entry_text(entry: Mapping[str, Any]) -> str:
+    """The text of a Vibe 2.23+ `message` entry, joined as Vibe's own
+    PublicMessageEntry.text joins it."""
+    content = entry.get("content")
+    if not isinstance(content, list):
+        return ""
+    return "\n\n".join(block["text"] for block in content
+                        if isinstance(block, dict) and block.get("type") == "text"
+                        and isinstance(block.get("text"), str))
+
+
+def _vibe_tool_flat_record(name: str, arguments: Mapping[str, Any]) -> dict[str, Any] | None:
+    """One Vibe tool call in the harness trace vocabulary, for the tools the
+    harness enables (VIBE_READ_ONLY_TOOLS); None for any other tool. Reads the
+    LLMMessage argument spellings and the 2.23+ camelCase effect input."""
+    if name == "skill":
+        return {"type": "skill_load", "name": name,
+                "path": str(arguments.get("name") or arguments.get("skill") or "")}
+    if name == "read_file":
+        return {"type": "file_read", "name": name,
+                "path": str(arguments.get("path") or arguments.get("file_path")
+                            or arguments.get("filePath") or "")}
+    if name == "grep":
+        return {"type": "tool_use", "tool": name, "input": dict(arguments)}
+    return None
+
+
 def vibe_stream_flat_records(records: list[dict[str, Any]], *,
                              record_lines: list[int] | None = None) -> list[tuple[int, dict[str, Any]]]:
-    """Flatten Vibe's OpenAI-style message/tool lifecycle without dropping it."""
+    """Flatten a Vibe stream in whichever record shape it is in."""
+    if vibe_records_are_history_entries(records):
+        return vibe_history_entry_flat_records(records, record_lines=record_lines)
+    return vibe_llm_message_flat_records(records, record_lines=record_lines)
+
+
+def vibe_history_entry_flat_records(
+    records: list[dict[str, Any]], *, record_lines: list[int] | None = None,
+) -> list[tuple[int, dict[str, Any]]]:
+    """Flatten Vibe 2.23+ public history entries. Vibe writes an entry once it
+    is completed, so an `effect` entry is a whole tool call: its input under
+    `detail`, its outcome under `state`."""
+    if record_lines is not None and len(record_lines) != len(records):
+        raise ValueError("record_lines must have one physical line per trace record")
+    flat: list[tuple[int, dict[str, Any]]] = []
+    seen: set[str] = set()
+
+    def invalid(line: int, message: str) -> None:
+        flat.append((line, _claude_protocol_error(f"Vibe {message}")))
+
+    for ordinal, record in enumerate(records, 1):
+        line = record_lines[ordinal - 1] if record_lines is not None else ordinal
+        kind, entry_id = record.get("type"), record.get("id")
+        if not isinstance(entry_id, str) or not entry_id.strip():
+            invalid(line, "history entry id must be a non-empty string")
+            continue
+        if entry_id in seen:
+            invalid(line, f"history entry id {entry_id!r} is duplicated")
+            continue
+        seen.add(entry_id)
+        if record.get("generationStatus") != "completed":
+            invalid(line, f"history entry {entry_id!r} is not completed")
+            continue
+        if kind == "message":
+            role, content = record.get("role"), record.get("content")
+            if role not in {"user", "assistant", "system"}:
+                invalid(line, f"message role {role!r} is unsupported")
+            elif not isinstance(content, list) or not all(isinstance(block, dict) for block in content):
+                invalid(line, "message content must be a list of content blocks")
+            elif vibe_entry_text(record).strip():
+                flat.append((line, {"type": "message", "role": role, "text": vibe_entry_text(record)}))
+        elif kind == "effect":
+            detail, state = record.get("detail"), record.get("state")
+            name = detail.get("toolName") if isinstance(detail, dict) else None
+            arguments = detail.get("input") if isinstance(detail, dict) else None
+            if not isinstance(name, str) or not name.strip() or not isinstance(state, dict):
+                invalid(line, "effect must carry a detail.toolName and a state")
+                continue
+            spec = _vibe_tool_flat_record(name, arguments if isinstance(arguments, dict) else {})
+            if spec is None:
+                invalid(line, f"tool call function {name!r} is unsupported")
+                continue
+            status = state.get("status")
+            if status not in {"completed", "failed", "cancelled", "skipped"}:
+                invalid(line, f"effect {entry_id!r} state {status!r} is not a finished tool call")
+                continue
+            flat.append((line, {**spec, "status": "completed" if status == "completed" else "failed",
+                                **({} if status == "completed" else {"is_error": True}),
+                                "output": stringify_trace_value(
+                                    state.get("output") if status == "completed"
+                                    else state.get("error") or state.get("reason"))[:1000],
+                                "_raw_call_line": line, "_raw_result_line": line}))
+        elif kind == "reasoning":
+            if not isinstance(record.get("text"), str):
+                invalid(line, "reasoning entry text must be a string")
+        elif kind == "callback" or kind in VIBE_HISTORY_METADATA_ENTRY_TYPES:
+            flat.append((line, record))
+        else:
+            invalid(line, f"history entry type {kind!r} is unsupported")
+    return flat
+
+
+def vibe_llm_message_flat_records(records: list[dict[str, Any]], *,
+                                  record_lines: list[int] | None = None) -> list[tuple[int, dict[str, Any]]]:
+    """Flatten Vibe 2.22's OpenAI-style message/tool lifecycle without dropping it."""
     if record_lines is not None and len(record_lines) != len(records):
         raise ValueError("record_lines must have one physical line per trace record")
     flat: list[tuple[int, dict[str, Any]]] = []
@@ -7786,15 +7927,8 @@ def vibe_stream_flat_records(records: list[dict[str, Any]], *,
                 if not isinstance(arguments, dict):
                     invalid(line, "tool call arguments must be an object")
                     continue
-                if name == "skill":
-                    spec = {"type": "skill_load", "name": name,
-                            "path": str(arguments.get("name") or arguments.get("skill") or "")}
-                elif name == "read_file":
-                    spec = {"type": "file_read", "name": name,
-                            "path": str(arguments.get("path") or arguments.get("file_path") or "")}
-                elif name == "grep":
-                    spec = {"type": "tool_use", "tool": name, "input": arguments}
-                else:
+                spec = _vibe_tool_flat_record(name, arguments)
+                if spec is None:
                     invalid(line, f"tool call function {name!r} is unsupported")
                     continue
                 flat.append((line, {**spec, "status": "in_progress"}))
@@ -8006,8 +8140,7 @@ def _codex_trace_protocol_error(
 def _claude_trace_protocol_error(
     records: list[dict[str, Any]], pi_stream: PiStream | None,
 ) -> str | None:
-    terminals = [i for i, record in enumerate(records) if record.get("type") == "result"]
-    if terminals != [len(records) - 1]:
+    if claude_terminal_result_index(records) is None:
         return "Claude trace must contain exactly one final result event"
     return None
 
@@ -8015,9 +8148,18 @@ def _claude_trace_protocol_error(
 def _vibe_trace_protocol_error(
     records: list[dict[str, Any]], pi_stream: PiStream | None,
 ) -> str | None:
-    terminal_answer = (records and records[-1].get("role") == "assistant"
-                       and isinstance(records[-1].get("content"), str)
-                       and bool(records[-1]["content"].strip()))
+    if vibe_records_are_history_entries(records):
+        # Session content ends with the answer; a checkpoint or notice entry
+        # (metadata) may still follow it.
+        content = [record for record in records
+                   if record.get("type") in VIBE_HISTORY_CONTENT_ENTRY_TYPES]
+        terminal_answer = (bool(content) and content[-1].get("type") == "message"
+                           and content[-1].get("role") == "assistant"
+                           and bool(vibe_entry_text(content[-1]).strip()))
+    else:
+        terminal_answer = (bool(records) and records[-1].get("role") == "assistant"
+                           and isinstance(records[-1].get("content"), str)
+                           and bool(records[-1]["content"].strip()))
     if not terminal_answer:
         return "Vibe trace must end with one non-empty assistant response"
     return None
@@ -8576,7 +8718,7 @@ def import_trace(args: argparse.Namespace) -> int:
     except UnicodeDecodeError:
         trace_text = trace_bytes.decode("utf-8", errors="backslashreplace")
         trace_utf8_valid = False
-    existing = read_metadata_base(run_dir)
+    existing = read_metrics_base(run_dir)
     output_text, _ = read_output_base(run_dir)
     provider_complete = output_text is not None and execution_valid(existing, output_text)
     returncode = existing.get("returncode")
@@ -8609,33 +8751,13 @@ def import_trace(args: argparse.Namespace) -> int:
     return 0
 
 
-def final_answer_from_events(events: dict[str, Any]) -> str:
-    messages = [e for e in events.get("events", []) if isinstance(e, dict) and e.get("type") == "message"]
-    for event in reversed(messages):
-        role = str(event.get("role", event.get("name", ""))).casefold()
-        if role and role not in {"assistant", "message", ""}:
-            continue
-        text = event.get("output_summary") or event.get("input_summary")
-        if isinstance(text, str) and text.strip():
-            return text.strip()
-    return ""
-
-
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def write_artifact_commit(run_dir: Path) -> None:
     """Write the commit marker last; absence means an interrupted artifact set."""
     missing = [name for name in ARTIFACT_REQUIRED_FILES if not (run_dir / name).is_file()]
     if missing:
         raise ValueError(f"cannot commit incomplete artifact set: {', '.join(missing)}")
     inventory = {
-        path.relative_to(run_dir).as_posix(): _file_sha256(path)
+        path.relative_to(run_dir).as_posix(): file_sha256(path)
         for path in sorted(run_dir.rglob("*"))
         if path.is_file() and path.name != ARTIFACT_COMMIT_NAME
     }
@@ -8711,7 +8833,17 @@ def _write_runner_outcome_files(run_dir: Path, outcome: AnswerOutcome,
     usage_block = normalize_usage(dict(context.usage) if context.usage is not None else None, source="provider_reported")
     cost_block = normalize_cost(context.cost_usd, source="provider_reported", pricing_model=context.model)
     elapsed = context.elapsed_ms
+    # Completion evidence every answer run records. A runner that observed a
+    # stop reason, a served model or an effort setting overrides these through
+    # metadata_extra; one that observed nothing says so instead of guessing.
+    completion_defaults = {
+        **StopObservation.unavailable(
+            f"{context.provider.value} runner exposes no stop signal").as_metadata(),
+        **ServedModel.observe(context.model, []).as_metadata(),
+        **EffortSetting.default().as_metadata(),
+    }
     metadata = {
+        **completion_defaults,
         **dict(context.metadata_extra),
         "provider": context.provider.value,
         "model": context.model,
@@ -8728,7 +8860,7 @@ def _write_runner_outcome_files(run_dir: Path, outcome: AnswerOutcome,
                      "invocation_state": invocation_state.value,
                      **({"elapsed_ms": elapsed} if elapsed is not None else {})}
     events, metrics = write_trace_artifacts(
-        run_dir, trace_text, source=context.provider.value, metadata=metadata,
+        run_dir, trace_text, source=(context.trace_source or context.provider).value, metadata=metadata,
         extra_metrics=extra_metrics,
         environment=dict(context.environment) if context.environment is not None else None,
         write_metadata=True, write_raw_trace=bool(trace_text),
@@ -8920,10 +9052,6 @@ def jetty_upload_workspace(pt: PreparedTask, ws: Path) -> None:
 # invariant (tests/test_confidence_floor.py) proves the without_skill baseline
 # is skill-free by construction for every registered answer path.
 WORKSPACE_BUILDERS: dict[str, Any] = workspace_builder_implementations()
-
-
-def register_workspace_builder(name: str, builder: Any) -> None:
-    WORKSPACE_BUILDERS[name] = builder
 
 
 def registered_workspace_builder(name: str) -> Any:
@@ -10127,8 +10255,8 @@ def parse_vibe_messages_with_errors(
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Parse Vibe --output json (one list) or --output streaming (JSONL).
 
-    The Vibe CLI emits LLMMessage dictionaries, not a provider-enforced answer
-    schema. The harness therefore treats the final assistant message content as
+    The Vibe CLI emits LLMMessage dictionaries (through 2.22) or public
+    history entries (2.23 and later), not a provider-enforced answer schema. The harness therefore treats the final assistant message content as
     the answer/verdict, while preserving all parsed messages as trace JSONL."""
     text = coerce_text(stdout).strip()
     if not text:
@@ -10185,16 +10313,6 @@ def vibe_final_answer(messages: list[dict[str, Any]]) -> str:
         if text:
             return text
     return ""
-
-
-def _walk_dicts(value: Any) -> Iterable[dict[str, Any]]:
-    if isinstance(value, dict):
-        yield value
-        for child in value.values():
-            yield from _walk_dicts(child)
-    elif isinstance(value, list):
-        for child in value:
-            yield from _walk_dicts(child)
 
 
 def vibe_usage_and_cost(messages: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, float | None]:
@@ -10304,6 +10422,13 @@ def vibe_cli_invoke(prompt: str, *, model: str | None = None, vibe_cmd: str | No
 
 class AgentBackend:
     name = "agent"
+    # How this backend applies a requested effort, or None when it has no
+    # known control. A request for effort on such a backend is refused before
+    # any run, rather than recorded as a setting that was never applied.
+    effort_control: str | None = None
+    # The levels of EFFORT_LEVELS that control accepts; another level is
+    # refused before any run instead of failing (or being ignored) mid-suite.
+    effort_levels: tuple[str, ...] = ()
 
     def invoke_answer(self, request: InvocationRequest, **options: Any) -> AnswerOutcome:
         raise NotImplementedError
@@ -10311,6 +10436,11 @@ class AgentBackend:
 
 class CodexBackend(AgentBackend):
     name = "codex"
+    effort_control = "codex -c model_reasoning_effort"
+    # Codex parses none, minimal, low, medium, high, xhigh, max, ultra and
+    # persistent (rust-v0.160.0) and passes other values to the model, so
+    # every harness level reaches it; releases before 0.140 reject `max`.
+    effort_levels = EFFORT_LEVELS
 
     def invoke_answer(self, request: InvocationRequest, **options: Any) -> AnswerOutcome:
         result = codex_cli_invoke(
@@ -10322,6 +10452,8 @@ class CodexBackend(AgentBackend):
             output_schema=None,
             sandbox="read-only",
             json_events=True,
+            config_overrides=(
+                [f"model_reasoning_effort={request.effort}"] if request.effort else None),
         )
         return RunnerOutcome(
             provider="codex", answer=result.get("answer"),
@@ -10337,6 +10469,10 @@ class CodexBackend(AgentBackend):
 
 class ClaudeBackend(AgentBackend):
     name = "claude"
+    effort_control = "claude --effort"
+    # `claude --help`, Claude Code 2.1.288: `--effort <level>` (low, medium,
+    # high, xhigh, max).
+    effort_levels = ("low", "medium", "high", "xhigh", "max")
 
     def invoke_answer(self, request: InvocationRequest, **options: Any) -> AnswerOutcome:
         # stream-json, not the single envelope: the stream is the run's raw
@@ -10344,8 +10480,16 @@ class ClaudeBackend(AgentBackend):
         # evidence the trigger matrix already observes — without it every
         # process assertion on a Claude run fails closed for missing evidence.
         result = claude_cli_invoke(request.prompt, model=request.model, claude_bin=str(options.get("claude_bin") or "claude"),
-                                   timeout=request.timeout_s, cwd=str(request.workspace), output_format="stream-json")
+                                   timeout=request.timeout_s, cwd=str(request.workspace), output_format="stream-json",
+                                   extra_args=["--effort", request.effort] if request.effort else None)
+        stop = result.get("stop")
+        completion = {
+            **(stop.as_metadata() if isinstance(stop, StopObservation)
+               else StopObservation.unavailable("claude stream has no result event").as_metadata()),
+            **ServedModel.observe(request.model, result.get("served_models") or []).as_metadata(),
+        }
         return RunnerOutcome(
+            metadata_extra=completion,
             provider="claude", answer=result.get("answer") or "",
             returncode=result.get("returncode"), timed_out=bool(result.get("timed_out", False)),
             invocation_state=result.get("invocation_state"),
@@ -10389,6 +10533,9 @@ class GeminiBackend(AgentBackend):
         raw_metadata = result.get("metadata")
         metadata = (dict(raw_metadata)
                     if isinstance(raw_metadata, Mapping) else {})
+        reported = metadata.get("reported_models")
+        metadata.update(ServedModel.observe(
+            request.model, reported if isinstance(reported, list) else []).as_metadata())
         return RunnerOutcome(
             provider="gemini",
             answer=result.get("answer") or "",
@@ -10429,7 +10576,12 @@ class VibeBackend(AgentBackend):
             auto_approve=True,
         )
         env = dict(result.get("environment") or {})
+        # Vibe's programmatic output (LLMMessage records through 2.22, public
+        # history entries from 2.23) names no finish or stop reason, and a
+        # turn, price or token limit exits 1 instead. Say so rather than guess.
+        stop = StopObservation.unavailable("vibe output carries no stop reason")
         return RunnerOutcome(
+            metadata_extra=stop.as_metadata(),
             provider="vibe", answer=result.get("answer") or "",
             returncode=result.get("returncode"), timed_out=bool(result.get("timed_out", False)),
             invocation_state=result.get("invocation_state"),
@@ -10461,13 +10613,23 @@ def registered_agent_backend(name: str) -> AgentBackend:
     return backend
 
 
-def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBackend, *, model: str | None = None, timeout: int = DEFAULT_RUNNER_TIMEOUT_S, **options: Any) -> int:
+def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBackend, *, model: str | None = None, timeout: int = DEFAULT_RUNNER_TIMEOUT_S, effort: str | None = None, **options: Any) -> int:
     """Shared answer-runner loop for native CLI backends.
 
     Existing `run-claude` and `run-codex` now use this path, and the new
     `run-agent` command exposes it directly. Provider-specific code returns a
     RunnerOutcome; this loop owns PreparedTask handling, workspace construction,
-    provenance, and the run-output contract."""
+    provenance, and the run-output contract. Every run records the effort it
+    asked for; a backend with no known effort control, or whose CLI does not
+    accept the requested level, refuses it before any spend instead of
+    recording a level it never applied."""
+    if effort is not None and backend.effort_control is None:
+        die(f"{backend.name} backend has no known effort control; omit --effort "
+            "(runs then record effort as the backend default)")
+    if effort is not None and effort not in backend.effort_levels:
+        die(f"{backend.effort_control} accepts {', '.join(backend.effort_levels)}; got {effort}")
+    effort_setting = (EffortSetting(effort, str(backend.effort_control))
+                      if effort is not None else EffortSetting.default())
     workspace_builder = registered_workspace_builder(backend.name)
     validated: list[tuple[dict[str, Any], PreparedTask, str | None, Path]] = []
     seen_identities: set[tuple[str, str | None, str, int, str]] = set()
@@ -10508,6 +10670,7 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
             "answer_instruction_sha256": answer_design_identity(
                 design, pt, row_model)["instruction_sha256"],
             **({"ablation": pt.ablation.as_dict()} if pt.ablation else {}),
+            **effort_setting.as_metadata(),
         }
         with tempfile.TemporaryDirectory(prefix=f"{backend.name}-ws-") as wd:
             ws = Path(wd)
@@ -10523,6 +10686,7 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
                 workspace=ws,
                 model=row_model,
                 timeout_s=timeout,
+                effort=effort,
             ), **options)
         context = outcome_context(outcome)
         env = dict(context.environment or {})
@@ -10543,8 +10707,9 @@ def run_agent(args: argparse.Namespace) -> int:
     backend = registered_agent_backend(agent)
     provider_options = binding_for(agent, "answer").option_values(
         surface_option_values(args, "answer"))
-    return run_agent_tasks(load_jsonl(Path(args.tasks)), Path(args.runs), backend,
+    return run_agent_tasks(load_prepared_tasks(Path(args.tasks)), Path(args.runs), backend,
                            model=getattr(args, "model", None), timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)),
+                           effort=getattr(args, "effort", None),
                            **provider_options)
 
 
@@ -10558,8 +10723,9 @@ def agent_capabilities_command(args: argparse.Namespace) -> int:
 
 
 def run_codex(args: argparse.Namespace) -> int:
-    return run_agent_tasks(load_jsonl(Path(args.tasks)), Path(args.runs), registered_agent_backend("codex"),
+    return run_agent_tasks(load_prepared_tasks(Path(args.tasks)), Path(args.runs), registered_agent_backend("codex"),
                            timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)),
+                           effort=getattr(args, "effort", None),
                            codex_cmd=getattr(args, "codex_cmd", None) or CODEX_ANSWER_DEFAULT_CMD)
 
 
@@ -10573,15 +10739,27 @@ def run_codex(args: argparse.Namespace) -> int:
 # thing every other adapter leaves the caller to reconstruct out of band.
 # --------------------------------------------------------------------------- #
 
-# The Claude envelope's normalized keys, aliased through the ONE table above.
-# (`cache_creation_tokens` is Claude's historical metrics.json field name for
-# what USAGE_ALIASES normalizes as cache_write_tokens.)
-CLAUDE_USAGE_KEYS = {
-    "input_tokens": USAGE_ALIASES["input_tokens"],
-    "output_tokens": USAGE_ALIASES["output_tokens"],
-    "cache_read_tokens": USAGE_ALIASES["cache_read_tokens"],
-    "cache_creation_tokens": USAGE_ALIASES["cache_write_tokens"],
-}
+# Record types that carry the session itself. One of them (or any record with a
+# `message` object) after the terminal result means the session went on past
+# its final word. Every other record type is metadata and may follow the result
+# (observed: `system`/`task_summary`, 2.1.269), so a metadata record type a
+# later Claude Code adds there does not make every run unreadable.
+CLAUDE_SESSION_CONTENT_RECORD_TYPES = frozenset({"assistant", "user", "result", "stream_event"})
+
+
+def claude_terminal_result_index(records: Sequence[Mapping[str, Any]]) -> int | None:
+    """The one owner of Claude's terminal-event rule, shared by the answer
+    parser, the trace dialect and the trigger adapter: exactly one `result`
+    record, and no session content after it. Anything else (no result, two
+    results, a turn after the result) is None: the stream has no final word."""
+    results = [i for i, record in enumerate(records) if record.get("type") == "result"]
+    if len(results) != 1:
+        return None
+    for record in records[results[0] + 1:]:
+        if (record.get("type") in CLAUDE_SESSION_CONTENT_RECORD_TYPES
+                or isinstance(record.get("message"), Mapping)):
+            return None
+    return results[0]
 
 
 def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
@@ -10596,20 +10774,27 @@ def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
     """
     text = stdout if isinstance(stdout, str) else ""
     env: dict[str, Any] | None = None
+    stream_records: list[dict[str, Any]] = []
     stripped = text.strip()
     try:
         single = strict_json_loads(stripped)
     except json.JSONDecodeError:
         records, errors = parse_trace_jsonl_text(text)
+        stream_records = records
         results = [record for record in records if record.get("type") == "result"]
         if errors:
             return {"answer": "", "raw_response": text, "cost_usd": None,
                     "usage": {}, "parse_error": f"malformed Claude stream: {errors[0]}"}
-        if len(results) != 1 or not records or records[-1] is not results[0]:
+        if len(results) != 1:
             return {"answer": "", "raw_response": text, "cost_usd": None,
                     "usage": {}, "parse_error": (
                         "Claude stream must contain exactly one terminal result event")}
-        env = results[0]
+        terminal_index = claude_terminal_result_index(records)
+        if terminal_index is None:
+            return {"answer": "", "raw_response": text, "cost_usd": None,
+                    "usage": {}, "parse_error": (
+                        "Claude stream carries session content after its terminal result event")}
+        env = records[terminal_index]
     else:
         if isinstance(single, dict):
             env = single
@@ -10642,6 +10827,17 @@ def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
     result_error = None if isinstance(result, str) else "claude result must be a string"
     if cost is not None and (normalized_cost is None or normalized_cost < 0):
         result_error = "claude total_cost_usd must be a finite nonnegative number"
+    # The model on each main-thread assistant message served that turn. A
+    # subagent turn (it carries parent_tool_use_id) may use another model by
+    # design, so it is not evidence about the requested model. The envelope-only
+    # `json` format has no assistant messages, so its served model stays
+    # unavailable.
+    served_models = [
+        record["message"].get("model")
+        for record in stream_records
+        if record.get("type") == "assistant" and isinstance(record.get("message"), dict)
+        and record.get("parent_tool_use_id") is None
+    ]
     return {
         "answer": result if isinstance(result, str) else "",
         "cost_usd": (normalized_cost
@@ -10651,6 +10847,8 @@ def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
         "parse_error": result_error,
         "is_error": env.get("is_error", False),
         "api_error_status": api_error_status,
+        "stop": claude_result_stop(env),
+        "served_models": served_models,
     }
 
 
@@ -10726,26 +10924,10 @@ def claude_cli_invoke(prompt: str, *, model: str | None = None, claude_bin: str 
     return parsed
 
 
-def claude_run_metrics(result: dict[str, Any]) -> dict[str, Any]:
-    """The metrics.json body for one Claude run: the token usage, the real dollar
-    cost, and timing — the fields the benchmark report aggregates."""
-    usage = result.get("usage") or {}
-    metrics: dict[str, Any] = {"schema_version": 1, "source": "claude"}
-    for k in ("input_tokens", "output_tokens", "total_tokens", "cache_read_tokens", "cache_creation_tokens"):
-        if isinstance(usage.get(k), (int, float)):
-            metrics[k] = int(usage[k])
-    if isinstance(result.get("cost_usd"), (int, float)):
-        metrics["cost_usd"] = float(result["cost_usd"])
-    if isinstance(result.get("elapsed_ms"), (int, float)):
-        metrics["elapsed_ms"] = int(result["elapsed_ms"])
-    if result.get("returncode") is not None:
-        metrics["returncode"] = result["returncode"]
-    return metrics
-
-
 def run_claude(args: argparse.Namespace) -> int:
-    return run_agent_tasks(load_jsonl(Path(args.tasks)), Path(args.runs), registered_agent_backend("claude"),
+    return run_agent_tasks(load_prepared_tasks(Path(args.tasks)), Path(args.runs), registered_agent_backend("claude"),
                            model=getattr(args, "model", None), timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)),
+                           effort=getattr(args, "effort", None),
                            claude_bin=getattr(args, "claude_bin", None) or "claude")
 
 
@@ -10964,7 +11146,8 @@ def codex_structured_output_schema(schema: dict[str, Any]) -> dict[str, Any]:
 
 def codex_cli_invoke(prompt: str, *, model: str | None = None, codex_cmd: str = "codex exec", timeout: int = DEFAULT_RUNNER_TIMEOUT_S,
                       output_schema: dict[str, Any] | None = None, cwd: str | Path | None = None,
-                      sandbox: str = "read-only", json_events: bool = True) -> dict[str, Any]:
+                      sandbox: str = "read-only", json_events: bool = True,
+                      config_overrides: list[str] | None = None) -> dict[str, Any]:
     """Native Codex invocation for judge-style calls.
 
     Codex's event stream is useful for telemetry, but the verdict/answer should
@@ -10994,6 +11177,8 @@ def codex_cli_invoke(prompt: str, *, model: str | None = None, codex_cmd: str = 
         argv.append("--ignore-rules")
     if sandbox and "--sandbox" not in argv:
         argv += ["--sandbox", sandbox]
+    for override in config_overrides or []:
+        argv += ["-c", override]
     tmp = Path(tempfile.mkdtemp(prefix="codex-invoke-"))
     cleanup_meta: dict[str, Any]
     try:
@@ -11552,25 +11737,14 @@ def validate_depends_on_scope(cid: str, assertions: list[Any], path: Path) -> No
 
 
 def judge_task_id(case_id: str, variant: str, run_number: int, assertion: dict[str, Any], model: str | None = None) -> str:
-    """One verdict key per (case, model, variant, run, assertion). The model
-    segment appears only on model-fanned runs (roadmap 2.1) — without it,
-    case-1/m1/with_skill and case-1/m2/with_skill would share an ID and the
-    last-loaded verdict would silently apply to both models. Single-model IDs
-    keep the historical shape."""
-    label = assertion_label(assertion)
-    segments = {"case_id": case_id, "variant": variant, "assertion": label}
-    if model is not None:
-        segments["model"] = model
-    for segment_name, segment in segments.items():
-        if not isinstance(segment, str) or not segment:
-            raise ValueError(f"judge task {segment_name} must be a non-empty string")
-        if "::" in segment:
-            raise ValueError(
-                f"judge task {segment_name} cannot contain reserved delimiter '::'")
-    if type(run_number) is not int or run_number < 1:
-        raise ValueError("judge task run_number must be a positive integer")
-    model_segment = f"{model}::" if model is not None else ""
-    return f"{case_id}::{model_segment}{variant}::run-{run_number}::{label}"
+    """One verdict key per (case, model, variant, run, assertion). The run
+    coordinate owns the format and validation; the model segment appears only
+    on model-fanned runs (roadmap 2.1), so single-model ids keep their shape."""
+    try:
+        coordinate = RunCoordinate.of(case_id, variant, run_number, model)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"judge task: {exc}") from exc
+    return coordinate.judge_task_id(assertion_label(assertion))
 
 
 JUDGE_EVIDENCE_MODES = {
@@ -11579,7 +11753,12 @@ JUDGE_EVIDENCE_MODES = {
 
 
 def judge_explore_surface_sha256(run_base: Path) -> str:
-    """Hash the names/content surface copied for a read-only exploring judge."""
+    """Hash the names/content surface copied for a read-only exploring judge.
+
+    Not content_digests.tree_sha256: a judge exploring the copy also sees its
+    directories, so directory entries are framed too, and the persisted digest
+    keeps this format.
+    """
     if not run_base.is_dir():
         raise ValueError("judge explore evidence requires a readable run directory")
     digest = hashlib.sha256()
@@ -11710,13 +11889,7 @@ def load_judge_results(path: str | None) -> dict[str, dict[str, Any]]:
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
-    def reject_constant(constant: str) -> Any:
-        raise json.JSONDecodeError(
-            f"non-finite numeric constant is not valid JSON: {constant}", "", 0)
-
-    decoder = json.JSONDecoder(
-        object_pairs_hook=unique_json_object,
-        parse_constant=reject_constant)
+    decoder = strict_json_decoder()
     found: list[dict[str, Any]] = []
     i = 0
     while i < len(text):
@@ -11726,10 +11899,9 @@ def extract_json_object(text: str) -> dict[str, Any]:
             continue
         try:
             obj, end = decoder.raw_decode(text[i:])
-        except json.JSONDecodeError as exc:
-            if ("duplicate object key" in exc.msg
-                    or "non-finite numeric constant" in exc.msg):
-                raise ValueError(exc.msg) from exc
+        except StrictJSONViolation as exc:
+            raise ValueError(exc.msg) from exc
+        except json.JSONDecodeError:
             i += 1
             continue
         if isinstance(obj, dict):
@@ -11748,6 +11920,18 @@ def extract_json_object(text: str) -> dict[str, Any]:
     if len(found) != 1:
         raise ValueError("judge output contains multiple JSON verdict objects")
     return found[0]
+
+
+def judge_score_scale(assertion: Mapping[str, Any]) -> tuple[float, float] | None:
+    """A plain judge's declared ``score_scale`` as (low, high), or None when
+    it declares none or an unusable one (validation refuses that)."""
+    scale = assertion.get("score_scale")
+    if (not isinstance(scale, list) or len(scale) != 2
+            or any(isinstance(x, bool) or not isinstance(x, (int, float))
+                   or not math.isfinite(float(x)) for x in scale)
+            or not float(scale[0]) < float(scale[1])):
+        return None
+    return float(scale[0]), float(scale[1])
 
 
 def is_per_step_assertion(assertion: dict[str, Any]) -> bool:
@@ -11835,7 +12019,7 @@ def verdict_schema_for(assertion: dict[str, Any]) -> dict[str, Any]:
     if assertion.get("dynamic_rubric"):
         minimum = (assertion.get("dynamic_rubric") or {}).get("minimum_criteria", 3)
         return _criteria_verdict_schema(minimum)
-    required = ["score"] if "atLeast" in assertion else ["passed"]
+    required = ["score"] if "atLeast" in assertion or "score_scale" in assertion else ["passed"]
     return {"type": "object", "required": required,
             "properties": {"passed": {"type": "boolean"}, "score": {"type": "number"}, "rationale": {"type": "string"}}}
 
@@ -11913,10 +12097,15 @@ def judge_prompt(task: dict[str, Any], output_text: str, *, trajectory: list | N
             + schema_hint
             + json.dumps(payload, indent=2, ensure_ascii=False)
         )
+    scale = judge_score_scale(assertion)
     plain_contract = (
         "Return only JSON with keys: score (required normalized number in [0, 1]), "
         "rationale (string). The harness derives pass/fail from atLeast.\n"
         if "atLeast" in assertion else
+        f"Return only JSON with keys: score (required number from {scale[0]:g} to {scale[1]:g}, "
+        "on the scale the rubric describes), rationale (string). The harness derives "
+        "pass/fail from the assertion's threshold on that scale.\n"
+        if scale is not None else
         "Return only JSON with keys: passed (boolean), score (number optional), "
         "rationale (string).\n"
     )
@@ -12441,16 +12630,30 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     # Validate every newly produced verdict before it can establish pass/fail.
     # `report` controls whether diagnostics are surfaced, not whether malformed
     # provider evidence is accepted; both modes fail closed.
+    if parse_error is None and isinstance(parsed, dict):
+        # A null optional field means absent: Codex structured output makes
+        # every optional verdict field required and nullable. A null required
+        # field stays, and the schema reports it.
+        required = set(verdict_schema_for(assertion).get("required") or ())
+        parsed = {key: value for key, value in parsed.items() if value is not None or key in required}
     schema_errors = json_schema_errors(parsed, verdict_schema_for(assertion)) if (parse_error is None and isinstance(parsed, dict)) else []
     if schema_errors:
         parse_error = "verdict schema: " + "; ".join(schema_errors[:5])
     at_least = assertion.get("atLeast")
+    scale = judge_score_scale(assertion)
     score = parsed.get("score")
     if (at_least is not None and parse_error is None
             and (isinstance(score, bool) or not isinstance(score, (int, float))
                  or not math.isfinite(float(score)) or not 0 <= float(score) <= 1)):
         parse_error = "atLeast judge verdict requires a finite normalized score in [0, 1]"
+    if (scale is not None and parse_error is None
+            and (isinstance(score, bool) or not isinstance(score, (int, float))
+                 or not math.isfinite(float(score))
+                 or not scale[0] <= float(score) <= scale[1])):
+        parse_error = (f"judge verdict requires a finite score in [{scale[0]:g}, "
+                       f"{scale[1]:g}] (score_scale)")
     threshold = (at_least if at_least is not None
+                 else assertion.get("threshold", scale[1]) if scale is not None
                  else assertion.get("threshold", parsed.get("threshold", 1)))
     graded_payload: dict[str, Any] = {}
     if assertion.get("graded_dimensions") and isinstance(parsed.get("dimension_scores"), dict):
@@ -12490,10 +12693,11 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         if "dimension_scores" in graded_payload:
             threshold = graded_entry.get("threshold")
     else:
-        if at_least is not None:
+        if at_least is not None or scale is not None:
+            # The harness, not the judge, decides pass from the score.
             passed = (
                 parse_error is None and isinstance(score, (int, float))
-                and not isinstance(score, bool) and float(score) >= float(at_least)
+                and not isinstance(score, bool) and float(score) >= float(threshold)
             )
         else:
             plain_payload = ({**parsed, "threshold": threshold}
@@ -12647,6 +12851,23 @@ def _incomplete_judge_consensus(
     return validated_result_row(out)
 
 
+def _judge_consensus(rows: list[dict[str, Any]], *, quorum: int | None = None) -> Consensus:
+    """Fold member verdicts with the one rule both merges share. An exact tie is
+    decided by the median score only against an explicit threshold; a raw-score
+    verdict with no calibrated threshold must not pass on a default, so the tie
+    is unresolved instead."""
+    scores = [
+        float(score) for row in rows
+        if isinstance((score := row.get("score")), (int, float))
+        and not isinstance(score, bool) and math.isfinite(float(score))
+    ]
+    threshold = rows[0].get("threshold")
+    return resolve_consensus(
+        [bool(row.get("passed")) for row in rows], scores,
+        threshold=threshold if isinstance(threshold, (int, float)) and not isinstance(threshold, bool) else None,
+        quorum=quorum)
+
+
 def merge_repeated_judge_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     if len(rows) == 1:
         return rows[0]
@@ -12658,26 +12879,23 @@ def merge_repeated_judge_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     if member_errors:
         return _incomplete_judge_consensus(
             rows, member_errors, members_key="judge_runs")
-    scores = [
-        score for row in rows
-        if isinstance((score := row.get("score")), (int, float))
-        and not isinstance(score, bool) and math.isfinite(float(score))
-    ]
-    passed_count = sum(1 for r in rows if r.get("passed"))
+    consensus = _judge_consensus(rows)
     first = dict(rows[0])
-    first["passed"] = passed_count > len(rows) / 2
-    if scores:
-        first["score"] = statistics.median(scores)
+    first["passed"] = consensus.passed
+    if consensus.median_score is not None:
+        first["score"] = consensus.median_score
     first["evidence"] = " | ".join(str(r.get("evidence", "")) for r in rows if r.get("evidence"))[:4000]
+    # A judge that disagrees with itself on identical input is grader noise;
+    # the agreement block makes it visible instead of averaging it away.
+    first["agreement"] = consensus.agreement()
     first["judge_runs"] = rows
     first["judge_observation_complete"] = True
     first["availability"] = "complete"
     first["returncode"] = 0
     aggregate_judge_member_telemetry(rows, first)
-    consensus = ConsensusVerdict(bool(first["passed"]), first.get("score"))
     for key in ("threshold", "dimension_scores", "criteria", "minimum_criteria"):
         first.pop(key, None)
-    first.update(verdict_fields(consensus))
+    first.update(verdict_fields(consensus.verdict()))
     return validated_result_row(first)
 
 
@@ -12712,40 +12930,15 @@ def merge_cross_judge_rows(rows: list[dict[str, Any]], *, quorum: int | None = N
         out["judge_model"] = "consensus"
         out["judge_models"] = models
         return validated_result_row(out)
-    n = len(rows)
-    concur = sum(1 for r in rows if r.get("passed"))
-    scores = [
-        score for row in rows
-        if isinstance((score := row.get("score")), (int, float))
-        and not isinstance(score, bool) and math.isfinite(float(score))
-    ]
-    median_score = statistics.median(scores) if scores else None
-    unresolved = False
-    if isinstance(quorum, int) and quorum > 0:
-        passed = concur >= quorum
-    elif concur * 2 > n:
-        passed = True
-    elif concur * 2 < n:
-        passed = False
-    else:
-        # Exact tie, no quorum: let the score median decide ONLY against an EXPLICIT
-        # threshold. A bare raw-score panel with no calibrated threshold must not pass
-        # on the default-1 fallback (median >= 1 is ~always true — a silent coin-flip
-        # toward PASS); it resolves to `unresolved` instead.
-        thr = rows[0].get("threshold")
-        if median_score is not None and isinstance(thr, (int, float)):
-            passed = median_score >= thr
-        else:
-            passed, unresolved = False, True
+    consensus = _judge_consensus(rows, quorum=quorum)
     out = dict(rows[0])
     out["judge_model"] = "consensus"
     out["judge_models"] = [r.get("judge_model") for r in rows]
-    out["passed"] = passed
-    if median_score is not None:
-        out["score"] = median_score
+    out["passed"] = consensus.passed
+    if consensus.median_score is not None:
+        out["score"] = consensus.median_score
     out["evidence"] = " | ".join(str(r.get("evidence", "")) for r in rows if r.get("evidence"))[:4000]
-    out["agreement"] = {"concur": concur, "n": n, "concur_fraction": round(concur / n, 4),
-                        "unanimous": concur in (0, n), "unresolved": unresolved}
+    out["agreement"] = consensus.agreement()
     aggregate_judge_member_telemetry(rows, out)
     out["judge_panel"] = rows
     out["judge_observation_complete"] = True
@@ -12753,7 +12946,7 @@ def merge_cross_judge_rows(rows: list[dict[str, Any]], *, quorum: int | None = N
     out["returncode"] = 0
     for key in ("threshold", "dimension_scores", "criteria", "minimum_criteria"):
         out.pop(key, None)
-    out.update(verdict_fields(ConsensusVerdict(bool(passed), median_score)))
+    out.update(verdict_fields(consensus.verdict()))
     return validated_result_row(out)
 
 
@@ -12855,11 +13048,17 @@ def tool_replay_mode(default: str = "off") -> str:
     return mode if mode in TOOL_REPLAY_MODES else default
 
 
+# The stop classes a subagent response may report. Leaving stop_class out is
+# how a response says it does not know, so `unavailable` is not spelled.
+SUBAGENT_STOP_CLASSES = tuple(
+    item.value for item in StopClass if item is not StopClass.UNAVAILABLE)
+
+
 def validate_subagent_response(value: Any) -> dict[str, Any]:
     value = string_keyed_dict(value, "subagent response")
     allowed = {
         "answer", "trace", "usage", "returncode", "timed_out", "elapsed_ms",
-        "telemetry_scope",
+        "telemetry_scope", "stop_class", "stop_reason", "served_models",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -12900,7 +13099,49 @@ def validate_subagent_response(value: Any) -> dict[str, Any]:
         raise ValueError(
             "subagent response telemetry_scope must be turn_delta or "
             "conversation_cumulative")
+    if "stop_class" in value and value["stop_class"] not in SUBAGENT_STOP_CLASSES:
+        raise ValueError(
+            f"subagent response stop_class must be one of {', '.join(SUBAGENT_STOP_CLASSES)}; "
+            f"got {value['stop_class']!r} (omit it when the stop is unknown)")
+    if "stop_reason" in value:
+        if not isinstance(value["stop_reason"], str) or not value["stop_reason"].strip():
+            raise TypeError("subagent response stop_reason must be a non-empty string")
+        validate_json_text(value["stop_reason"], "subagent response stop_reason")
+    if "served_models" in value:
+        models = value["served_models"]
+        if not isinstance(models, list) or not all(
+                isinstance(item, str) and item.strip() for item in models):
+            raise TypeError(
+                "subagent response served_models must be a list of non-empty strings")
+        for item in models:
+            validate_json_text(item, "subagent response served model")
     return value
+
+
+def subagent_stop(response: Mapping[str, Any], source: str) -> StopObservation:
+    """The stop a validated subagent response reported. A raw stop_reason
+    without a stop_class is not mapped, because each provider names its stops
+    differently; the source text keeps it as evidence instead."""
+    stop_class, raw = response.get("stop_class"), response.get("stop_reason")
+    if isinstance(stop_class, str):
+        return StopObservation(StopClass(stop_class), raw if isinstance(raw, str) else None, source)
+    if isinstance(raw, str):
+        return StopObservation.unavailable(
+            f"{source} gave stop_reason {raw!r} without a stop_class; raw reasons are not mapped")
+    return StopObservation.unavailable(f"{source} carries no stop_class")
+
+
+def subagent_served_models(response: Mapping[str, Any]) -> list[str]:
+    """The model ids a validated subagent response says answered it."""
+    models = response.get("served_models")
+    return [item for item in models if isinstance(item, str)] if isinstance(models, list) else []
+
+
+def subagent_run_stop(turn_stops: Sequence[StopObservation]) -> StopObservation:
+    """How a multi-turn run stopped: a truncated or turn-limited turn spoils
+    the transcript every later turn answered, so its stop is the run's;
+    otherwise the run stopped the way its last turn did."""
+    return next((stop for stop in turn_stops if not stop.scorable), turn_stops[-1])
 
 
 def _subagent_trace_text(records: Any) -> str:
@@ -13060,6 +13301,7 @@ def run_subagent_tasks(
     model: str | None = None,
     live_tools: dict[str, Any] | None = None,
     replay_mode: str | None = None,
+    trace_source: str | None = None,
 ) -> int:
     """The built-in subagent runner (roadmap 2.7): no external CLI required —
     `agent_fn(prompt, workspace, model, tool_executor)` is the seam (a Claude
@@ -13069,7 +13311,10 @@ def run_subagent_tasks(
     events.json, metrics.json), so grading stays file-based and re-runnable.
     Multi-turn telemetry aggregates only when every response declares
     ``telemetry_scope: turn_delta``; every attempted turn is retained under
-    ``turn-N/`` regardless. Tool replay (2.3) wraps the executor per run."""
+    ``turn-N/`` regardless. Tool replay (2.3) wraps the executor per run.
+    ``trace_source`` names the provider whose stream records a backend returns
+    as ``trace`` (the default Claude backend's), so they normalize through that
+    provider's trace dialect instead of the generic one."""
     mode = replay_mode or tool_replay_mode()
     workspace_builder = registered_workspace_builder("subagent")
     validated: list[tuple[dict[str, Any], PreparedTask, str | None, Path]] = []
@@ -13128,6 +13373,8 @@ def run_subagent_tasks(
         turns = [str(t) for t in task.get("turns") or [] if str(t)]
         multi_turn_extra: dict[str, Any] = {}
         aggregate_cost_usd: float | None = None
+        turn_stops: list[StopObservation] = []
+        served_reported: list[str] = []
         with tempfile.TemporaryDirectory(prefix="subagent-ws-") as wd:
             ws = Path(wd)
             workspace = workspace_builder(pt, ws)
@@ -13209,17 +13456,22 @@ def run_subagent_tasks(
                         if isinstance(raw_turn_usage, dict) else None
                     )
                     turn_cost = _subagent_cost_usd(turn_response)
+                    turn_stops.append(subagent_stop(turn_response, f"subagent response, turn {n}"))
+                    turn_served = subagent_served_models(turn_response)
+                    served_reported.extend(turn_served)
                     turn_ro = RunnerOutcome(
                         provider="subagent", answer=turn_answer,
                         returncode=int(turn_rc), timed_out=bool(turn_timed_out),
                         error=turn_error, elapsed_ms=turn_elapsed,
-                        trace_text=turn_trace_text, usage=turn_usage,
-                        cost_usd=turn_cost, model=row_model,
+                        trace_text=turn_trace_text, trace_source=trace_source,
+                        usage=turn_usage, cost_usd=turn_cost, model=row_model,
                         metadata_extra={
                             "tool_replay_mode": mode, **prov_extra,
                             "billing_scope": "turn", "turn_number": n,
                             "expected_turns": len(turns),
                             "telemetry_scope": turn_response.get("telemetry_scope"),
+                            **turn_stops[-1].as_metadata(),
+                            **ServedModel.observe(row_model, turn_served).as_metadata(),
                         },
                         diagnose_returncode=False,
                     )
@@ -13271,8 +13523,14 @@ def run_subagent_tasks(
                     if isinstance(raw_single_usage, dict) else None
                 )
                 aggregate_cost_usd = _subagent_cost_usd(outcome)
+                turn_stops.append(subagent_stop(outcome, "subagent response"))
+                served_reported.extend(subagent_served_models(outcome))
         if store is not None:
             store.save()
+        completion = {
+            **subagent_run_stop(turn_stops).as_metadata(),
+            **ServedModel.observe(row_model, served_reported).as_metadata(),
+        }
         # The subagent seam returns structured trace records; single-turn traces
         # remain direct. Multi-turn root traces are safe composites whose exact
         # provider records live under turn-<n>/trace.jsonl.
@@ -13298,9 +13556,10 @@ def run_subagent_tasks(
             # TIMEOUT marker, not the provider marker, heads the body.
             error=error or ("subagent timed out" if timed_out else None),
             elapsed_ms=(int(elapsed_ms) if isinstance(elapsed_ms, (int, float)) else None),
-            trace_text=trace_text,
+            trace_text=trace_text, trace_source=trace_source,
             usage=raw_usage, cost_usd=aggregate_cost_usd, model=row_model,
-            metadata_extra={"tool_replay_mode": mode, **prov_extra, **multi_turn_extra},
+            metadata_extra={"tool_replay_mode": mode, **prov_extra, **multi_turn_extra,
+                            **completion},
             diagnose_returncode=False)
         try:
             write_runner_outcome(base, ro, sidecars=sidecars)
@@ -13312,7 +13571,7 @@ def run_subagent_tasks(
 def shell_agent_backend(agent_cmd: str, timeout: int = DEFAULT_RUNNER_TIMEOUT_S) -> Any:
     """Adapt a shell command into the subagent seam: the prompt arrives as JSON
     on stdin, the reply is JSON on stdout ({answer, trace?, usage?,
-    telemetry_scope?})."""
+    telemetry_scope?, stop_class?, stop_reason?, served_models?})."""
     def backend(*, prompt: str, workspace: Path, model: str | None, tool_executor: Any, history: list | None = None) -> dict[str, Any]:
         payload = {"prompt": prompt, "model": model, "workspace": str(workspace)}
         if history:
@@ -13334,7 +13593,7 @@ def shell_agent_backend(agent_cmd: str, timeout: int = DEFAULT_RUNNER_TIMEOUT_S)
 
 
 def run_subagent(args: argparse.Namespace) -> int:
-    tasks = load_jsonl(Path(args.tasks))
+    tasks = load_prepared_tasks(Path(args.tasks))
     runs = Path(args.runs)
     agent_cmd = getattr(args, "agent_cmd", None)
     if agent_cmd:
@@ -13347,12 +13606,43 @@ def run_subagent(args: argparse.Namespace) -> int:
             if history:
                 transcript = "\n\n".join(f"[user]\n{h['prompt']}\n\n[assistant]\n{h['answer']}" for h in history)
                 prompt = f"Conversation so far:\n{transcript}\n\n[user]\n{prompt}"
-            result = claude_cli_invoke(prompt, model=model, claude_bin=claude_bin, timeout=timeout)
+            # stream-json, as run-claude reads it: the terminal result event
+            # carries the stop reason, the main-thread assistant messages name
+            # the model that served each turn, and the stream is the run's
+            # trace. Claude runs in the run's workspace, where the prompt's
+            # skill and input paths are.
+            result = claude_cli_invoke(prompt, model=model, claude_bin=claude_bin, timeout=timeout,
+                                       cwd=workspace, output_format="stream-json")
+            error = result.get("provider_error") or result.get("parse_error")
+            if error and result.get("returncode") == 0:
+                # An exit-zero error envelope or unreadable output is a failed
+                # run, as run-claude records it, not an answer to grade.
+                raise RuntimeError(error)
+            # The provider's usage as run-claude records it, with the cost the
+            # subagent contract reads from usage.cost_usd. Only numeric fields:
+            # the subagent usage contract rejects labels such as `source`.
+            usage = dict(result.get("usage") or {})
+            if isinstance(result.get("cost_usd"), (int, float)):
+                usage["cost_usd"] = result["cost_usd"]
+            completion: dict[str, Any] = {}
+            stop = result.get("stop")
+            if isinstance(stop, StopObservation) and stop.stop_class is not StopClass.UNAVAILABLE:
+                completion["stop_class"] = stop.stop_class.value
+                if stop.raw is not None:
+                    completion["stop_reason"] = stop.raw
+            served = [item for item in result.get("served_models") or []
+                      if isinstance(item, str) and item.strip()]
+            if served:
+                completion["served_models"] = served
+            trace, _ = parse_trace_jsonl_text(str(result.get("raw_response") or ""))
+            # Each turn is its own `claude -p` call, so its usage, cost and
+            # time are that turn's alone and sum to the run's.
             return {"answer": result.get("answer"), "returncode": result.get("returncode"),
                     "timed_out": result.get("timed_out", False), "elapsed_ms": result.get("elapsed_ms"),
-                    "usage": claude_run_metrics(result)}
+                    "usage": usage, "trace": trace, "telemetry_scope": "turn_delta", **completion}
     return run_subagent_tasks(tasks, runs, backend, model=getattr(args, "model", None),
-                              replay_mode=getattr(args, "tool_replay", None) or tool_replay_mode())
+                              replay_mode=getattr(args, "tool_replay", None) or tool_replay_mode(),
+                              trace_source=None if agent_cmd else "claude")
 
 
 JUDGE_NEGATIVE_CONTROLS = {
@@ -13443,7 +13733,7 @@ def judge_robustness_report(tasks: list[dict[str, Any]], *, tmp_dir: Path, judge
                 call_errors.append({"probe": probe, "reason": problem})
                 findings.append({
                     "judge_task_id": task.get("judge_task_id"),
-                    "kind": "judge-call-incomplete", "probe": probe,
+                    "kind": FindingKind.JUDGE_CALL_INCOMPLETE.value, "probe": probe,
                     "detail": problem,
                 })
         controls: dict[str, bool | None] = {}
@@ -13460,14 +13750,14 @@ def judge_robustness_report(tasks: list[dict[str, Any]], *, tmp_dir: Path, judge
                 call_errors.append({"probe": f"control:{name}", "reason": problem})
                 findings.append({
                     "judge_task_id": task.get("judge_task_id"),
-                    "kind": "judge-call-incomplete", "probe": f"control:{name}",
+                    "kind": FindingKind.JUDGE_CALL_INCOMPLETE.value, "probe": f"control:{name}",
                     "detail": problem,
                 })
             elif passed:
-                findings.append({"judge_task_id": task.get("judge_task_id"), "kind": f"passes-{name}-control",
+                findings.append({"judge_task_id": task.get("judge_task_id"), "kind": FindingKind(f"passes-{name}-control").value,
                                  "detail": f"judge PASSED a {name} negative control it should reject"})
         if consistent is False:
-            findings.append({"judge_task_id": task.get("judge_task_id"), "kind": "order-flip-inconsistent",
+            findings.append({"judge_task_id": task.get("judge_task_id"), "kind": FindingKind.ORDER_FLIP_INCONSISTENT.value,
                              "detail": "verdict flipped when the rubric / expected-behavior order was reversed"})
         results.append({
             "judge_task_id": task.get("judge_task_id"),
@@ -13513,9 +13803,12 @@ def judge_robustness_command(args: argparse.Namespace) -> int:
     report = judge_robustness_report(tasks, tmp_dir=tmp, judge_cmd=judge_cmd, judge_model=judge_model,
                                      claude_bin=getattr(args, "claude_bin", None) or "claude")
     emit_report(report, getattr(args, "out", None))
-    gate_failed = (report["summary"].get("availability") != "complete"
-                   or bool(report["findings"]))
-    return 1 if (getattr(args, "fail_on_findings", False) and gate_failed) else 0
+    if not getattr(args, "fail_on_findings", False):
+        return 0
+    availability = report["summary"].get("availability")
+    return gate_exit(gate_policy.JUDGE_ROBUSTNESS.decide(
+        report["findings"], complete=availability == "complete",
+        incomplete_reason=f"judge-robustness evidence is {availability}"), "judge-robustness")
 
 
 def judge_command(args: argparse.Namespace) -> int:
@@ -13534,6 +13827,9 @@ def judge_command(args: argparse.Namespace) -> int:
         die("judge needs --judge-cmd (any provider), --judge-model/--judge-panel, or a manifest judge.model default")
     if explore and judge_backend != "claude":
         die("--judge-explore is for the native claude judge backend only")
+    if getattr(args, "quorum", None) is not None and (judge_backend == "cmd" or len(panel) < 2):
+        die("--quorum needs a --judge-panel of two or more judges; a single judge has no panel to fold "
+            "(--judge-runs repeats fold by majority)")
     backend_options = surface_option_values(args, "judge")
     tasks = collect_judge_tasks(Path(args.manifest), Path(args.runs), split=args.split, variants=args.variant)
     transcripts = Path(args.transcripts) if getattr(args, "transcripts", None) else None
@@ -13766,12 +14062,50 @@ def judge_alignment_report(human: dict[str, dict[str, Any]], judge: dict[str, di
     }
 
 
+def human_labels_from_judgements(judgements: list[HumanJudgement]) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
+    """Judge-calibration labels from stored human judgements.
+
+    Only a pass/fail verdict on a named judge assertion is a label: a run-level
+    note grades no particular judge task, and "unsure" is not ground truth."""
+    labels: dict[str, dict[str, Any]] = {}
+    skipped = {"run_level": 0, "unsure_or_note_only": 0}
+    for judgement in judgements:
+        if judgement.assertion is None:
+            skipped["run_level"] += 1
+            continue
+        if judgement.label is None:
+            skipped["unsure_or_note_only"] += 1
+            continue
+        jid = judgement.run.judge_task_id(judgement.assertion)
+        if jid in labels:
+            die(f"feedback labels {jid!r} twice")
+        labels[jid] = {"judge_task_id": jid, "passed": judgement.label}
+    return labels, skipped
+
+
+def load_human_labels(path: str) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Read human labels from the served review's feedback.json, or from the
+    legacy {judge_task_id, passed} file that predates the single store."""
+    try:
+        document = strict_json_loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        document = None
+    if is_feedback_document(document):
+        assert isinstance(document, dict)
+        store = FeedbackStore.from_document(document)
+        labels, skipped = human_labels_from_judgements(list(store.judgements))
+        skipped["unparsed"] = len(store.unparsed)
+        return labels, {"format": "feedback", "skipped": skipped}
+    return load_judge_results(path), {"format": "judge_task_labels"}
+
+
 def judge_alignment_command(args: argparse.Namespace) -> int:
-    human = load_judge_results(args.labels)
+    human, source = load_human_labels(args.labels)
     judge = load_judge_results(args.judge_results)
     if not human:
         die(f"no human labels loaded from {args.labels}")
     report = judge_alignment_report(human, judge, min_labels=int(getattr(args, "min_labels", 50)))
+    report["label_source"] = source
     emit_report(report, getattr(args, "out", None))
     return 0
 
@@ -13798,13 +14132,15 @@ def first_failure(result: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def error_analysis_report(report: dict[str, Any], *, limit: int = 100) -> dict[str, Any]:
+def error_analysis_report(report: dict[str, Any], *, limit: int = 100,
+                          feedback: list[HumanJudgement] | None = None) -> dict[str, Any]:
     """Feature 8: open-coding review queue + axial failure taxonomy over a
     benchmark report (model-free). The queue is one row per failing/errored run
     anchored on its first failure (the 'look at your data' substrate); the
     taxonomy counts those first-failures by category so the >60%-in-a-few-buckets
     pattern is visible. Reuses the report's own case_flags as a second histogram."""
     results = report.get("results", [])
+    run_notes = {item.run_key: item for item in (feedback or []) if item.assertion is None}
     queue: list[dict[str, Any]] = []
     blocked = [
         {"case_id": row.get("case_id"), "model": row.get("model"),
@@ -13829,10 +14165,19 @@ def error_analysis_report(report: dict[str, Any], *, limit: int = 100) -> dict[s
             category = f"{ff['klass']}:{ff.get('name') or ff.get('type') or 'unnamed'}"
         entry = {
             "case_id": r.get("case_id"), "variant": r.get("variant"), "model": r.get("model"),
+            "run_number": r.get("run_number", 1),
             "run_base": r.get("run_base"), "category": category,
             "objective_pass_rate": r.get("objective_pass_rate"), "combined_pass_rate": r.get("combined_pass_rate"),
             "first_failure": ff, "note": "",   # open-text slot for a human annotation
         }
+        human = run_notes.get((str(r.get("case_id")), str(r.get("model") or ""),
+                               str(r.get("variant")), int(r.get("run_number", 1) or 1)))
+        if human is not None:
+            # The review page's run-level judgement fills the slot, so a note
+            # written while reading the run is not typed a second time here.
+            entry["note"] = human.note or ""
+            if human.verdict is not None:
+                entry["human_verdict"] = human.verdict.value
         queue.append(entry)
         bucket = taxonomy.setdefault(category, {"category": category, "count": 0, "example_case": r.get("case_id"), "example_evidence": (ff or {}).get("evidence", "")})
         bucket["count"] += 1
@@ -13869,7 +14214,12 @@ def error_analysis_report(report: dict[str, Any], *, limit: int = 100) -> dict[s
 
 def error_analysis_command(args: argparse.Namespace) -> int:
     report = load_json(Path(args.benchmark))
-    out = error_analysis_report(report, limit=int(getattr(args, "limit", 100)))
+    feedback_path = getattr(args, "feedback", None)
+    try:
+        feedback = read_feedback(Path(feedback_path)) if feedback_path else None
+    except ValueError as exc:
+        die(str(exc))
+    out = error_analysis_report(report, limit=int(getattr(args, "limit", 100)), feedback=feedback)
     emit_report(out, getattr(args, "out", None))
     return 0
 
@@ -13958,12 +14308,50 @@ def merged_qualitative_entry(assertion: dict[str, Any], judged: dict[str, Any], 
             })
             return entry
         normalized_score = float(score)
+        # A panel or repeated judge keeps its own majority or quorum pass: its
+        # score is a median, which can clear atLeast while the panel fails.
+        consensus = judged.get("verdict_kind") == "consensus"
         entry.update({
-            "passed": normalized_score >= float(at_least),
+            "passed": (bool(judged.get("passed")) if consensus
+                       else normalized_score >= float(at_least)),
             "score": normalized_score,
             "threshold": float(at_least),
             "evidence": (
                 f"score={normalized_score:g}, atLeast={float(at_least):g}; "
+                f"{evidence}"
+            ),
+        })
+        return entry
+    scale = judge_score_scale(assertion)
+    if scale is not None:
+        # Pass compares the raw score with the threshold on the declared
+        # scale, as the judge command did (a panel or repeats keep their own
+        # majority or quorum); the graded channel takes the score normalised
+        # to 0-1.
+        low, high = scale
+        score = judged.get("score")
+        if (isinstance(score, bool) or not isinstance(score, (int, float))
+                or not math.isfinite(float(score)) or not low <= float(score) <= high):
+            entry.update({
+                "passed": None,
+                "score": None,
+                "availability": "partial",
+                "evidence": (
+                    "score_scale judge verdict is incomplete: expected a finite "
+                    f"score in [{low:g}, {high:g}]; {evidence}"
+                ),
+            })
+            return entry
+        raw_score = float(score)
+        threshold = float(assertion.get("threshold", high))
+        entry.update({
+            "passed": judge_verdict_passed(judged, default_threshold=threshold),
+            "score": (raw_score - low) / (high - low),
+            "threshold": (threshold - low) / (high - low),
+            "raw_score": raw_score,
+            "score_scale": [low, high],
+            "evidence": (
+                f"score={raw_score:g} on [{low:g}, {high:g}], threshold={threshold:g}; "
                 f"{evidence}"
             ),
         })
@@ -14357,9 +14745,12 @@ def grade_case_variant(
         "run_base": str(run_base or output_path.parent),
         "missing_output": missing_output,
         "execution_valid": exec_valid,
+        **completion_row_fields(metadata),
         "objective_passed": objective_passed,
         "objective_total": objective_total,
-        "objective_pass_rate": (0.0 if vetoed else objective_passed / objective_total) if objective_total else (0.0 if vetoed else None),
+        # With no objective check the rate is not applicable, vetoed or not;
+        # the veto zeroes the combined rate that carries the judges.
+        "objective_pass_rate": (0.0 if vetoed else objective_passed / objective_total) if objective_total else None,
         "process_passed": process_passed,
         "process_total": len(process_rows),
         "process_pass_rate": (0.0 if vetoed else process_passed / len(process_rows)) if process_rows else None,
@@ -14568,136 +14959,92 @@ def telemetry_summary(rows: list[dict[str, Any]]) -> dict[str, int]:
     return counts
 
 
+def completion_row_fields(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Carry a run's completion evidence onto its result row.
+
+    Runs recorded before this evidence existed carry none of these keys, and
+    the report counts them as unrecorded rather than as completed."""
+    fields: dict[str, Any] = {}
+    for key in ("stop_class", "stop_reason", "served_model", "served_model_check"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value:
+            fields[key] = value
+    effort = metadata.get("effort")
+    if isinstance(effort, Mapping):
+        fields["effort"] = {"requested": effort.get("requested"),
+                            "applied_by": effort.get("applied_by")}
+    reason = completion_unscorable_reason(metadata)
+    if reason is not None:
+        fields["unscorable_reason"] = reason
+    return fields
+
+
+def run_endings_block(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """How every graded run ended, per variant: stop class, served-model check
+    and effort. Counts cover all runs, scorable or not, because the question
+    is what the eval actually measured: a refused run is graded (so its zero
+    is a refusal, not a capability miss), while a truncated or wrong-model run
+    is excluded and blocks its pair."""
+    by_variant: dict[str, dict[str, Any]] = {}
+    models = set()
+    for row in results:
+        variant = str(row.get("variant"))
+        block = by_variant.setdefault(variant, {
+            "runs": 0,
+            "stop_class": collections.Counter(),
+            "served_model_check": collections.Counter(),
+            "effort": collections.Counter(),
+        })
+        block["runs"] += 1
+        block["stop_class"][row.get("stop_class") or "unrecorded"] += 1
+        block["served_model_check"][row.get("served_model_check") or "unrecorded"] += 1
+        block["effort"][effort_identity(row) or "unrecorded"] += 1
+        if row.get("model"):
+            models.add(str(row["model"]))
+    totals = collections.Counter()
+    efforts: set[str] = set()
+    for block in by_variant.values():
+        for key in ("stop_class", "served_model_check", "effort"):
+            block[key] = dict(sorted(block[key].items()))
+        totals.update({f"stop:{k}": v for k, v in block["stop_class"].items()})
+        totals.update({f"served:{k}": v for k, v in block["served_model_check"].items()})
+        efforts.update(block["effort"])
+    notes = []
+    if totals["stop:refused"]:
+        notes.append(f"{totals['stop:refused']} run(s) ended in a refusal; they are graded, "
+                     "so read those zeros as refusals rather than capability misses")
+    if totals["stop:truncated"] or totals["stop:turn_limit"]:
+        notes.append(f"{totals['stop:truncated'] + totals['stop:turn_limit']} run(s) were cut off "
+                     "by an output or turn limit and are excluded from scoring")
+    if totals["served:mismatch"]:
+        notes.append(f"{totals['served:mismatch']} run(s) were answered by a different model "
+                     "than requested and are excluded from scoring")
+    if totals["served:mixed"]:
+        notes.append(f"{totals['served:mixed']} run(s) reported the requested model and at least "
+                     "one other; they are scored, but no single model can be credited")
+    if len(models) > 1 and efforts == {BACKEND_DEFAULT}:
+        notes.append("every run used its backend's default effort; defaults differ by model, "
+                     "so pin --effort before reading a cross-model comparison")
+    return {
+        "by_variant": dict(sorted(by_variant.items())),
+        "refused_runs": totals["stop:refused"],
+        "cut_off_runs": totals["stop:truncated"] + totals["stop:turn_limit"],
+        "served_model_mismatches": totals["served:mismatch"],
+        "served_model_mixed": totals["served:mixed"],
+        "effort_levels": sorted(efforts),
+        "notes": notes,
+    }
+
+
 def mean_rate(rows: list[dict[str, Any]], key: str = "objective_pass_rate") -> float | None:
     # Single scorable+mean path: ResultSet owns the predicate.
     return ResultSet(rows).mean_rate(key)
 
 
-def _monte_carlo_upper_bound(hits: int, samples: int, *, failure_probability: float = 0.001) -> float:
-    """Distribution-free upper confidence bound for a sampled tail probability."""
-    if samples < 1:
-        raise ValueError("Monte Carlo samples must be positive")
-    empirical = hits / samples
-    radius = math.sqrt(math.log(1.0 / failure_probability) / (2.0 * samples))
-    return min(1.0, empirical + radius)
-
-
-def _exact_rate(successes: int, observations: int) -> float:
-    """An inference-grade rate: never round before computing a delta/test."""
-    if (isinstance(successes, bool) or not isinstance(successes, int)
-            or isinstance(observations, bool) or not isinstance(observations, int)
-            or observations < 1 or successes < 0 or successes > observations):
-        raise ValueError("rate counts must satisfy 0 <= successes <= observations")
-    return successes / observations
-
-
 def sign_flip_significance(deltas: list[float], *, max_exact_n: int = 14, samples: int = 4096) -> dict[str, Any]:
-    """Two-sided sign-flip permutation test over per-case paired deltas
-    (roadmap 2.2): under H0 (the skill does nothing) each case's delta is a
-    coin-flip of sign, so p = share of sign patterns whose |mean| reaches the
-    observed |mean|. Exact enumeration up to max_exact_n cases, then a SEEDED
-    sample — deterministic, so re-grading stays byte-identical (CF.3)."""
-    n = len(deltas)
-    if n == 0:
-        return {"method": "sign-flip", "n": 0, "observed_mean_delta": None,
-                "p_value": None, "p_value_upper_bound": None,
-                "significant_at_0_05": False}
-    observed = statistics.mean(deltas)
-    if all(abs(d) < 1e-12 for d in deltas):
-        return {"method": "sign-flip", "n": n, "observed_mean_delta": 0.0,
-                "p_value": 1.0, "p_value_upper_bound": 1.0,
-                "significant_at_0_05": False}
-    target = abs(observed) - 1e-12
-    if n <= max_exact_n:
-        total = 1 << n
-        hits = 0
-        for mask in range(total):
-            s = sum(-d if (mask >> i) & 1 else d for i, d in enumerate(deltas))
-            if abs(s / n) >= target:
-                hits += 1
-        method = "sign-flip-exact"
-        # Exact enumeration counts the observed sign pattern itself, so p is never 0.
-        p = hits / total
-        p_upper = p
-    else:
-        rng = random.Random(0)
-        hits = 0
-        # The null distribution depends on magnitudes, not input ordering or
-        # original signs. Canonicalizing makes the seeded approximation
-        # permutation-invariant.
-        magnitudes = sorted(abs(float(delta)) for delta in deltas)
-        for _ in range(samples):
-            s = sum(-delta if rng.random() < 0.5 else delta
-                    for delta in magnitudes)
-            if abs(s / n) >= target:
-                hits += 1
-        method = "sign-flip-sampled"
-        # Monte-Carlo permutation p uses the (b+1)/(m+1) estimator: the observed
-        # pattern is one valid permutation under H0, so a sampled p is never a
-        # (statistically impossible) exact 0.
-        p = (hits + 1) / (samples + 1)
-        p_upper = _monte_carlo_upper_bound(hits, samples)
-    return {"method": method, "n": n, "observed_mean_delta": observed,
-            "p_value": p, "p_value_upper_bound": p_upper,
-            "significant_at_0_05": p_upper <= 0.05}
-
-
-def two_sample_permutation_significance(a: list[float], b: list[float], *, max_exact_total: int = 18, samples: int = 4096) -> dict[str, Any]:
-    """Two-sided label-shuffle permutation test on the difference of means of two
-    UNPAIRED groups (roadmap: the ablation confirmation gate). `a` is the with_skill
-    per-run scores, `b` the ablation arm's; under H0 (removing the component does
-    nothing) the arm label is exchangeable, so p = share of relabelings whose
-    |mean(a')-mean(b')| reaches the observed gap. This is the right unit for the
-    n-per-arm replication the walkthrough leaned on: with one run per arm the only
-    two relabelings tie, so p=1.0 and a single-shot ablation can never confirm.
-    Exact enumeration while the combered space is small, else a SEEDED sample so a
-    re-grade stays byte-identical (CF.3)."""
-    na, nb = len(a), len(b)
-    if na == 0 or nb == 0:
-        return {"method": "two-sample-permutation", "n_a": na, "n_b": nb,
-                "observed_delta": None, "p_value": None,
-                "p_value_upper_bound": None, "significant_at_0_05": False}
-    observed = statistics.mean(a) - statistics.mean(b)
-    pool = sorted(float(value) for value in list(a) + list(b))
-    total_n = na + nb
-    if all(abs(x - pool[0]) < 1e-12 for x in pool):
-        return {"method": "two-sample-permutation", "n_a": na, "n_b": nb,
-                "observed_delta": 0.0, "p_value": 1.0,
-                "p_value_upper_bound": 1.0, "significant_at_0_05": False}
-    target = abs(observed) - 1e-12
-    total_sum = sum(pool)
-    def delta_for(idx_a: Iterable[int]) -> float:
-        sa = sum(pool[i] for i in idx_a)
-        mean_a = sa / na
-        mean_b = (total_sum - sa) / nb
-        return mean_a - mean_b
-    if math.comb(total_n, na) <= max(1, max_exact_total ** 2) and total_n <= max_exact_total:
-        hits = 0
-        combos = 0
-        for combo in _combinations(list(range(total_n)), na):
-            combos += 1
-            if abs(delta_for(combo)) >= target:
-                hits += 1
-        method = "two-sample-permutation-exact"
-        p = hits / combos
-        p_upper = p
-    else:
-        rng = random.Random(0)
-        idx = list(range(total_n))
-        hits = 0
-        for _ in range(samples):
-            rng.shuffle(idx)
-            if abs(delta_for(idx[:na])) >= target:
-                hits += 1
-        method = "two-sample-permutation-sampled"
-        # (b+1)/(m+1) Monte-Carlo estimator: the observed labeling is itself a
-        # valid permutation, so a sampled p is never an impossible exact 0.
-        p = (hits + 1) / (samples + 1)
-        p_upper = _monte_carlo_upper_bound(hits, samples)
-    return {"method": method, "n_a": na, "n_b": nb,
-            "observed_delta": observed, "p_value": p,
-            "p_value_upper_bound": p_upper,
-            "significant_at_0_05": p_upper <= 0.05}
+    """The paired lift test (roadmap 2.2). ``effect_estimates`` owns it so the
+    lift interval inverts the very test reported here."""
+    return sign_flip_test(deltas, max_exact_n=max_exact_n, samples=samples)
 
 
 @_dataclass(frozen=True)
@@ -14783,9 +15130,10 @@ def _validated_trigger_protocol(
                     f"{label} matrix protocol adapter {agent!r} must use "
                     f"{known_implementation}, got {implementation}")
             known_requirements = {
-                "claude": {"config_isolated": True},
+                "claude": {"config_isolated": True,
+                           "claude_config_outside_workdir": True},
                 "codex": {"codex_home_outside_workdir": True},
-                "pi": {"config_isolated": True},
+                "pi": {"config_isolated": True, "pi_home_outside_workdir": True},
                 "stub": {},
                 "vibe": {"config_isolated": True,
                          "vibe_home_outside_workdir": True},
@@ -14808,34 +15156,8 @@ def _validated_trigger_protocol(
                 if pair in configured_pairs:
                     die(f"{label} matrix protocol duplicates agent/model {pair!r}")
                 configured_pairs.add(pair)
-    elif producer == "skill-pi-trigger-eval":
-        model = protocol.get("model")
-        required = protocol.get("required_observations")
-        required_mapping = (
-            string_keyed_dict(
-                required, f"{label} Pi protocol required_observations")
-            if isinstance(required, dict) else None
-        )
-        if (protocol.get("adapter") != "pi"
-                or (model is not None and (not isinstance(model, str) or not model.strip()))
-                or not isinstance(protocol.get("command"), dict)
-                or not isinstance(protocol.get("producer_sha256"), str)
-                or re.fullmatch(
-                    r"sha256:[0-9a-f]{64}", protocol.get("producer_sha256", "")) is None
-                or required_mapping is None
-                or any(not isinstance(key, str) or type(value) is not bool
-                       for key, value in required_mapping.items())):
-            die(f"{label} Pi trigger protocol is malformed")
-        configured_pairs.add(("pi", model))
-        if required_mapping != {"config_isolated": True}:
-            die(
-                f"{label} Pi trigger protocol must require config_isolated=true")
-        requirements["pi"] = {
-            key: value for key, value in required_mapping.items()
-            if type(value) is bool
-        }
     else:
-        die(f"{label} protocol producer must be skill-trigger-matrix or skill-pi-trigger-eval")
+        die(f"{label} protocol producer must be skill-trigger-matrix")
     if configured_pairs != design_pairs:
         die(
             f"{label} protocol agent/model design disagrees with its report: "
@@ -15047,7 +15369,7 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
         if prov.id != ablation.get("ablation"):
             reasons.append(
                 f"ablation report id {ablation.get('ablation')!r} does not match provenance id {prov.id!r}")
-        if prov.population is not Population.TRIGGER:
+        if prov.population is not CasePopulation.TRIGGER:
             reasons.append("ablation provenance is not trigger-population")
         if base_hash and prov.identity.canonical != base_hash:
             reasons.append("ablation parent_skill_hash does not match the baseline skill_tree_hash: "
@@ -15189,7 +15511,7 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
     elif query_units and aggregate_regression and not significant_drop:
         note = (f"regression observed but not significant across queries "
                 f"(p={significance.get('p_value')}, mean delta={significance.get('observed_mean_delta')}); "
-                f">= 6 consistently regressed queries are needed to confirm")
+                f"{minimum_units_note(InferenceUnit.QUERY)}")
     elif not query_units:
         note = "no comparable (agent, model, query) pair has complete observations on both sides"
     elif regressed and not aggregate_regression:
@@ -15224,26 +15546,6 @@ def trigger_compare(args: argparse.Namespace) -> int:
     report = build_trigger_comparison(load_json(Path(args.baseline)), load_json(Path(args.ablation)))
     emit_report(report, getattr(args, "out", None))
     return 0
-
-
-def _combinations(items: list[int], r: int) -> Iterable[tuple[int, ...]]:
-    # Local, dependency-free itertools.combinations (kept explicit so the grade
-    # path's imports stay the audited leaf set).
-    n = len(items)
-    if r > n:
-        return
-    idx = list(range(r))
-    yield tuple(items[i] for i in idx)
-    while True:
-        for i in reversed(range(r)):
-            if idx[i] != i + n - r:
-                break
-        else:
-            return
-        idx[i] += 1
-        for j in range(i + 1, r):
-            idx[j] = idx[j - 1] + 1
-        yield tuple(items[i] for i in idx)
 
 
 def pass_at_k(n: int, c: int, k: int) -> float | None:
@@ -15341,7 +15643,9 @@ def build_reliability(results: list[dict[str, Any]]) -> dict[str, Any]:
     return {"by_case_variant": by_case_variant, "by_variant": by_variant_summary}
 
 
-def _metric_pair_construction(results: list[dict[str, Any]], key: str) -> _ResultPairConstruction:
+def _metric_pair_construction(results: list[dict[str, Any]], key: str, *,
+                              contrast: pair_domain.ContrastSpec = pair_domain.SKILL_PRESENCE_CONTRAST,
+                              ) -> _ResultPairConstruction:
     def eligibility(row: Mapping[str, Any]) -> tuple[bool, str | None]:
         if not scorable_run(row):
             return False, "unscorable_arm"
@@ -15351,16 +15655,26 @@ def _metric_pair_construction(results: list[dict[str, Any]], key: str) -> _Resul
         if key in {"objective_pass_rate", "combined_pass_rate", "graded_score"} and not 0 <= float(value) <= 1:
             return False, f"invalid_{key}"
         return True, None
+
+    def no_objective_assertions(row: Mapping[str, Any]) -> bool:
+        # A case gated only by judges has no objective rate in either arm: it
+        # is out of scope for the objective pairing, not a missing value.
+        return scorable_run(row) and row.get("objective_total") == 0
     return pair_domain.pairs_from_rows(
         results,
         population=pair_domain.ExperimentalPopulation.ANSWER,
         eligibility=eligibility,
+        contrast=contrast,
+        not_applicable=no_objective_assertions if key == "objective_pass_rate" else None,
     )
 
 
-def paired_case_rates(results: list[dict[str, Any]], *, key: str = "objective_pass_rate") -> tuple[list[float], list[float], list[dict[str, Any]]]:
-    """Per-case rates computed only from validated repetition-level pairs."""
-    construction = _metric_pair_construction(results, key)
+def paired_case_rates(results: list[dict[str, Any]], *, key: str = "objective_pass_rate",
+                      contrast: pair_domain.ContrastSpec = pair_domain.SKILL_PRESENCE_CONTRAST,
+                      ) -> tuple[list[float], list[float], list[dict[str, Any]]]:
+    """Per-case treatment and control rates from validated repetition-level
+    pairs under ``contrast`` (skill presence unless another is named)."""
+    construction = _metric_pair_construction(results, key, contrast=contrast)
     grouped: dict[str, list[_ResultPair]] = collections.defaultdict(list)
     for pair in construction.pairs:
         grouped[pair.key.case_id].append(pair)
@@ -15368,30 +15682,13 @@ def paired_case_rates(results: list[dict[str, Any]], *, key: str = "objective_pa
     paired_without_rates: list[float] = []
     negative_cases: list[dict[str, Any]] = []
     for case_id, pairs in sorted(grouped.items()):
-        w = statistics.mean(float(pair.with_skill.payload[key]) for pair in pairs)
-        n = statistics.mean(float(pair.without_skill.payload[key]) for pair in pairs)
+        w = statistics.mean(float(pair.treatment.payload[key]) for pair in pairs)
+        n = statistics.mean(float(pair.control.payload[key]) for pair in pairs)
         paired_with_rates.append(w)
         paired_without_rates.append(n)
         if w < n:
             negative_cases.append({"case_id": case_id, "with_skill": w, "without_skill": n, "delta": w - n})
     return paired_with_rates, paired_without_rates, negative_cases
-
-
-def _reliability_counts(rows: list[dict[str, Any]]) -> tuple[int, int]:
-    """(n, c) for one arm: n = scorable runs carrying an objective pass rate,
-    c = runs where every objective assertion passed. Identical predicate to
-    build_reliability (:build_reliability) so the paired counts line up with the
-    per-arm block above them."""
-    rates: list[float] = []
-    for row in rows:
-        value = row.get("objective_pass_rate")
-        if value is None:
-            continue
-        if (isinstance(value, bool) or not isinstance(value, (int, float))
-                or not math.isfinite(float(value)) or not 0 <= float(value) <= 1):
-            raise ValueError("objective_pass_rate must be a finite number in [0, 1]")
-        rates.append(float(value))
-    return len(rates), sum(1 for x in rates if x >= 1.0 - 1e-12)
 
 
 def paired_case_counts(results: list[dict[str, Any]]) -> list[tuple[str, tuple[int, int], tuple[int, int]]]:
@@ -15409,7 +15706,8 @@ def paired_case_counts(results: list[dict[str, Any]]) -> list[tuple[str, tuple[i
     return pairs
 
 
-def paired_block_from_rates(paired_with_rates: list[float], paired_without_rates: list[float], negative_cases: list[dict[str, Any]]) -> dict[str, Any]:
+def paired_block_from_rates(paired_with_rates: list[float], paired_without_rates: list[float], negative_cases: list[dict[str, Any]],
+                            *, min_lift: float | None = None) -> dict[str, Any]:
     with_rate = statistics.mean(paired_with_rates) if paired_with_rates else None
     without_rate = statistics.mean(paired_without_rates) if paired_without_rates else None
     absolute_delta = None
@@ -15419,14 +15717,18 @@ def paired_block_from_rates(paired_with_rates: list[float], paired_without_rates
         if with_rate >= without_rate and without_rate < 1:
             normalized_gain = (with_rate - without_rate) / (1 - without_rate)
     deltas = [w - n for w, n in zip(paired_with_rates, paired_without_rates)]
+    # Lift is tested, not eyeballed (roadmap 2.2). One Estimate yields the
+    # sign-flip test over the per-(case, model) deltas, the interval that
+    # inverts it, and the noise check (could this eval have shown a lift at
+    # all?), each labelled with the unit the test counts.
+    estimate = Estimate.from_deltas(deltas, unit=InferenceUnit.CASE,
+                                    without_rates=paired_without_rates, min_lift=min_lift)
     return {
         "with_skill_objective_pass_rate": with_rate,
         "without_skill_objective_pass_rate": without_rate,
         "absolute_delta": absolute_delta,
         "normalized_gain": normalized_gain,
-        # Lift is tested, not eyeballed (roadmap 2.2): the sign-flip permutation
-        # p-value over the per-(case, model) deltas rides beside the raw delta.
-        "significance": sign_flip_significance(deltas),
+        **estimate.blocks(),
         "negative_delta_cases": negative_cases,
     }
 
@@ -15437,27 +15739,90 @@ PAIR_HEADLINE_FIELDS = (
 )
 
 
+EDIT_HEADLINE_FIELDS = (
+    "current_objective_pass_rate", "previous_objective_pass_rate", "delta",
+)
+
+
+def withhold_paired_headline(block: dict[str, Any], reason: str, *,
+                             headline_fields: tuple[str, ...] = PAIR_HEADLINE_FIELDS) -> dict[str, Any]:
+    """Move a paired block's headline, significance, interval and noise check
+    under ``observed_*`` and mark the block partial for ``reason``."""
+    out = dict(block)
+    out["availability"] = "partial"
+    for key in headline_fields:
+        out[f"observed_{key}"] = out.get(key)
+        out[key] = None
+    out["observed_significance"] = out.get("significance")
+    out["significance"] = {
+        "method": "unavailable", "n": 0, "p_value": None,
+        "significant_at_0_05": False, "reason": reason,
+    }
+    for key in ("interval", "noise_check"):
+        if key in out:
+            out[f"observed_{key}"] = out[key]
+            out[key] = {"availability": "unavailable", "reason": reason}
+    return out
+
+
 def pairing_aware_block(block: dict[str, Any],
-                        construction: _ResultPairConstruction) -> dict[str, Any]:
+                        construction: _ResultPairConstruction, *,
+                        headline_fields: tuple[str, ...] = PAIR_HEADLINE_FIELDS) -> dict[str, Any]:
     """Make subset-only lift explicitly diagnostic when any identity is blocked."""
     out = dict(block)
     out["pairing"] = construction.diagnostics()
     if not construction.blocked:
         out["availability"] = "complete"
         return out
-    out["availability"] = "partial"
-    for key in PAIR_HEADLINE_FIELDS:
-        out[f"observed_{key}"] = out.get(key)
-        out[key] = None
-    out["observed_significance"] = out.get("significance")
-    out["significance"] = {
-        "method": "unavailable", "n": 0, "p_value": None,
-        "significant_at_0_05": False, "reason": "incomplete_pairing",
+    return withhold_paired_headline(out, "incomplete_pairing", headline_fields=headline_fields)
+
+
+def paired_edit_summary(results: list[dict[str, Any]], *, min_lift: float | None = None) -> dict[str, Any] | None:
+    """The current skill against the revision it replaces, paired within one run.
+
+    Comparing iteration N with N+1 across two runs mixes the edit with
+    everything else that changed between them (CLI version, provider, cache).
+    An old_skill arm in the same run pairs case by case under EDIT_CONTRAST,
+    with effort held fixed, so the delta is the edit's. Pairs are per (case,
+    model), pooled as paired_summary pools them. Returns None when the run has
+    no old_skill arm.
+    """
+    contrast = pair_domain.EDIT_CONTRAST
+    if not any(row.get("variant") == contrast.control_arm for row in results):
+        return None
+    models = sorted({str(r.get("model")) for r in results if r.get("model")})
+    unlabeled = [r for r in results if not r.get("model")]
+    pools: list[tuple[str | None, list[dict[str, Any]]]] = [
+        (model, [r for r in results if str(r.get("model")) == model]) for model in models]
+    if unlabeled or not models:
+        pools.append((None, unlabeled if models else results))
+    current: list[float] = []
+    previous: list[float] = []
+    regressed: list[dict[str, Any]] = []
+    for model, rows in pools:
+        w, n, neg = paired_case_rates(rows, contrast=contrast)
+        current.extend(w)
+        previous.extend(n)
+        for item in neg:
+            entry = {"case_id": item["case_id"], "current": item["with_skill"],
+                     "previous": item["without_skill"], "delta": item["delta"]}
+            regressed.append({**entry, "model": model} if model else entry)
+    deltas = [w - n for w, n in zip(current, previous)]
+    block = {
+        "contrast_id": contrast.contrast_id,
+        "current_objective_pass_rate": statistics.mean(current) if current else None,
+        "previous_objective_pass_rate": statistics.mean(previous) if previous else None,
+        "delta": statistics.mean(deltas) if deltas else None,
+        **Estimate.from_deltas(deltas, unit=InferenceUnit.CASE,
+                               without_rates=previous, min_lift=min_lift).blocks(),
+        "regressed_cases": regressed,
     }
-    return out
+    return pairing_aware_block(
+        block, _metric_pair_construction(results, "objective_pass_rate", contrast=contrast),
+        headline_fields=EDIT_HEADLINE_FIELDS)
 
 
-def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+def build_paired_summary(results: list[dict[str, Any]], *, min_lift: float | None = None) -> dict[str, Any]:
     # The pairing key is (case, model) — roadmap 2.1. Each model's rows pair
     # with_skill against without_skill within that model only; the headline
     # block pools the per-(case, model) pairs, and by_model carries each
@@ -15478,7 +15843,7 @@ def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         all_without.extend(n)
         all_negative.extend({**item, "model": model} for item in neg)
         by_model[model] = pairing_aware_block(
-            paired_block_from_rates(w, n, neg),
+            paired_block_from_rates(w, n, neg, min_lift=min_lift),
             _metric_pair_construction(rows, "objective_pass_rate"))
         gw, gn, _ = paired_case_rates(rows, key="graded_score")
         graded_with.extend(gw)
@@ -15493,7 +15858,7 @@ def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         graded_with.extend(gw)
         graded_without.extend(gn)
     out = pairing_aware_block(
-        paired_block_from_rates(all_with, all_without, all_negative),
+        paired_block_from_rates(all_with, all_without, all_negative, min_lift=min_lift),
         _metric_pair_construction(results, "objective_pass_rate"))
     if graded_with:
         # The graded channel (roadmap 2.2): how much better, after the binary
@@ -15504,7 +15869,7 @@ def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
             "with_skill_mean_score": round(statistics.mean(graded_with), 4),
             "without_skill_mean_score": round(statistics.mean(graded_without), 4),
             "delta": round(statistics.mean(graded_deltas), 4),
-            "significance": sign_flip_significance(graded_deltas),
+            **Estimate.from_deltas(graded_deltas, unit=InferenceUnit.CASE).blocks(),
         }
         graded_construction = _metric_pair_construction(results, "graded_score")
         if graded_construction.blocked:
@@ -15514,6 +15879,13 @@ def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         else:
             out["graded"] = {"availability": "complete", **graded,
                              "pairing": graded_construction.diagnostics()}
+    elif any(isinstance(r.get("graded_score"), (int, float)) and not isinstance(r.get("graded_score"), bool)
+             for r in results):
+        # Graded scores were recorded but no pair could use them (a judge that
+        # answered outside 0-1, say): report the channel as partial and why,
+        # rather than drop it from a report that reads complete.
+        out["graded"] = {"availability": "partial", "delta": None,
+                         "pairing": _metric_pair_construction(results, "graded_score").diagnostics()}
     if by_model:
         out["by_model"] = by_model
     return out
@@ -15559,7 +15931,8 @@ def paired_reliability_block(pairs: list[tuple[str, tuple[int, int], tuple[int, 
         # so each k averages only over the cases that support it.
         "mean_pass_at_k_delta": {str(k): round(statistics.mean(v), 6) for k, v in sorted(at_k_pool.items())},
         "mean_pass_hat_k_delta": {str(k): round(statistics.mean(v), 6) for k, v in sorted(hat_k_pool.items())},
-        "significance": sign_flip_significance(pass_at_1_deltas),
+        "significance": Estimate.from_deltas(
+            pass_at_1_deltas, unit=InferenceUnit.CASE).blocks()["significance"],
     }
     return {"by_case": by_case, "pooled": pooled}
 
@@ -15913,7 +16286,7 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
         expected_prov = ExpectedProvenance(
             id=aid,
             mode=AblationMode.INVALID_SKILL if invalid else AblationMode.MATERIALIZED,
-            population=Population(expected_pop),
+            population=CasePopulation(expected_pop),
             components=tuple(_expected_component(c, manifest.get("skill_paths", [])) for c in ablation_components(ablation)),
         )
         prov_ok, prov_note = _verify_recorded_ablation_provenance(
@@ -15922,13 +16295,12 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
         if not prov_ok:
             entry["provenance_note"] = prov_note
 
-        # Causal ablation evidence uses exact case/model/repetition pairs. The
-        # ablation arm is adapted to the pair constructor's treatment slot only
-        # for identity construction; payloads retain their original variant.
-        ablation_pair_rows = [r for r in results if r.get("variant") == "with_skill"] + [
-            {**r, "variant": "without_skill", "_ablation_variant": variant}
-            for r in results if r.get("variant") == variant
-        ]
+        # Causal ablation evidence uses exact case/model/repetition pairs under
+        # the ablation's own contrast: the full skill against the skill with
+        # this component removed, holding effort fixed. A missing arm is named
+        # as the ablation arm, not as a missing without_skill arm.
+        contrast = pair_domain.ablation_contrast(variant)
+        ablation_pair_rows = [r for r in results if r.get("variant") in {"with_skill", variant}]
         def ablation_eligibility(row: Mapping[str, Any]) -> tuple[bool, str | None]:
             if not scorable_run(row):
                 return False, "unscorable_arm"
@@ -15943,6 +16315,7 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
         ablation_pairing = pair_domain.pairs_from_rows(
             ablation_pair_rows,
             population=pair_domain.ExperimentalPopulation.ANSWER,
+            contrast=contrast,
             eligibility=ablation_eligibility,
         )
         pairs_by_case_model: dict[tuple[str, str | None], list[_ResultPair]] = collections.defaultdict(list)
@@ -15958,8 +16331,8 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
         def paired_assertion_rates(pairs: list[_ResultPair], name: str) -> tuple[float | None, float | None, int]:
             observations = []
             for pair in pairs:
-                left = assertion_value(pair.with_skill.payload, name)
-                right = assertion_value(pair.without_skill.payload, name)
+                left = assertion_value(pair.treatment.payload, name)
+                right = assertion_value(pair.control.payload, name)
                 if left is not None and right is not None:
                     observations.append((left, right))
             if not observations:
@@ -15971,8 +16344,8 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
         def paired_combined_deltas(pairs: list[_ResultPair]) -> list[float]:
             deltas = []
             for pair in pairs:
-                left = pair.with_skill.payload.get("combined_pass_rate", pair.with_skill.payload.get("objective_pass_rate"))
-                right = pair.without_skill.payload.get("combined_pass_rate", pair.without_skill.payload.get("objective_pass_rate"))
+                left = pair.treatment.payload.get("combined_pass_rate", pair.treatment.payload.get("objective_pass_rate"))
+                right = pair.control.payload.get("combined_pass_rate", pair.control.payload.get("objective_pass_rate"))
                 if (isinstance(left, (int, float)) and not isinstance(left, bool)
                         and isinstance(right, (int, float)) and not isinstance(right, bool)
                         and math.isfinite(float(left)) and math.isfinite(float(right))
@@ -16034,9 +16407,12 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
             for cid, cohort_model in confirmed_cohorts:
                 matched = pairs_by_case_model[(cid, cohort_model)]
                 label = cid if cohort_model is None else f"{cid}@{cohort_model}"
-                per_case_sig[label] = sign_flip_significance(paired_combined_deltas(matched))
+                per_case_sig[label] = Estimate.from_deltas(
+                    paired_combined_deltas(matched),
+                    unit=InferenceUnit.REPLICATE_PAIR).blocks()["significance"]
             significance = {
                 "method": "per-case-model-paired-sign-flip",
+                "unit": InferenceUnit.REPLICATE_PAIR.value,
                 "significant_at_0_05": any(s.get("significant_at_0_05") for s in per_case_sig.values()),
                 "min_p_value": min((s["p_value"] for s in per_case_sig.values() if s.get("p_value") is not None), default=None),
                 "by_case": per_case_sig,
@@ -16078,7 +16454,7 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
                 )
                 if prov_ok and has_coverage and regression_observed and not significant:
                     p = (significance or {}).get("min_p_value")
-                    reg["note"] = f"regression observed but not significant per case across replicates (min p={p}); a case needs >= 6 matched pairs to confirm"
+                    reg["note"] = f"regression observed but not significant per case across replicates (min p={p}); {minimum_units_note(InferenceUnit.REPLICATE_PAIR)}"
                 elif not prov_ok:
                     reg["note"] = f"provenance unverified: {prov_note}"
                 elif assertion_coverage_gaps:
@@ -16467,24 +16843,6 @@ def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str
     return out
 
 
-def judge_cost_usd(row: dict[str, Any]) -> float | None:
-    """One reading of a judge verdict's dollar cost, preferring the normalized
-    block. Both cost ledgers (build_cost_summary and suite_cost_ledger) route
-    through here — they previously read different fields, so a verdict whose
-    spend lived only in cost_normalized counted in one ledger and not the other."""
-    block = row.get("cost_normalized")
-    if isinstance(block, dict) and isinstance(block.get("total_cost"), (int, float)):
-        return float(block["total_cost"])
-    if isinstance(row.get("cost_usd"), (int, float)):
-        return float(row["cost_usd"])
-    aggregate = row.get("cost_aggregate")
-    usd = aggregate.get("USD") if isinstance(aggregate, dict) else None
-    if (isinstance(usd, dict) and usd.get("availability") == telemetry_domain.COMPLETE
-            and isinstance(usd.get("value"), (int, float))):
-        return float(usd["value"])
-    return None
-
-
 def judge_cost_block(judge_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     def leaves(row: dict[str, Any]) -> list[dict[str, Any]]:
         for key in ("judge_panel", "judge_runs"):
@@ -16865,17 +17223,19 @@ def answer_design_coverage(
     }
 
 
-def invalidate_report_pairing(block: dict[str, Any], reason: str) -> dict[str, Any]:
+def invalidate_report_pairing(block: dict[str, Any], reason: str, *,
+                              headline_fields: tuple[str, ...] = PAIR_HEADLINE_FIELDS) -> dict[str, Any]:
+    """Withhold a paired block, its per-model blocks and its graded channel
+    when the report as a whole is incomplete for ``reason``."""
     out = dict(block)
     if out.get("availability") != "partial":
-        for key in PAIR_HEADLINE_FIELDS:
-            out[f"observed_{key}"] = out.get(key)
-            out[key] = None
-        out["observed_significance"] = out.get("significance")
-        out["significance"] = {"method": "unavailable", "n": 0,
-                               "p_value": None, "significant_at_0_05": False,
-                               "reason": reason}
-    out["availability"] = "partial"
+        out = withhold_paired_headline(out, reason, headline_fields=headline_fields)
+    graded = out.get("graded")
+    if isinstance(graded, dict) and graded.get("availability") == "complete":
+        out["observed_graded"] = {key: value for key, value in graded.items()
+                                  if key not in {"availability", "pairing"}}
+        out["graded"] = {"availability": "partial", "delta": None, "reason": reason,
+                         "pairing": graded.get("pairing")}
     out["design_coverage_reason"] = reason
     if isinstance(out.get("by_model"), dict):
         out["by_model"] = {model: invalidate_report_pairing(value, reason)
@@ -17020,6 +17380,23 @@ def build_trajectory_diff(results: list[dict[str, Any]]) -> dict[str, Any]:
     return observed
 
 
+def add_grading_options(parser: argparse.ArgumentParser) -> None:
+    """The options that change how runs are graded. Every command that grades
+    or rebuilds a benchmark takes the same set, so an aggregate or an export
+    can reproduce exactly the benchmark it summarizes."""
+    parser.add_argument("--judge-results", help="judge verdicts keyed by judge_task_id (JSONL/JSON); merges qualitative scoring")
+    parser.add_argument("--allow-scripts", action="store_true", help="execute script assertions from the manifest")
+    parser.add_argument("--strict", action="store_true", help="grading option, not a gate: promote soft-severity assertions to gates (roadmap 2.2)")
+    parser.add_argument("--embed-cmd", help="external embedding command enabling similarity mode=embedding (opt-in; stdin {texts:[a,b]} -> stdout {embeddings:[[..],[..]]})")
+
+
+def grading_options(args: argparse.Namespace) -> dict[str, Any]:
+    """The grading keyword arguments for build_benchmark_report from parsed options."""
+    return {"allow_scripts": bool(getattr(args, "allow_scripts", False)),
+            "strict": bool(getattr(args, "strict", False)),
+            "embed_cmd": getattr(args, "embed_cmd", None)}
+
+
 def build_benchmark_report(
     path: Path,
     runs: Path,
@@ -17029,6 +17406,7 @@ def build_benchmark_report(
     allow_scripts: bool = False,
     strict: bool = False,
     embed_cmd: str | None = None,
+    min_lift: float | None = None,
 ) -> dict[str, Any]:
     manifest = validate_manifest(path)
     variants = variants_arg or manifest.get("variants", DEFAULT_VARIANTS)
@@ -17079,40 +17457,63 @@ def build_benchmark_report(
         case_rows = everything.where(case_id=cid).all
         by_var_case = ResultSet(case_rows).by_variant()
         pairing = _metric_pair_construction(case_rows, "objective_pass_rate")
+        signal = "objective"
+        rate: Callable[[Mapping[str, Any]], float | None] = (
+            lambda row: row.get("objective_pass_rate"))
+        if not pairing.pairs and pairing.not_applicable:
+            # Gated only by judges: no objective rate exists, so every flag
+            # reads the combined score readiness reads, over its pairs.
+            pairing = combined_pair_construction(case_rows)
+            signal, rate = "combined", combined_signal
         if not pairing.pairs:
             continue
         ws_rows = [pair.with_skill.payload for pair in pairing.pairs]
         ns_rows = [pair.without_skill.payload for pair in pairing.pairs]
-        w_rate = statistics.mean(float(r["objective_pass_rate"]) for r in ws_rows)
-        n_rate = statistics.mean(float(r["objective_pass_rate"]) for r in ns_rows)
+        combined_means = combined_arm_means(pairing.pairs)
+        if signal == "objective":
+            w_rate = statistics.mean(float(r["objective_pass_rate"]) for r in ws_rows)
+            n_rate = statistics.mean(float(r["objective_pass_rate"]) for r in ns_rows)
+        elif combined_means is not None:
+            w_rate, n_rate = combined_means
+        else:
+            continue
         flags = []
-        if w_rate == 1 and n_rate == 1:
-            flags.append("saturated/non-discriminating")
+        extreme = ceiling_or_floor(w_rate, n_rate)
+        if (combined_means is not None
+                and ceiling_or_floor(*combined_means) is DiscriminationFailure.FLOOR):
+            # Both arms fail every scored run, judges included. That is more
+            # often a broken case or assertion than a hard task, so it is
+            # flagged apart from the ceiling and never offered to
+            # suggest-cases for hardening.
+            flags.append(CaseFlag.FLOOR.render())
+        if extreme is DiscriminationFailure.CEILING:
+            flags.append(CaseFlag.SATURATED.render())
             # 2.2: saturation's next move. Objectively perfect but scoring low on
             # the graded channel is competent-but-forgettable work — the report
             # points at graded dimensions instead of stopping at the flag.
             graded_ws = [r["graded_score"] for r in ws_rows if isinstance(r.get("graded_score"), (int, float))]
             if graded_ws and statistics.mean(graded_ws) < FORGETTABLE_GRADED_THRESHOLD:
-                flags.append("structurally-pass-but-forgettable")
+                flags.append(CaseFlag.FORGETTABLE.render())
         if w_rate is not None and n_rate is not None and w_rate <= n_rate:
-            flags.append("no objective lift")
+            flags.append(CaseFlag.NO_OBJECTIVE_LIFT.render())
         if w_rate is not None and w_rate < 1:
-            flags.append("with-skill failure")
+            flags.append(CaseFlag.WITH_SKILL_FAILURE.render())
         for variant, vrows in by_var_case.items():
-            rr = [r["objective_pass_rate"] for r in vrows if r["objective_pass_rate"] is not None]
+            rr = [value for r in vrows if (value := rate(r)) is not None]
             if len(rr) > 1 and len(set(rr)) > 1:
-                flags.append(f"flaky repeated pass rates: {variant}")
+                flags.append(CaseFlag.FLAKY.render(variant))
             # A critical (absorbing-barrier) failure is surfaced on its own,
             # never only inside an averaged rate.
             veto_names = sorted({name for r in vrows if r.get("vetoed") for name in r.get("critical_failures", [])})
             if veto_names:
-                flags.append(f"critical-failure: {variant} ({', '.join(veto_names)})")
+                flags.append(CaseFlag.CRITICAL_FAILURE.render(f"{variant} ({', '.join(veto_names)})"))
         floor_hits = sorted({name for r in ws_rows for name in r.get("below_reference_floor", [])})
         if floor_hits:
-            flags.append(f"below-reference-floor: {', '.join(floor_hits)}")
+            flags.append(CaseFlag.BELOW_REFERENCE_FLOOR.render(', '.join(floor_hits)))
         if flags:
             case_flags.append({"case_id": cid, "flags": flags, "with_skill": w_rate,
-                               "without_skill": n_rate, "pairing": pairing.diagnostics(),
+                               "without_skill": n_rate, "signal": signal,
+                               "pairing": pairing.diagnostics(),
                                "eval_intent": ws_rows[0].get("eval_intent", "capability")})
 
     # 1.7: per case, how much of the pass rate rests on strong oracles. A case
@@ -17141,17 +17542,22 @@ def build_benchmark_report(
     design_coverage = answer_design_coverage(
         runs, results, manifest=manifest, manifest_path=path,
         case_ids=answer_case_ids, variants=variants)
-    paired_summary = build_paired_summary(results)
+    paired_summary = build_paired_summary(results, min_lift=min_lift)
+    # The edit's own effect when the run carries an old_skill arm.
+    edit_summary = paired_edit_summary(results, min_lift=min_lift)
+    pairing_block_reasons = set(paired_summary["pairing"]["blocked_reason_counts"])
     unscorable_results = [row for row in results if not scorable_run(row)]
     grading_blocked_results = [
         row for row in results
         if row.get("grading_availability") != "complete"]
-    if not design_coverage["complete"]:
-        paired_summary = invalidate_report_pairing(
-            paired_summary, "answer_design_incomplete")
-    elif grading_blocked_results:
-        paired_summary = invalidate_report_pairing(
-            paired_summary, "grading_evidence_incomplete")
+    report_pairing_reason = (
+        "answer_design_incomplete" if not design_coverage["complete"]
+        else "grading_evidence_incomplete" if grading_blocked_results else None)
+    if report_pairing_reason is not None:
+        paired_summary = invalidate_report_pairing(paired_summary, report_pairing_reason)
+        if edit_summary is not None:
+            edit_summary = invalidate_report_pairing(
+                edit_summary, report_pairing_reason, headline_fields=EDIT_HEADLINE_FIELDS)
     ablation_regressions = build_ablation_regression_report(manifest, results)
     if not design_coverage["complete"]:
         for entry in ablation_regressions:
@@ -17218,6 +17624,19 @@ def build_benchmark_report(
                     block[key] = None
                 block["availability"] = "partial"
                 block["reason"] = judge_reason
+    # Why the report is partial, one code per root cause; availability is
+    # derived from this list so the two cannot disagree. A pending judge
+    # verdict also leaves its row's grading partial, and an unscorable run
+    # blocks its pair, so those consequences are not listed again; a pair
+    # blocked for any other reason (effort_mismatch) is listed beside them.
+    incomplete_reasons = [reason for reason, present in (
+        ("answer_design_incomplete", not design_coverage["complete"]),
+        ("unscorable_answer_attempts", bool(unscorable_results)),
+        ("deferred_judge_verdicts", bool(deferred_judge_tasks)),
+        ("grading_evidence_incomplete", any(
+            not row.get("deferred_judge_tasks") for row in grading_blocked_results)),
+        ("incomplete_answer_pairing", bool(pairing_block_reasons - {"unscorable_arm"})),
+    ) if present]
     if not design_coverage["complete"]:
         reason = "answer_design_incomplete"
         summary = invalidate_variant_summaries(summary, reason)
@@ -17245,11 +17664,8 @@ def build_benchmark_report(
         # CONFIRMED_CAUSAL is reserved for the per-ablation causal_confirmation
         # door and lives on ablation_regressions, not on a with/without summary.)
         "population": "answer",
-        "availability": (
-            "complete" if (design_coverage["complete"] and not unscorable_results
-                           and not deferred_judge_tasks and not grading_blocked_results
-                           and not pairing_incomplete)
-            else "partial"),
+        "availability": "partial" if incomplete_reasons else "complete",
+        "incomplete_reasons": incomplete_reasons,
         "answer_design": design_coverage,
         "skipped_trigger_cases": skipped_trigger_cases,
         "deferred_judge_tasks": deferred_judge_tasks,
@@ -17260,6 +17676,7 @@ def build_benchmark_report(
         # so a rubric the skill could see never inflates the held-out number.
         "qualitative_by_visibility": qualitative_surface,
         "paired_summary": paired_summary,
+        **({"paired_edit_summary": edit_summary} if edit_summary is not None else {}),
         # 5: pass@k / pass^k per (case, variant) from the repeated-run data, plus a
         # pooled per-variant reliability headline. Uses the unbiased estimator.
         "reliability": reliability,
@@ -17273,6 +17690,9 @@ def build_benchmark_report(
         # ALL runs (failures included), per-variant/case stats, paired cost
         # deltas, ablation marginal cost, and separated judge spend.
         "cost_summary": cost_surface,
+        # How runs ended: refusals, cut-off answers, served-model mismatches
+        # and effort levels, per variant, so a zero can be read correctly.
+        "run_endings": run_endings_block(results),
         "case_flags": case_flags_surface,
         "case_flags_availability": (
             "partial" if observed_case_flags is not None else "complete"),
@@ -17283,7 +17703,7 @@ def build_benchmark_report(
 
 
 def benchmark(args: argparse.Namespace) -> int:
-    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False), strict=getattr(args, "strict", False), embed_cmd=getattr(args, "embed_cmd", None))
+    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), **grading_options(args), min_lift=getattr(args, "min_lift", None))
     emit_report(report, args.out)
     return 0
 
@@ -17372,8 +17792,40 @@ def junit_xml_from_report(report: dict[str, Any]) -> str:
     return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(suite, encoding="unicode")
 
 
+MISSING_CELL = "—"
+
+
 def fmt_rate(value: Any) -> str:
-    return "—" if value is None else f"{float(value):.2f}"
+    return MISSING_CELL if value is None else f"{float(value):.2f}"
+
+
+def md_cell(value: Any) -> str:
+    """One markdown table cell. A missing value reads as MISSING_CELL, a list
+    joins with commas, and a pipe or newline in the value cannot break the row."""
+    if value is None:
+        text = MISSING_CELL
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        text = ", ".join(str(item) for item in value) or MISSING_CELL
+    elif isinstance(value, dict):
+        text = json.dumps(value, sort_keys=True, ensure_ascii=False)
+    else:
+        text = str(value)
+    return " ".join(text.splitlines()).replace("|", "\\|")
+
+
+def md_table(headers: Sequence[str], rows: Iterable[Sequence[Any]], *, align: str = "") -> list[str]:
+    """Markdown table lines. ``align`` gives one letter per column, ``l`` or
+    ``r``; an empty string left-aligns every column."""
+    if align and len(align) != len(headers):
+        raise ValueError(f"align names {len(align)} columns for {len(headers)} headers")
+    rule = "|" + "|".join("---:" if letter == "r" else "---"
+                          for letter in (align or "l" * len(headers))) + "|"
+    lines = ["| " + " | ".join(md_cell(header) for header in headers) + " |", rule]
+    for row in rows:
+        if len(row) != len(headers):
+            raise ValueError(f"table row has {len(row)} cells for {len(headers)} columns")
+        lines.append("| " + " | ".join(md_cell(cell) for cell in row) + " |")
+    return lines
 
 
 def github_summary_from_report(report: dict[str, Any]) -> str:
@@ -17383,18 +17835,10 @@ def github_summary_from_report(report: dict[str, Any]) -> str:
     paired = report.get("paired_summary", {}) or {}
     summary = report.get("summary", {}) or {}
     lines = [f"# Skill eval — {skill}", ""]
-    design = report.get("answer_design") or {}
     if report.get("availability") != "complete":
-        reasons = []
-        if design.get("complete") is not True:
-            reasons.append("answer-design coverage")
-        if report.get("deferred_judge_tasks"):
-            reasons.append("deferred judge verdicts")
-        if any(row.get("grading_availability") != "complete"
-               for row in report.get("results", [])):
-            reasons.append("blocked grading evidence")
-        if any(not scorable_run(row) for row in report.get("results", [])):
-            reasons.append("unscorable attempts")
+        # The report's own root causes, each once (build_benchmark_report owns them).
+        reasons = [incomplete_label(str(reason))
+                   for reason in report.get("incomplete_reasons") or []]
         lines.extend([
             "**Experiment status:** incomplete"
             + (f" ({', '.join(reasons)})" if reasons else ""), "",
@@ -17404,13 +17848,14 @@ def github_summary_from_report(report: dict[str, Any]) -> str:
         f"**Lift (with − without, objective):** {fmt_rate(paired.get('with_skill_objective_pass_rate'))} − "
         f"{fmt_rate(paired.get('without_skill_objective_pass_rate'))} = **{fmt_rate(delta)}**"
     )
-    lines.extend(["", "| variant | cases | runs | mean objective | mean combined | missing | exec errors |", "|---|---|---|---|---|---|---|"])
-    for variant, block in summary.items():
-        lines.append(
-            f"| {variant} | {block.get('cases', 0)} | {block.get('runs', 0)} | "
-            f"{fmt_rate(block.get('mean_objective_pass_rate'))} | {fmt_rate(block.get('mean_combined_pass_rate'))} | "
-            f"{block.get('missing_outputs', 0)} | {block.get('execution_errors', 0)} |"
-        )
+    lines.append("")
+    lines.extend(md_table(
+        ["variant", "cases", "runs", "mean objective", "mean combined", "missing", "exec errors"],
+        [[variant, block.get("cases", 0), block.get("runs", 0),
+          fmt_rate(block.get("mean_objective_pass_rate")),
+          fmt_rate(block.get("mean_combined_pass_rate")),
+          block.get("missing_outputs", 0), block.get("execution_errors", 0)]
+         for variant, block in summary.items()]))
     flags = report.get("case_flags", []) or []
     if not isinstance(flags, list):
         flags = []
@@ -17442,9 +17887,7 @@ def report_command(args: argparse.Namespace) -> int:
     else:
         rendered = github_summary_from_report(report)
     if args.out:
-        out = Path(args.out)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(rendered, encoding="utf-8")
+        emit_text(rendered, args.out)
     else:
         print(rendered, end="")
     return 0
@@ -17458,7 +17901,7 @@ def aggregate(args: argparse.Namespace) -> int:
         runs = Path(args.runs_root) / repo_root.name / args.runs_subdir
         if args.runs:
             runs = Path(args.runs)
-        reports.append(build_benchmark_report(manifest_path, runs, args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False)))
+        reports.append(build_benchmark_report(manifest_path, runs, args.split, args.variant, getattr(args, "judge_results", None), **grading_options(args)))
 
     skill_names = [report.get("skill_name") for report in reports]
     if not all(isinstance(name, str) and name for name in skill_names):
@@ -17656,7 +18099,7 @@ def anthropic_benchmark_from_report(report: dict[str, Any], skill_path: str = ""
 
 
 def export_anthropic(args: argparse.Namespace) -> int:
-    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False))
+    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), **grading_options(args))
     benchmark = anthropic_benchmark_from_report(report, args.skill_path or "")
     emit_report(benchmark, args.out)
     return 0
@@ -17664,6 +18107,14 @@ def export_anthropic(args: argparse.Namespace) -> int:
 
 def comparison_output_sha256(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def comparison_task_id(case_id: str, run_number: int, primary: str, baseline: str,
+                       model: str | None = None) -> str:
+    """The blind comparison's task key; compare-tasks writes it and the truth
+    check recomputes it, so both read this one spelling."""
+    model_segment = f"{model}::" if model else ""
+    return f"{case_id}::{model_segment}run-{run_number}::blind-{primary}-vs-{baseline}"
 
 
 def comparison_task_identity(task: dict[str, Any]) -> dict[str, Any]:
@@ -17726,7 +18177,7 @@ def index_comparison_runs(case_id: str, role: str,
 def comparison_run_artifact(base: Path) -> tuple[str | None, Path, dict[str, Any]]:
     """Read one candidate and enforce the shared scorable-run boundary."""
     text, output_path = read_output_base(base)
-    metadata = read_metadata_base(base)
+    metadata = read_metrics_base(base)
     missing_output = not output_path.is_file() or text is None or not text.strip()
     exec_valid = execution_valid(metadata, None if missing_output else text)
     if not scorable_run({
@@ -17887,10 +18338,8 @@ def compare_tasks(args: argparse.Namespace) -> int:
                     ("baseline", args.baseline, model, run_number, b_out),
                 ]
                 rng.shuffle(sides)
-                model_segment = f"{model}::" if model else ""
-                task_id = (
-                    f"{case['id']}::{model_segment}run-{run_number}::"
-                    f"blind-{args.primary}-vs-{args.baseline}")
+                task_id = comparison_task_id(
+                    case["id"], run_number, args.primary, args.baseline, model)
                 if task_id in task_ids:
                     die(f"duplicate comparison task identity {task_id!r}")
                 result_schema = {
@@ -17970,9 +18419,7 @@ def compare_tasks(args: argparse.Namespace) -> int:
     for task in tasks:
         task["comparison_design_sha256"] = design_sha256
     if args.out:
-        out = Path(args.out)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text("".join(json.dumps(t, ensure_ascii=False) + "\n" for t in tasks), encoding="utf-8")
+        emit_text("".join(json.dumps(t, ensure_ascii=False) + "\n" for t in tasks), args.out)
     else:
         for t in tasks:
             print(json.dumps(t, ensure_ascii=False))
@@ -18183,10 +18630,9 @@ def load_comparison_truth(path: Path) -> dict[str, dict[str, Any]]:
         if sides["A"]["run_number"] != run_number:
             die(f"comparison truth row {position} ({task_id}): side run identity disagrees with task")
         by_role = {sides[label]["role"]: sides[label] for label in ("A", "B")}
-        model_segment = f"{model}::" if model else ""
-        expected_task_id = (
-            f"{case_id}::{model_segment}run-{run_number}::"
-            f"blind-{by_role['primary']['variant']}-vs-{by_role['baseline']['variant']}")
+        expected_task_id = comparison_task_id(
+            case_id, run_number, by_role["primary"]["variant"],
+            by_role["baseline"]["variant"], model)
         if task_id != expected_task_id:
             die(f"comparison truth row {position} ({task_id}): task id disagrees with its identity")
         truth_sha256 = row.get("comparison_truth_sha256")
@@ -18354,22 +18800,32 @@ def benchmark_report_diff(previous: dict[str, Any], current: dict[str, Any]) -> 
     return {"availability": "complete", **observed}
 
 
+def read_feedback_store(path: Path) -> FeedbackStore:
+    """The feedback.json store (empty when absent). Legacy entries that no
+    longer validate are kept verbatim as unparsed, never silently dropped."""
+    if not path.is_file():
+        return FeedbackStore((), ())
+    loaded = strict_json_loads(path.read_text(encoding="utf-8"))
+    if not is_feedback_document(loaded):
+        raise ValueError(f"{path} is not a feedback document with an entries list")
+    assert isinstance(loaded, dict)
+    return FeedbackStore.from_document(loaded)
+
+
+def read_feedback(path: Path) -> list[HumanJudgement]:
+    """Every usable human judgement stored in one feedback.json."""
+    return list(read_feedback_store(path).judgements)
+
+
 def persist_feedback(workspace: Path, entry: dict[str, Any]) -> Path:
-    """Feedback capture (roadmap 2.8, eval-viewer's feedback.json): entries are
-    keyed by case/model/variant/run — a re-submission replaces its prior entry."""
+    """Feedback capture (roadmap 2.8, eval-viewer's feedback.json): the ONE
+    store for human judgements. Each new entry is validated as a
+    HumanJudgement; a re-submission for the same run and assertion replaces
+    its prior entry. judge-alignment reads this file directly, so a verdict is
+    written once."""
     path = workspace / "feedback.json"
-    doc = {"entries": []}
-    if path.is_file():
-        loaded = strict_json_loads(path.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict) and isinstance(loaded.get("entries"), list):
-            doc = loaded
-    key = (entry.get("case_id"), entry.get("model"), entry.get("variant"),
-           entry.get("run_number", 1))
-    doc["entries"] = [e for e in doc["entries"] if (
-        e.get("case_id"), e.get("model"), e.get("variant"),
-        e.get("run_number", 1)) != key]
-    doc["entries"].append(entry)
-    write_json(path, doc)
+    judgement = HumanJudgement.parse(entry)
+    write_json(path, read_feedback_store(path).with_judgement(judgement).as_document())
     return path
 
 
@@ -18389,10 +18845,13 @@ def viewer_html(report: dict[str, Any], runs_root: Path | None = None, *, previo
         parts.append("<h2>Diff vs previous workspace</h2><pre>" + html.escape(json.dumps(diff, indent=2)) + "</pre>")
     if serve_mode:
         parts.append(
-            "<h2>Feedback</h2><form id='fb'>"
+            "<h2>Feedback</h2><p>Name a judge assertion to label it for <code>judge-alignment</code>; "
+            "leave it blank to annotate the whole run for <code>error-analysis</code>.</p><form id='fb'>"
             "<input name='case_id' placeholder='case id'> <input name='model' placeholder='model'> "
-            "<input name='variant' placeholder='variant'>"
-            " <select name='verdict'><option>good</option><option>bad</option><option>unsure</option></select>"
+            "<input name='variant' placeholder='variant'> <input name='run_number' placeholder='run' size='4'> "
+            "<input name='assertion' placeholder='judge assertion (optional)'>"
+            " <select name='verdict'><option value=''>no verdict</option><option>pass</option>"
+            "<option>fail</option><option>unsure</option></select>"
             " <input name='note' placeholder='note' size='40'> <button>save</button> <span id='fb-status'></span></form>"
             "<script>document.getElementById('fb').addEventListener('submit',async e=>{e.preventDefault();"
             "const data=Object.fromEntries(new FormData(e.target));"
@@ -18430,29 +18889,6 @@ def viewer_html(report: dict[str, Any], runs_root: Path | None = None, *, previo
     return "\n".join(parts)
 
 
-def iteration_dirs(root: Path) -> list[Path]:
-    """The iteration-N convention (roadmap 2.9), sorted by iteration number."""
-    if not root.is_dir():
-        return []
-    found = []
-    for child in root.iterdir():
-        m = re.fullmatch(r"iteration-(\d+)", child.name)
-        if child.is_dir() and m:
-            found.append((int(m.group(1)), child))
-    return [p for _, p in sorted(found)]
-
-
-def next_iteration_dir(root: Path) -> Path:
-    existing = iteration_dirs(root)
-    if not existing:
-        return root / "iteration-1"
-    match = re.fullmatch(r"iteration-(\d+)", existing[-1].name)
-    if match is None:
-        raise AssertionError("iteration_dirs returned a non-iteration directory")
-    last = int(match.group(1))
-    return root / f"iteration-{last + 1}"
-
-
 def serve_viewer(html_text: str, workspace: Path, port: int) -> None:
     """The interactive served report (roadmap 2.8): GET / renders the review,
     POST /feedback persists feedback.json into the workspace. Never touched by
@@ -18479,7 +18915,7 @@ def serve_viewer(html_text: str, workspace: Path, port: int) -> None:
                 entry = strict_json_loads(self.rfile.read(length).decode("utf-8"))
                 persist_feedback(workspace, entry)
                 self.send_response(204)
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, OSError, ValueError):
                 self.send_response(400)
             self.end_headers()
 
@@ -18698,10 +19134,10 @@ def suite_cost_ledger(manifest_path: Path, runs: Path, *, benchmark_report: dict
             spend = by_case.get(case_id)
             if not spend:
                 continue
-            waste_flags = [f for f in flags if "saturated" in f or "no objective lift" in f]
+            waste_flags = [f for f in flags if CaseFlag.parse(f) in NON_DISCRIMINATING_FLAGS]
             if waste_flags:
                 findings.append({
-                    "kind": "spend-on-non-discriminating-case",
+                    "kind": FindingKind.SPEND_ON_NON_DISCRIMINATING_CASE.value,
                     "case_id": case_id,
                     "flags": waste_flags,
                     "total_tokens": spend["total_tokens"],
@@ -18739,7 +19175,7 @@ def cost_ledger_markdown(ledger: dict[str, Any]) -> str:
         if isinstance(aggregate, dict):
             return telemetry_domain.display_aggregate(aggregate, prefix=prefix)
         value = slot.get(name)
-        return f"{prefix}{value}" if value is not None else "— unavailable"
+        return f"{prefix}{value}" if value is not None else MISSING_CELL
 
     lines = [
         f"# Cost summary — {ledger.get('skill_name')}",
@@ -18748,15 +19184,18 @@ def cost_ledger_markdown(ledger: dict[str, Any]) -> str:
         "",
         f"**Totals:** {show(totals, 'total_tokens')} tokens (in {show(totals, 'input_tokens')} / out {show(totals, 'output_tokens')}), {show(totals, 'total_cost_usd', '$')}, {show(totals, 'elapsed_ms_sum')} ms summed",
         "",
-        "| Variant | Runs | Tokens | Cost USD |",
-        "|---|---:|---:|---:|",
+        *md_table(["Variant", "Runs", "Tokens", "Cost USD"],
+                  [[variant, slot["runs"], show(slot, "total_tokens"), show(slot, "total_cost_usd", "$")]
+                   for variant, slot in ledger.get("by_variant", {}).items()],
+                  align="lrrr"),
     ]
-    for variant, slot in ledger.get("by_variant", {}).items():
-        lines.append(f"| {variant} | {slot['runs']} | {show(slot, 'total_tokens')} | {show(slot, 'total_cost_usd', '$')} |")
     if ledger.get("top_expensive_cases"):
-        lines += ["", "## Top expensive cases", "", "| Case | Runs | Tokens | Cost USD |", "|---|---:|---:|---:|"]
-        for row in ledger["top_expensive_cases"]:
-            lines.append(f"| {row['case_id']} | {row['runs']} | {show(row, 'total_tokens')} | {show(row, 'total_cost_usd', '$')} |")
+        lines += ["", "## Top expensive cases", ""]
+        lines += md_table(["Case", "Runs", "Tokens", "Cost USD"],
+                          [[row["case_id"], row["runs"], show(row, "total_tokens"),
+                            show(row, "total_cost_usd", "$")]
+                           for row in ledger["top_expensive_cases"]],
+                          align="lrrr")
     if ledger.get("cost_quality_findings"):
         lines += ["", "## Cost-quality findings", ""]
         for f in ledger["cost_quality_findings"]:
@@ -18773,7 +19212,7 @@ def cost_summary_command(args: argparse.Namespace) -> int:
     ledger = suite_cost_ledger(Path(args.manifest), Path(args.runs), benchmark_report=benchmark_report, judge_results=judge_lookup or None, top_n=int(getattr(args, "top", 10)))
     emit_report(ledger, args.out)
     if getattr(args, "md", None):
-        Path(args.md).write_text(cost_ledger_markdown(ledger), encoding="utf-8")
+        emit_text(cost_ledger_markdown(ledger), args.md)
     return 0
 
 
@@ -18818,7 +19257,7 @@ def trend_entry(label: str, report: dict[str, Any]) -> dict[str, Any]:
         "with_skill": paired.get("with_skill_objective_pass_rate"),
         "without_skill": paired.get("without_skill_objective_pass_rate"),
         "lift": paired.get("absolute_delta"),
-        "saturated_cases": sum(1 for f in flags for x in f.get("flags", []) if "saturated" in x),
+        "saturated_cases": sum(1 for f in flags if CaseFlag.SATURATED in CaseFlag.in_row(f.get("flags"))),
         "flagged_cases": len(flags),
         "median_total_tokens": {v: block.get("median_total_tokens") for v, block in (report.get("summary") or {}).items()},
     }
@@ -18930,11 +19369,18 @@ def suggest_case_candidates(report: dict[str, Any], manifest: dict[str, Any]) ->
     """The deterministic half of the living-eval loop (roadmap 2.10): saturated
     and no-lift flags select the cases that stopped discriminating; each yields
     a candidate SEED for a harder variant. Generation is a separate, opt-in,
-    model-backed step — and a candidate never enters a manifest on its own."""
+    model-backed step — and a candidate never enters a manifest on its own.
+
+    A floor case (both arms fail every run) is never a seed: making a case that
+    nothing passes harder cannot help, and the likelier cause is the case or
+    its assertion. Those cases go to `audit-manifest` as `floor-eval`."""
     cases = case_by_id(manifest)
     seeds = []
     for flag in report.get("case_flags", []):
-        reasons = [f for f in flag.get("flags", []) if "saturated" in f or "no objective lift" in f]
+        case_flag_list = flag.get("flags", [])
+        if CaseFlag.FLOOR in CaseFlag.in_row(case_flag_list):
+            continue
+        reasons = [f for f in case_flag_list if CaseFlag.parse(f) in NON_DISCRIMINATING_FLAGS]
         if not reasons:
             continue
         case = cases.get(flag.get("case_id"), {})
@@ -18948,8 +19394,12 @@ def suggest_case_candidates(report: dict[str, Any], manifest: dict[str, Any]) ->
             "assertions": [assertion_label(a) for a in case.get("assertions", [])],
             "instruction": (
                 "Propose ONE harder variant of this case: same domain and oracle style, "
-                "solvable with the skill but likely to fail without it. Do not leak assertion "
-                "values into the prompt. Return JSON {\"prompt\": ..., \"rationale\": ...}."
+                "exercising what the skill teaches, and hard for a reason a domain expert "
+                "would name rather than because today's model happens to fail it. Do not "
+                "leak assertion values into the prompt. The "
+                "rationale must say why the case is hard. A new case belongs in the tune "
+                "split until it has been measured. Return JSON "
+                "{\"prompt\": ..., \"rationale\": ...}."
             ),
         })
     return seeds
@@ -19012,7 +19462,7 @@ def render_viewer(args: argparse.Namespace) -> int:
     serve_mode = bool(getattr(args, "serve", False))
     text = viewer_html(report, runs_root, previous_report=previous_report, serve_mode=serve_mode)
     if args.out:
-        Path(args.out).write_text(text, encoding="utf-8")
+        emit_text(text, args.out)
     if serve_mode:
         workspace = Path(getattr(args, "workspace", None) or Path(args.benchmark).parent)
         serve_viewer(text, workspace, int(getattr(args, "port", 8642)))
@@ -19077,7 +19527,7 @@ def profile_skill_report(
     findings: list[dict[str, Any]] = []
     for path in skill_files:
         if not path.exists():
-            findings.append({"kind": "missing-skill-file", "severity": "required", "message": f"Skill path does not exist: {path}"})
+            findings.append(Finding(FindingKind.MISSING_SKILL_FILE, f"Skill path does not exist: {path}").as_dict())
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         tokens = approximate_tokens(text)
@@ -19098,13 +19548,13 @@ def profile_skill_report(
                 reference_files.append({"path": str(ref), "tokens": ref_tokens, "bytes": ref.stat().st_size})
     reference_tokens = sum(r["tokens"] for r in reference_files)
     if total_tokens > max_skill_tokens:
-        findings.append({"kind": "skill-too-large", "severity": "recommended", "message": f"SKILL.md token count {total_tokens} exceeds {max_skill_tokens}; consider moving rare details to conditional references."})
+        findings.append(Finding(FindingKind.SKILL_TOO_LARGE, f"SKILL.md token count {total_tokens} exceeds {max_skill_tokens}; consider moving rare details to conditional references.").as_dict())
     if len(reference_files) > max_references:
-        findings.append({"kind": "many-references", "severity": "recommended", "message": f"{len(reference_files)} reference files exceeds {max_references}; check that navigation is conditional and focused."})
+        findings.append(Finding(FindingKind.MANY_REFERENCES, f"{len(reference_files)} reference files exceeds {max_references}; check that navigation is conditional and focused.").as_dict())
     if reference_tokens > max_reference_tokens:
-        findings.append({"kind": "references-too-large", "severity": "recommended", "message": f"Reference token count {reference_tokens} exceeds {max_reference_tokens}; consider pruning or splitting by trigger."})
+        findings.append(Finding(FindingKind.REFERENCES_TOO_LARGE, f"Reference token count {reference_tokens} exceeds {max_reference_tokens}; consider pruning or splitting by trigger.").as_dict())
     if module_count > max_modules:
-        findings.append({"kind": "many-modules", "severity": "recommended", "message": f"{module_count} skill headings/modules exceeds {max_modules}; focused 2–3-module skills are often easier for agents to apply."})
+        findings.append(Finding(FindingKind.MANY_MODULES, f"{module_count} skill headings/modules exceeds {max_modules}; focused 2–3-module skills are often easier for agents to apply.").as_dict())
     return {
         "generated_at": int(time.time()),
         "manifest": str(manifest_path),
@@ -19123,7 +19573,12 @@ def profile_skill_report(
 
 
 def paired_run_bases(runs: Path, case_id: str, with_variant: str, without_variant: str):
-    """Yield run bases through the same validated identity constructor as reports."""
+    """Yield ``(model, run_number, treatment_base, control_base, blocked_reason)``.
+
+    Pairs come from the same constructor and declared contrast as the
+    benchmark, so a pair whose arms ran at different effort is blocked here
+    too; ``blocked_reason`` is None for a usable pair."""
+    contrast = pair_domain.contrast_for(with_variant, without_variant)
     for model, model_root in discover_case_model_roots(runs, case_id, [with_variant, without_variant]):
         with_dir = model_root / with_variant
         without_dir = model_root / without_variant
@@ -19131,7 +19586,7 @@ def paired_run_bases(runs: Path, case_id: str, with_variant: str, without_varian
         without_runs = discover_run_bases_under(without_dir) if without_dir.exists() else []
         arms = []
         bases: dict[tuple[int, str], Path] = {}
-        for arm, discovered in (("with_skill", with_runs), ("without_skill", without_runs)):
+        for arm, discovered in ((with_variant, with_runs), (without_variant, without_runs)):
             for run_number, base in discovered:
                 key = pair_domain.ExperimentalPairKey.parse(
                     case_id,
@@ -19142,13 +19597,18 @@ def paired_run_bases(runs: Path, case_id: str, with_variant: str, without_varian
                 bases[(run_number, arm)] = base
                 arms.append(pair_domain.ExperimentalArm(
                     key, pair_domain.ExperimentalArmId(arm), base))
-        construction = pair_domain.construct_pairs(arms)
+        construction = pair_domain.construct_pairs(
+            arms, contrast=contrast,
+            comparable=lambda left, right: contrast.comparability(
+                read_metrics_base(left), read_metrics_base(right)))
         for pair in construction.pairs:
-            yield model, pair.key.run_number, pair.with_skill.payload, pair.without_skill.payload
+            yield model, pair.key.run_number, pair.treatment.payload, pair.control.payload, None
         for blocked in construction.blocked:
+            reason = {f"missing_{with_variant}": "missing_left",
+                      f"missing_{without_variant}": "missing_right"}.get(blocked.reason, blocked.reason)
             yield (model, blocked.key.run_number,
-                   bases.get((blocked.key.run_number, "with_skill")),
-                   bases.get((blocked.key.run_number, "without_skill")))
+                   bases.get((blocked.key.run_number, with_variant)),
+                   bases.get((blocked.key.run_number, without_variant)), reason)
 
 
 def paired_token_overhead_report(
@@ -19157,6 +19617,7 @@ def paired_token_overhead_report(
     runs: Path | None = None,
     split: str | None = None,
     variants: tuple[str, str] = ("with_skill", "without_skill"),
+    judge_results_path: str | None = None,
 ) -> dict[str, Any]:
     manifest = validate_manifest(manifest_path)
     profile = profile_skill_report(manifest_path)
@@ -19165,10 +19626,11 @@ def paired_token_overhead_report(
     blocked_pairs: list[dict[str, Any]] = []
     if runs is not None:
         for case in iter_cases(manifest, split):
-            for model_name, run_number, with_base, without_base in paired_run_bases(
+            for model_name, run_number, with_base, without_base, blocked_reason in paired_run_bases(
                 runs, case["id"], with_variant, without_variant):
-                if with_base is None or without_base is None:
-                    missing_reason = "missing_left" if with_base is None else "missing_right"
+                if blocked_reason is not None or with_base is None or without_base is None:
+                    missing_reason = blocked_reason or (
+                        "missing_left" if with_base is None else "missing_right")
                     blocked_pairs.append({
                         "case_id": case["id"], "model": model_name, "run_number": run_number,
                         "with_run_base": str(with_base) if with_base else None,
@@ -19187,8 +19649,8 @@ def paired_token_overhead_report(
                 without_metrics = read_metrics_base(without_base)
                 with_text, with_output_path = read_output_base(with_base)
                 without_text, without_output_path = read_output_base(without_base)
-                with_grade, _ = grade_case_variant(case, with_variant, with_text, with_output_path, read_metadata_base(with_base), run_number=run_number, run_base=with_base, manifest_dir=manifest_path.parent)
-                without_grade, _ = grade_case_variant(case, without_variant, without_text, without_output_path, read_metadata_base(without_base), run_number=run_number, run_base=without_base, manifest_dir=manifest_path.parent)
+                with_grade, _ = grade_case_variant(case, with_variant, with_text, with_output_path, read_metrics_base(with_base), run_number=run_number, run_base=with_base, manifest_dir=manifest_path.parent)
+                without_grade, _ = grade_case_variant(case, without_variant, without_text, without_output_path, read_metrics_base(without_base), run_number=run_number, run_base=without_base, manifest_dir=manifest_path.parent)
                 # A crashed/timed-out or output-less arm is an infrastructure failure,
                 # not evidence of token cost or accuracy; exclude the pair via the same
                 # scorable predicate every report view uses (was: graded raw, so a
@@ -19381,9 +19843,12 @@ def paired_token_overhead_report(
     report_pairs = pairs
     observed_pairs = None
     if runs is not None:
+        # A manifest with judge assertions grades completely only with its
+        # verdicts; without them the lift is withheld as partial coverage.
         benchmark_surface = build_benchmark_report(
             manifest_path, runs, split=split,
-            variants_arg=[with_variant, without_variant])
+            variants_arg=[with_variant, without_variant],
+            judge_results_path=judge_results_path)
         design_coverage = benchmark_surface["answer_design"]
         if benchmark_surface.get("availability") != "complete":
             observed_pairs = pairs
@@ -19411,7 +19876,9 @@ def token_overhead(args: argparse.Namespace) -> int:
         runs = Path(args.runs) if args.runs else None
         if runs is None and args.runs_subdir:
             runs = repo_root_for_manifest(manifest_path) / args.runs_subdir
-        reports.append(paired_token_overhead_report(manifest_path, runs=runs, split=args.split))
+        reports.append(paired_token_overhead_report(
+            manifest_path, runs=runs, split=args.split,
+            judge_results_path=getattr(args, "judge_results", None)))
     observed_summary = {
         "skills": len(reports),
         "skills_with_runtime_pairs": sum(
@@ -19443,7 +19910,7 @@ def token_overhead(args: argparse.Namespace) -> int:
         "reports": reports,
     }
     if args.format == "markdown":
-        lines = ["# Token overhead report", "", "| Skill | Static SKILL tokens | Reference tokens | Runtime pairs | Mean total delta | Median total delta | Mean input delta | Mean objective lift | Lift per 1k total tokens | Mean cost delta USD | Lift per $ | Saturated/no-lift cost USD |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+        summary_rows = []
         for r in reports:
             s = r["summary"]
             td = s.get("total_token_delta") or {}
@@ -19452,26 +19919,40 @@ def token_overhead(args: argparse.Namespace) -> int:
             lift = s.get("objective_lift_per_1k_total_tokens") or {}
             cd = s.get("cost_delta_usd") or {}
             lpd = s.get("objective_lift_per_dollar") or {}
-            lines.append(f"| {r['skill_name']} | {s.get('static_skill_tokens')} | {s.get('static_reference_tokens')} | {s.get('paired_runtime_rows')} | {td.get('mean')} | {td.get('median')} | {idelta.get('mean')} | {odelta.get('mean')} | {lift.get('mean')} | {cd.get('mean')} | {lpd.get('mean')} | {s.get('saturated_or_no_lift_cost_usd')} |")
+            summary_rows.append([
+                r["skill_name"], s.get("static_skill_tokens"), s.get("static_reference_tokens"),
+                s.get("paired_runtime_rows"), td.get("mean"), td.get("median"), idelta.get("mean"),
+                odelta.get("mean"), lift.get("mean"), cd.get("mean"), lpd.get("mean"),
+                s.get("saturated_or_no_lift_cost_usd")])
+        lines = ["# Token overhead report", "", *md_table(
+            ["Skill", "Static SKILL tokens", "Reference tokens", "Runtime pairs", "Mean total delta",
+             "Median total delta", "Mean input delta", "Mean objective lift", "Lift per 1k total tokens",
+             "Mean cost delta USD", "Lift per $", "Saturated/no-lift cost USD"],
+            summary_rows, align="l" + "r" * 11)]
         lines += ["", "## Per-case runtime pairs", ""]
         for r in reports:
             if not r.get("pairs") and not r.get("blocked_pairs"):
                 continue
-            lines += [f"### {r['skill_name']}", "", "| Case | Run | Total delta | Input delta | Objective delta | Lift/1k | With cost | Without cost | Cost delta | Lift/$ | Lift/$ status |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
+            pair_rows = []
             for p in r["pairs"]:
                 status = p.get("objective_lift_per_dollar_comparison", {})
                 lift_status = status.get("reason") if status.get("availability") == telemetry_domain.BLOCKED else "comparable"
-                lines.append(f"| {p['case_id']} | {p['run_number']} | {p.get('total_token_delta')} | {p.get('input_token_delta')} | {p.get('objective_delta')} | {p.get('objective_lift_per_1k_total_tokens')} | {p.get('with_cost_usd')} | {p.get('without_cost_usd')} | {p.get('cost_delta_usd')} | {p.get('objective_lift_per_dollar')} | {lift_status} |")
+                pair_rows.append([
+                    p["case_id"], p["run_number"], p.get("total_token_delta"), p.get("input_token_delta"),
+                    p.get("objective_delta"), p.get("objective_lift_per_1k_total_tokens"),
+                    p.get("with_cost_usd"), p.get("without_cost_usd"), p.get("cost_delta_usd"),
+                    p.get("objective_lift_per_dollar"), lift_status])
+            lines += [f"### {r['skill_name']}", "", *md_table(
+                ["Case", "Run", "Total delta", "Input delta", "Objective delta", "Lift/1k", "With cost",
+                 "Without cost", "Cost delta", "Lift/$", "Lift/$ status"],
+                pair_rows, align="l" + "r" * 9 + "l")]
             if r.get("blocked_pairs"):
                 lines += ["", "Blocked pairs (not included in runtime statistics):"]
                 for pair in r["blocked_pairs"]:
                     lines.append(f"- `{pair.get('case_id')}` / `{pair.get('model')}` / run {pair.get('run_number')}: {pair.get('pair_status', {}).get('reason')}")
             lines.append("")
         text = "\n".join(lines) + "\n"
-        if args.out:
-            Path(args.out).write_text(text, encoding="utf-8")
-        else:
-            print(text)
+        emit_text(text, args.out)
     else:
         emit_report(output, args.out)
     return 0
@@ -19487,9 +19968,8 @@ def profile_skill(args: argparse.Namespace) -> int:
         max_modules=args.max_modules,
     )
     if args.format == "markdown":
-        lines = [f"# Skill profile — {report['skill_name']}", "", "## Summary", "", "| Metric | Value |", "|---|---:|"]
-        for k, v in report["summary"].items():
-            lines.append(f"| {k} | {v} |")
+        lines = [f"# Skill profile — {report['skill_name']}", "", "## Summary", "",
+                 *md_table(["Metric", "Value"], report["summary"].items(), align="lr")]
         lines += ["", "## Findings", ""]
         if report["findings"]:
             for f in report["findings"]:
@@ -19497,10 +19977,7 @@ def profile_skill(args: argparse.Namespace) -> int:
         else:
             lines.append("- No profile findings.")
         text = "\n".join(lines) + "\n"
-        if args.out:
-            Path(args.out).write_text(text, encoding="utf-8")
-        else:
-            print(text)
+        emit_text(text, args.out)
     else:
         emit_report(report, args.out)
     return 0
@@ -19579,9 +20056,39 @@ def fixture_recommendations(manifest: dict[str, Any]) -> list[dict[str, Any]]:
 POSITIVE_OBJECTIVE_TYPES = {"contains", "contains_any", "contains_all", "regex"}
 
 
-def _mean_or_none(xs: list[float] | None) -> float | None:
-    xs = [x for x in (xs or []) if isinstance(x, (int, float))]
-    return statistics.mean(xs) if xs else None
+def combined_signal(row: Mapping[str, Any]) -> float | None:
+    """A run's combined score, the rate the floor and readiness rules read.
+    Soft judges live in graded_score, not combined, so a case with no gate
+    judge blends the two; the signal rides whichever channel the judge fed."""
+    value = row.get("combined_pass_rate")
+    if value is None or (row.get("combined_total") == row.get("objective_total")
+                         and isinstance(row.get("graded_score"), (int, float))):
+        blended = [x for x in (value, row.get("graded_score")) if isinstance(x, (int, float))]
+        value = statistics.mean(blended) if blended else row.get("objective_pass_rate")
+    return (float(value) if isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(float(value)) and 0 <= float(value) <= 1 else None)
+
+
+def combined_pair_construction(rows: Iterable[Mapping[str, Any]]) -> _ResultPairConstruction:
+    """The pairs the combined signal is read over: every scorable arm, with
+    no objective rate required, so a case gated only by judges pairs too."""
+    return pair_domain.pairs_from_rows(
+        rows, population=pair_domain.ExperimentalPopulation.ANSWER,
+        eligibility=lambda row: ((True, None) if scorable_run(row) else (False, "unscorable_arm")),
+    )
+
+
+def combined_arm_means(pairs: Iterable[_ResultPair]) -> tuple[float, float] | None:
+    """Mean combined score per arm over the pairs where both arms have one.
+    A case is at the floor when both means are 0 (`ceiling_or_floor`), the
+    one rule behind the floor case flag and readiness's floor_cases."""
+    combined = [(combined_signal(pair.with_skill.payload), combined_signal(pair.without_skill.payload))
+                for pair in pairs]
+    present = [(left, right) for left, right in combined if left is not None and right is not None]
+    if not present:
+        return None
+    return (statistics.mean(left for left, _ in present),
+            statistics.mean(right for _, right in present))
 
 
 def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9) -> dict[str, Any]:
@@ -19589,8 +20096,13 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
     static manifest audit CANNOT see — the ones where the *measured* numbers say
     the case can't discriminate the skill:
 
-      base_saturated   — combined with_skill == without_skill: the case measures
-                         nothing (the base model does it with or without the skill).
+      base_saturated   — combined with_skill == without_skill above zero: the case
+                         measures nothing (the base model does it with or without
+                         the skill).
+      floor            — both arms score 0: nothing passes, which points at a broken
+                         case or assertion before it points at a hard task. Kept
+                         apart from base_saturated, and a regression guard at the
+                         floor is not "holding".
       qualitative_only — objective with == without (the deterministic assertions
                          don't move) yet combined with > without: the whole signal
                          is carried by the judge. An objective-only eval would call
@@ -19599,34 +20111,19 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
     intent: dict[Any, str] = {}
     for row in rows:
         intent.setdefault(row.get("case_id"), row.get("eval_intent", "capability"))
-    pairing = pair_domain.pairs_from_rows(
-        rows, population=pair_domain.ExperimentalPopulation.ANSWER,
-        eligibility=lambda row: ((True, None) if scorable_run(row) else (False, "unscorable_arm")),
-    )
-
-    def combined_value(row: Mapping[str, Any]) -> float | None:
-        value = row.get("combined_pass_rate")
-        # Soft judges live in graded_score, not combined; the qualitative signal
-        # this function looks for rides whichever channel the judge fed.
-        if value is None or (row.get("combined_total") == row.get("objective_total")
-                             and isinstance(row.get("graded_score"), (int, float))):
-            blended = [x for x in (value, row.get("graded_score")) if isinstance(x, (int, float))]
-            value = statistics.mean(blended) if blended else row.get("objective_pass_rate")
-        return (float(value) if isinstance(value, (int, float)) and not isinstance(value, bool)
-                and math.isfinite(float(value)) and 0 <= float(value) <= 1 else None)
-
+    pairing = combined_pair_construction(rows)
     by_case: dict[str, list[_ResultPair]] = collections.defaultdict(list)
     for pair in pairing.pairs:
         by_case[pair.key.case_id].append(pair)
-    base_saturated, base_saturated_expected, qualitative_only = [], [], []
+    base_saturated, base_saturated_expected, qualitative_only, floor = [], [], [], []
     for cid, pairs in by_case.items():
-        combined = [(combined_value(pair.with_skill.payload), combined_value(pair.without_skill.payload))
-                    for pair in pairs]
-        combined = [(left, right) for left, right in combined if left is not None and right is not None]
-        if not combined:
+        means = combined_arm_means(pairs)
+        if means is None:
             continue
-        cw = statistics.mean(left for left, _ in combined)
-        cn = statistics.mean(right for _, right in combined)
+        cw, cn = means
+        if ceiling_or_floor(cw, cn, eps=eps) is DiscriminationFailure.FLOOR:
+            floor.append(cid)
+            continue
         if abs(cw - cn) <= eps:
             (base_saturated_expected if intent.get(cid) == "regression" else base_saturated).append(cid)
             continue
@@ -19646,17 +20143,48 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
         "base_saturated_cases": sorted(base_saturated, key=str),
         "base_saturated_expected_cases": sorted(base_saturated_expected, key=str),
         "qualitative_only_cases": sorted(qualitative_only, key=str),
+        "floor_cases": sorted(floor, key=str),
     }
     if benchmark_report.get("availability") != "complete":
         return {
             "availability": "partial",
             "reason": "benchmark report population is incomplete",
+            "incomplete_reasons": list(benchmark_report.get("incomplete_reasons") or []),
             "base_saturated_cases": [],
             "base_saturated_expected_cases": [],
             "qualitative_only_cases": [],
+            "floor_cases": [],
             "observed": observed,
         }
     return {"availability": "complete", **observed}
+
+
+# Each reason a benchmark report is partial (build_benchmark_report's
+# incomplete_reasons): its short name for a one-line status, and what to do.
+INCOMPLETE_CAUSES = {
+    "answer_design_incomplete": (
+        "answer-design coverage", "some planned case arms have no run; finish the runs"),
+    "unscorable_answer_attempts": (
+        "unscorable attempts",
+        "some runs are unscorable (cut off, wrong model, or not completed); re-run them"),
+    "grading_evidence_incomplete": (
+        "blocked grading evidence",
+        "some runs could not be graded; see grading_availability on the results"),
+    "deferred_judge_verdicts": (
+        "deferred judge verdicts", "judge assertions have no verdicts; pass --judge-results"),
+    "incomplete_answer_pairing": (
+        "blocked pairs",
+        ("some pairs are blocked (a missing arm, or arms run at different effort); "
+         "see paired_summary.pairing")),
+}
+
+
+def incomplete_label(reason: str) -> str:
+    return INCOMPLETE_CAUSES[reason][0] if reason in INCOMPLETE_CAUSES else reason
+
+
+def incomplete_remedy(reason: str) -> str:
+    return INCOMPLETE_CAUSES[reason][1] if reason in INCOMPLETE_CAUSES else reason
 
 
 def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str | None = None, leakage_min_chars: int = 4, benchmark_report: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -19701,21 +20229,36 @@ def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str 
             for a in positive
         ):
             leak_saturated.append(case.get("id"))
-    blockers: list[str] = []
+    blockers: list[Finding] = []
     if instr_sim:
-        blockers.append(f"{instr_sim}/{len(ablations)} ablation(s) are instruction-simulated (not blind / confirmation-gradeable) — materialize them")
+        blockers.append(Finding(FindingKind.ABLATION_INSTRUCTION_SIMULATED, f"{instr_sim}/{len(ablations)} ablation(s) are instruction-simulated (not blind / confirmation-gradeable) — materialize them"))
     if leak_saturated:
-        blockers.append(f"{len(leak_saturated)} case(s) are leak-saturated (every positive assertion value appears in the prompt) — they cannot discriminate skill from no-skill")
+        blockers.append(Finding(FindingKind.LEAK_SATURATED_CASE, f"{len(leak_saturated)} case(s) are leak-saturated (every positive assertion value appears in the prompt) — they cannot discriminate skill from no-skill", leak_saturated))
     if adversarial == 0:
-        blockers.append("no adversarial cases (kind: adversarial) — add the near-miss/under-pressure cases where the skill must hold")
+        blockers.append(Finding(FindingKind.NO_ADVERSARIAL_CASES, "no adversarial cases (kind: adversarial) — add the near-miss/under-pressure cases where the skill must hold"))
     # Run-measured signals (only when a benchmark report is supplied): cases whose
     # MEASURED numbers say they can't discriminate the skill. base_saturated is a
     # blocker (a case that measures nothing is wasted budget); qualitative_only is a
     # warning that the case's signal lives entirely in the judge, so an
     # objective-only reading would miss it.
-    run = readiness_run_signals(benchmark_report) if benchmark_report else {"base_saturated_cases": [], "base_saturated_expected_cases": [], "qualitative_only_cases": []}
+    run = readiness_run_signals(benchmark_report) if benchmark_report else {"base_saturated_cases": [], "base_saturated_expected_cases": [], "qualitative_only_cases": [], "floor_cases": []}
+    if run.get("availability") == "partial":
+        # An incomplete benchmark yields empty signal lists; reading those as
+        # "no base-saturated or floor cases" would pass a gate on evidence it
+        # never saw.
+        causes = run.get("incomplete_reasons") or []
+        blockers.append(Finding(
+            FindingKind.BENCHMARK_INCOMPLETE,
+            "the benchmark report is incomplete, so run-measured readiness signals are unknown: "
+            + ("; ".join(incomplete_remedy(cause) for cause in causes)
+               or "finish or re-grade the runs before relying on readiness"),
+            {"incomplete_reasons": causes}))
     if run["base_saturated_cases"]:
-        blockers.append(f"{len(run['base_saturated_cases'])} case(s) are base-saturated (measured with_skill == without_skill) — they cannot measure the skill; cut or harden them")
+        blockers.append(Finding(FindingKind.BASE_SATURATED_CASE, f"{len(run['base_saturated_cases'])} case(s) are base-saturated (measured with_skill == without_skill) — they cannot measure the skill; cut or harden them", run["base_saturated_cases"]))
+    if run.get("floor_cases"):
+        blockers.append(Finding(FindingKind.FLOOR_EVAL, f"{len(run['floor_cases'])} case(s) fail in both arms on every scored run — audit each case and its assertions before hardening or spending more on it", run["floor_cases"]))
+    if not all(gate_policy.READINESS.matches(item) for item in blockers):
+        raise AssertionError("every readiness blocker must be a kind the readiness gate blocks on")
     return {
         "ablations": {"total": len(ablations), "materialized": materialized, "instruction_simulated": instr_sim},
         "leak_saturated_cases": leak_saturated,
@@ -19723,11 +20266,13 @@ def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str 
         "adversarial_cases": adversarial,
         "judge_only_cases": judge_only,
         "base_saturated_cases": run["base_saturated_cases"],
+        "floor_cases": run.get("floor_cases", []),
         "qualitative_only_cases": run["qualitative_only_cases"],
         # G5: regression guards that saturated are the intended steady state —
         # surfaced, but never a blocker (so --fail-on-blockers stays green).
         "regression_guards_holding": run["base_saturated_expected_cases"],
-        "blockers": blockers,
+        "blockers": [item.message for item in blockers],
+        "blocker_findings": [item.as_dict() for item in blockers],
     }
 
 
@@ -19805,7 +20350,7 @@ def contamination_check(case: dict[str, Any], output_text: str, *, manifest_dir:
         ).evaluate(output_text or "")
         if canary_observation.passed:
             finding: dict[str, Any] = {
-                "kind": "canary-hit",
+                "kind": FindingKind.CANARY_HIT.value,
                 "detail": f"canary {str(canary)!r} appeared in the output — the model has seen this held-out eval",
             }
             if canary_observation.changed:
@@ -19814,12 +20359,12 @@ def contamination_check(case: dict[str, Any], output_text: str, *, manifest_dir:
     answer = case_answer_material(case, manifest_dir)
     overlap = ngram_containment(output_text or "", answer, n) if answer else 0.0
     if answer and overlap >= overlap_threshold:
-        findings.append({"kind": "output-answer-overlap", "detail": f"{overlap:.2f} of the answer key's {n}-grams appear verbatim in the output"})
+        findings.append({"kind": FindingKind.OUTPUT_ANSWER_OVERLAP.value, "detail": f"{overlap:.2f} of the answer key's {n}-grams appear verbatim in the output"})
     released_at = case.get("released_at")
     rel_key = cutoff_key(released_at, end=False) if released_at else None
     cut_key = cutoff_key(model_cutoff, end=True) if model_cutoff else None
     if rel_key and cut_key and rel_key <= cut_key:
-        findings.append({"kind": "released-before-cutoff", "detail": f"case released_at {released_at} is at/before the model cutoff {model_cutoff} — the model may have trained on it"})
+        findings.append({"kind": FindingKind.RELEASED_BEFORE_CUTOFF.value, "detail": f"case released_at {released_at} is at/before the model cutoff {model_cutoff} — the model may have trained on it"})
     return {
         "case_id": case.get("id"),
         "comparison": ComparisonProfile.RENDERED_V1.value,
@@ -19834,10 +20379,20 @@ def contamination_report(manifest_path: Path, runs: Path, *, split: str | None =
     variants = manifest.get("variants", DEFAULT_VARIANTS)
     cases_out: list[dict[str, Any]] = []
     total = 0
+    # Coverage: every answer run discovery yields (case, model, arm, run)
+    # whose output was read. A gate that never saw a run's output cannot say
+    # that run did not leak, and another model's output does not stand in.
+    unscanned: list[dict[str, Any]] = []
+    expected_runs = 0
     for case in iter_cases(manifest, split):
         max_overlap, findings = 0.0, []
+        answer_case = not is_trigger_case(case)
         for model_name, variant, run_number, _base, text, _path, _meta in discovered_run_units(runs, case, variants):
+            expected_runs += answer_case
             if text is None:
+                if answer_case:
+                    unscanned.append({"case_id": case["id"], "model": model_name,
+                                      "variant": variant, "run_number": run_number})
                 continue
             chk = contamination_check(case, text, manifest_dir=manifest_path.parent, n=n,
                                       overlap_threshold=overlap_threshold, model_cutoff=model_cutoff)
@@ -19847,7 +20402,12 @@ def contamination_report(manifest_path: Path, runs: Path, *, split: str | None =
         total += len(findings)
         if findings or max_overlap > 0:
             cases_out.append({"case_id": case["id"], "max_overlap": round(max_overlap, 4), "findings": findings})
+    scanned_runs = expected_runs - len(unscanned)
+    availability = (Availability.COMPLETE if not unscanned
+                    else Availability.PARTIAL if scanned_runs else Availability.UNAVAILABLE)
     return {"cases": cases_out, "total_findings": total,
+            "coverage": {"availability": availability.value, "expected_runs": expected_runs,
+                         "scanned_runs": scanned_runs, "unscanned": unscanned},
             "params": {"ngram": n, "overlap_threshold": overlap_threshold, "model_cutoff": model_cutoff,
                        "comparison": ComparisonProfile.RENDERED_V1.value}}
 
@@ -19857,7 +20417,129 @@ def contamination_command(args: argparse.Namespace) -> int:
                                   n=getattr(args, "ngram", 8), overlap_threshold=getattr(args, "overlap_threshold", 0.6),
                                   model_cutoff=getattr(args, "model_cutoff", None))
     emit_report(report, getattr(args, "out", None))
-    return 1 if (getattr(args, "fail_on_contamination", False) and report["total_findings"]) else 0
+    if not getattr(args, "fail_on_contamination", False):
+        return 0
+    coverage = report["coverage"]
+    return gate_exit(gate_policy.CONTAMINATION.decide(
+        [finding for case in report["cases"] for finding in case["findings"]],
+        complete=coverage["availability"] == Availability.COMPLETE.value,
+        incomplete_reason=(f"contamination scanned {coverage['scanned_runs']} of "
+                           f"{coverage['expected_runs']} answer runs; the rest have no saved output")),
+        "contamination")
+
+
+def reference_answer_text(case: dict[str, Any], manifest_dir: Path) -> str | None:
+    """A case's declared known-good answer, or None (also when a private ref is absent)."""
+    if isinstance(case.get("reference_answer"), str):
+        return str(case["reference_answer"])
+    ref = case.get("reference_answer_ref")
+    if isinstance(ref, str) and ref:
+        path = manifest_dir / ref
+        return path.read_text(encoding="utf-8") if path.is_file() else None
+    return None
+
+
+def known_answer_check(manifest: dict[str, Any], manifest_path: Path, *,
+                       split: str | None = None) -> dict[str, Any]:
+    """Grade known answers through each case's own deterministic checks (mark 2).
+
+    A declared reference answer must pass every gate text check. The null
+    answer, the prompt echoed back, must fail at least one: a grader that passes
+    an answer which only repeats the question cannot tell a good answer from no
+    answer. Only text checks that need nothing but the answer string run here;
+    a case with other gate checks is not null-checked, because those checks
+    fail an echo for reasons unrelated to the grader. Model-free.
+    """
+    output_path = manifest_path.parent / "known-answer-check.md"
+    reference_failures: list[dict[str, Any]] = []
+    null_passes: list[Any] = []
+    references_checked = nulls_checked = 0
+    for case in iter_cases(manifest, split):
+        if CaseKind.parse(case.get("kind", "behavior")).population is CasePopulation.TRIGGER:
+            continue
+        gates = [a for a in case.get("assertions", []) or []
+                 if a.get("type") in OBJECTIVE_ASSERTIONS
+                 and assertion_severity(a) in {"gate", "critical"}]
+        checkable = [a for a in gates if a.get("type") in KNOWN_ANSWER_ASSERTIONS]
+        if not checkable:
+            continue
+        reference = reference_answer_text(case, manifest_path.parent)
+        if reference is not None:
+            references_checked += 1
+            failed = [assertion_label(a) for a in checkable
+                      if assertion_result(a, reference, output_path)["passed"] is not True]
+            if failed:
+                reference_failures.append({"case_id": case.get("id"), "failed_assertions": failed})
+        if len(checkable) != len(gates) or not (case.get("prompt") or case.get("turns")):
+            continue
+        prompt = case_prompt(case, manifest_path)
+        nulls_checked += 1
+        if all(assertion_result(a, prompt, output_path)["passed"] is True for a in checkable):
+            null_passes.append(case.get("id"))
+    return {
+        "references_checked": references_checked,
+        "reference_failures": reference_failures,
+        "null_answers_checked": nulls_checked,
+        "null_answer_passes": null_passes,
+    }
+
+
+def run_condition_findings(report: dict[str, Any]) -> list[Finding]:
+    """Mark 5 findings read from the runs present: arms run under different
+    conditions, or a run answered by another model. Each is a root cause of an
+    incomplete benchmark rather than a measurement over it, so it is raised on
+    a partial benchmark too."""
+    out: list[Finding] = []
+    blocked = ((report.get("paired_summary") or {}).get("pairing") or {}).get(
+        "blocked_reason_counts") or {}
+    held_fixed = {reason: count for reason, count in blocked.items()
+                  if reason.endswith(("_mismatch", "_unrecorded_on_one_arm"))}
+    if held_fixed:
+        out.append(Finding(
+            FindingKind.ARM_CONDITIONS_DIFFER,
+            f"{sum(held_fixed.values())} pair(s) were blocked because their arms ran under "
+            "different conditions", held_fixed))
+    endings = report.get("run_endings") or {}
+    if endings.get("served_model_mismatches"):
+        out.append(Finding(
+            FindingKind.SERVED_MODEL_MISMATCH,
+            f"{endings['served_model_mismatches']} run(s) were answered by a model other than "
+            "the one requested"))
+    if endings.get("served_model_mixed"):
+        out.append(Finding(
+            FindingKind.SERVED_MODEL_MIXED,
+            f"{endings['served_model_mixed']} run(s) reported the requested model and another"))
+    return out
+
+
+def run_measured_findings(report: dict[str, Any]) -> list[Finding]:
+    """Findings only a complete benchmark can support (marks 3 and 4)."""
+    out: list[Finding] = []
+    paired = report.get("paired_summary") or {}
+    capability = [
+        float(row["objective_pass_rate"]) for row in report.get("results", [])
+        if row.get("variant") == "without_skill" and scorable_run(row)
+        and row.get("eval_intent") != "regression"
+        and isinstance(row.get("objective_pass_rate"), (int, float))]
+    if capability and statistics.fmean(capability) >= SUITE_HEADROOM_CEILING:
+        rate = round(statistics.fmean(capability), 4)
+        out.append(Finding(
+            FindingKind.SUITE_HEADROOM_EXHAUSTED,
+            f"without_skill already passes {rate:.0%} of capability runs; there is little "
+            "room to show lift, so hold quality and optimise cost or latency instead",
+            {"without_skill_capability_rate": rate}))
+    noise = paired.get("noise_check") or {}
+    if noise.get("verdict") == "unbounded" and noise.get("reason"):
+        out.append(Finding(
+            FindingKind.UNDERPOWERED_EVAL,
+            "the lift interval has no bounds, so the noise check cannot say how large the "
+            f"lift is or compare it with --min-lift ({noise['reason']})", noise))
+    elif noise.get("verdict") not in (None, "no-data", "resolvable"):
+        out.append(Finding(
+            FindingKind.UNDERPOWERED_EVAL,
+            f"the eval cannot resolve the lift it is meant to measure ({noise['verdict']})",
+            noise))
+    return out
 
 
 GENERIC_ALTERNATIVE_MAX_CHARS = 4
@@ -19951,6 +20633,9 @@ def audit_manifest_report(
     min_trigger_neg: int = 2,
     leakage_min_chars: int = 4,
     expensive_case_usd: float = 1.0,
+    min_lift: float | None = None,
+    judge_results_path: str | None = None,
+    grading: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     manifest = validate_manifest(manifest_path)
     require_resolvable_skill_paths(manifest_path, manifest)
@@ -19980,8 +20665,8 @@ def audit_manifest_report(
     }
     findings: list[dict[str, Any]] = []
     recommendations: list[dict[str, Any]] = []
-    def finding(kind: str, severity: str, message: str, evidence: Any = None) -> None:
-        findings.append({"kind": kind, "severity": severity, "message": message, **({"evidence": evidence} if evidence is not None else {})})
+    def finding(kind: FindingKind, message: str, evidence: Any = None) -> None:
+        findings.append(Finding(kind, message, evidence).as_dict())
     def rec(kind: str, message: str, example: Any = None) -> None:
         recommendations.append({"kind": kind, "message": message, **({"example": example} if example is not None else {})})
 
@@ -19994,33 +20679,33 @@ def audit_manifest_report(
 
     leakage = prompt_assertion_leakage_findings(manifest, manifest_path, min_chars=leakage_min_chars, split=split)
     if leakage:
-        finding("prompt-assertion-leakage", "recommended", f"{len(leakage)} contains-style assertion values appear literally in their prompts.", leakage[:30])
+        finding(FindingKind.PROMPT_ASSERTION_LEAKAGE, f"{len(leakage)} contains-style assertion values appear literally in their prompts.", leakage[:30])
         rec("assertion-leakage", "Replace leaked literal keyword assertions with non-leaked wording, regex scoped to output structure, fixture/script oracles, or stricter artifact checks.")
 
     if cases and counts["domain_tagged"] < len(cases):
-        finding("missing-domain-taxonomy", "recommended", f"{len(cases) - counts['domain_tagged']} cases lack domain tags used for slice summaries.")
+        finding(FindingKind.MISSING_DOMAIN_TAXONOMY, f"{len(cases) - counts['domain_tagged']} cases lack domain tags used for slice summaries.")
         rec("taxonomy-domain", "Add a stable domain to each case, for example docs, testing, repo-quality, design, audit, or cloudflare.")
     if cases and counts["difficulty_tagged"] < len(cases):
-        finding("missing-difficulty-taxonomy", "recommended", f"{len(cases) - counts['difficulty_tagged']} cases lack difficulty tags used for slice summaries.")
+        finding(FindingKind.MISSING_DIFFICULTY_TAXONOMY, f"{len(cases) - counts['difficulty_tagged']} cases lack difficulty tags used for slice summaries.")
         rec("taxonomy-difficulty", "Tag cases as core, extended, or extreme so regressions are visible by difficulty.")
     if cases and counts["success_goal_tagged"] < len(cases):
-        finding("missing-success-goals", "recommended", f"{len(cases) - counts['success_goal_tagged']} cases lack success_goals such as outcome, style, process, efficiency, or trigger.")
+        finding(FindingKind.MISSING_SUCCESS_GOALS, f"{len(cases) - counts['success_goal_tagged']} cases lack success_goals such as outcome, style, process, efficiency, or trigger.")
         rec("taxonomy-success-goals", "Add success_goals so benchmark reports can separate outcome, style, process, trigger, and efficiency evidence.")
 
     if counts["positive"] < min_positive:
-        finding("missing-positive-evals", "required", f"Only {counts['positive']} positive cases; target at least {min_positive}.")
+        finding(FindingKind.MISSING_POSITIVE_EVALS, f"Only {counts['positive']} positive cases; target at least {min_positive}.")
         rec("positive-eval", "Add task-success cases that require the skill's core workflow to produce verifiable evidence.")
     if counts["negative"] < min_negative:
-        finding("missing-negative-evals", "required", f"Only {counts['negative']} negative/adversarial cases; target at least {min_negative}.")
+        finding(FindingKind.MISSING_NEGATIVE_EVALS, f"Only {counts['negative']} negative/adversarial cases; target at least {min_negative}.")
         rec("negative-eval", "Add no-op/false-positive cases where a general checklist would overreach.")
     if counts["adversarial"] < min_adversarial:
-        finding("missing-adversarial-evals", "recommended", f"Only {counts['adversarial']} adversarial cases; target at least {min_adversarial}.")
+        finding(FindingKind.MISSING_ADVERSARIAL_EVALS, f"Only {counts['adversarial']} adversarial cases; target at least {min_adversarial}.")
         rec("adversarial-eval", "Add near-miss prompts that look like they need the skill but should be refused, scoped down, or handled cautiously.")
     if counts["holdout"] == 0 or counts["holdback"] == 0:
-        finding("missing-hidden-splits", "required", f"holdout={counts['holdout']}, holdback={counts['holdback']}; both should be present.")
+        finding(FindingKind.MISSING_HIDDEN_SPLITS, f"holdout={counts['holdout']}, holdback={counts['holdback']}; both should be present.")
         rec("holdout-holdback", "Add private prompt_ref cases under evals/holdout and evals/holdback with ignored answer keys.")
     if counts["ablations"] == 0:
-        finding("missing-ablation-plan", "recommended", "No ablations declared.")
+        finding(FindingKind.MISSING_ABLATION_PLAN, "No ablations declared.")
     components = skill_heading_components(skill_text)
     suggested_ablations = []
     existing_ab = {str(a.get("removed_component", "")).lower() for a in manifest.get("ablations", [])}
@@ -20030,23 +20715,35 @@ def audit_manifest_report(
     if suggested_ablations:
         rec("ablation-plan", "Consider ablations for major skill sections not yet represented exactly by removed_component.", suggested_ablations[:5])
     if counts["trigger_positive"] < min_trigger_pos or counts["trigger_negative"] < min_trigger_neg:
-        finding("missing-trigger-no-trigger-cases", "required", f"trigger positives={counts['trigger_positive']}, trigger negatives={counts['trigger_negative']}; targets {min_trigger_pos}/{min_trigger_neg}.")
+        finding(FindingKind.MISSING_TRIGGER_CASES, f"trigger positives={counts['trigger_positive']}, trigger negatives={counts['trigger_negative']}; targets {min_trigger_pos}/{min_trigger_neg}.")
         rec("trigger-cases", "Add both TRIGGER and NO_TRIGGER cases with anchored expected-trigger-label regex assertions.")
 
     benchmark_summary = None
     bench_report = None
     if runs:
-        report = build_benchmark_report(manifest_path, Path(runs), split)
+        # The audit's benchmark is graded exactly as `benchmark` would grade it:
+        # without the judge verdicts a judged suite is partial, which readiness
+        # reports as a blocker rather than reading empty lists as all clear.
+        report = build_benchmark_report(manifest_path, Path(runs), split, None, judge_results_path,
+                                        **(grading or {}), min_lift=min_lift)
         bench_report = report
         benchmark_summary = {"summary": report["summary"], "case_flags": report["case_flags"]}
         for flag in report["case_flags"]:
-            for f in flag.get("flags", []):
-                if "saturated" in f and flag.get("eval_intent") != "regression":
-                    finding("saturated-eval", "recommended", f"Case {flag['case_id']} is saturated/non-discriminating.", flag)
-                elif "no objective lift" in f and flag.get("eval_intent") != "regression":
-                    finding("no-lift-eval", "recommended", f"Case {flag['case_id']} shows no objective lift.", flag)
-                elif "flaky" in f:
-                    finding("flaky-eval", "required", f"Case {flag['case_id']} has repeated-run variance.", flag)
+            present = CaseFlag.in_row(flag.get("flags"))
+            guard = flag.get("eval_intent") == "regression"
+            if CaseFlag.FLOOR in present:
+                # Regression guards included: a guard nothing passes is not holding.
+                finding(FindingKind.FLOOR_EVAL,
+                        f"Case {flag['case_id']} fails in both arms on every scored run; "
+                        "audit the case and its assertions before making it harder.", flag)
+            if CaseFlag.SATURATED in present and not guard:
+                finding(FindingKind.SATURATED_EVAL, f"Case {flag['case_id']} is saturated/non-discriminating.", flag)
+            if (CaseFlag.NO_OBJECTIVE_LIFT in present and CaseFlag.FLOOR not in present
+                    and not guard):
+                measure = "judge-gated" if flag.get("signal") == "combined" else "objective"
+                finding(FindingKind.NO_LIFT_EVAL, f"Case {flag['case_id']} shows no {measure} lift.", flag)
+            if CaseFlag.FLAKY in present:
+                finding(FindingKind.FLAKY_EVAL, f"Case {flag['case_id']} has repeated-run variance.", flag)
         assertion_rows = []
         by_case = ResultSet(report["results"]).by_case_variant()   # scorable + grouped, once
         for case_id, by_variant in by_case.items():
@@ -20060,7 +20757,7 @@ def audit_manifest_report(
                 if "with_skill" in rates and "without_skill" in rates and rates["with_skill"] == rates["without_skill"]:
                     assertion_rows.append({"case_id": case_id, "assertion": name, "rates": rates})
         if assertion_rows:
-            finding("non-discriminating-assertions", "recommended", f"{len(assertion_rows)} assertions have identical with/without pass rates.", assertion_rows[:20])
+            finding(FindingKind.NON_DISCRIMINATING_ASSERTIONS, f"{len(assertion_rows)} assertions have identical with/without pass rates.", assertion_rows[:20])
             rec("assertion-design", "Replace keyword-only checks with source/artifact-backed assertions or stricter behavioral regexes for identical-rate assertions.")
 
     # 1.7: a case whose checks are all demo/live tiers can look solid while
@@ -20075,17 +20772,17 @@ def audit_manifest_report(
         elif case_assertions and "lexical" in tiers and "strong" not in tiers:
             lexical_only.append(case.get("id"))
     if weak_only:
-        finding("weak-oracle-only", "recommended", f"{len(weak_only)} case(s) are graded only by demo/live oracles (no deterministic check): {weak_only[:10]}. Add a strong-tier assertion, or mark a verified script oracle oracle:\"strong\".", weak_only[:20])
+        finding(FindingKind.WEAK_ORACLE_ONLY, f"{len(weak_only)} case(s) are graded only by demo/live oracles (no deterministic check): {weak_only[:10]}. Add a strong-tier assertion, or mark a verified script oracle oracle:\"strong\".", weak_only[:20])
     # Deterministic is not strong: a keyword/regex check is reproducible but only
     # as strong as its ability to fail a wrong answer. Recommendations only, so
     # --fail-on-blockers behaves exactly as before.
     if lexical_only:
-        finding("lexical-oracle-only", "recommended", f"{len(lexical_only)} case(s) have no check stronger than keyword/regex matching: {lexical_only[:10]}. Add a structured/golden/process assertion or a verified script oracle, or scope the regexes to the output's structure.", lexical_only[:20])
+        finding(FindingKind.LEXICAL_ORACLE_ONLY, f"{len(lexical_only)} case(s) have no check stronger than keyword/regex matching: {lexical_only[:10]}. Add a structured/golden/process assertion or a verified script oracle, or scope the regexes to the output's structure.", lexical_only[:20])
     generic_alternatives, redundant_assertions = lexical_assertion_findings(cases)
     if generic_alternatives:
-        finding("generic-lexical-alternative", "recommended", f"{len(generic_alternatives)} contains/contains_any assertion(s) accept a generic value (<= {GENERIC_ALTERNATIVE_MAX_CHARS} characters or a common word) that most answers contain whether right or wrong. Replace it with a regex scoped to the specific claim, or drop the alternative.", generic_alternatives[:30])
+        finding(FindingKind.GENERIC_LEXICAL_ALTERNATIVE, f"{len(generic_alternatives)} contains/contains_any assertion(s) accept a generic value (<= {GENERIC_ALTERNATIVE_MAX_CHARS} characters or a common word) that most answers contain whether right or wrong. Replace it with a regex scoped to the specific claim, or drop the alternative.", generic_alternatives[:30])
     if redundant_assertions:
-        finding("redundant-assertion", "recommended", f"{len(redundant_assertions)} assertion(s) can never fail on their own: every output that passes another assertion in the same case also passes them, so they add a green check without adding an oracle.", redundant_assertions[:30])
+        finding(FindingKind.REDUNDANT_ASSERTION, f"{len(redundant_assertions)} assertion(s) can never fail on their own: every output that passes another assertion in the same case also passes them, so they add a green check without adding an oracle.", redundant_assertions[:30])
 
     # Cost-quality findings (issue #21): where money is being spent without
     # buying signal. Only computable when run data is supplied.
@@ -20121,11 +20818,11 @@ def audit_manifest_report(
             # cheap or expensive, so it must not drive a dollar finding.
             if cost is None or cost < expensive_case_usd:
                 continue
-            case_flag_list = flags_by_case.get(case_id, [])
-            if any("saturated" in f for f in case_flag_list):
-                finding("expensive-saturated-case", "recommended", f"Case {case_id} cost ${cost} but is saturated/non-discriminating — spend without signal.", spend)
-            elif any("no objective lift" in f for f in case_flag_list):
-                finding("expensive-no-lift-case", "recommended", f"Case {case_id} cost ${cost} with no objective lift — spend without signal.", spend)
+            present = CaseFlag.in_row(flags_by_case.get(case_id, []))
+            if CaseFlag.SATURATED in present:
+                finding(FindingKind.EXPENSIVE_SATURATED_CASE, f"Case {case_id} cost ${cost} but is saturated/non-discriminating — spend without signal.", spend)
+            elif CaseFlag.NO_OBJECTIVE_LIFT in present:
+                finding(FindingKind.EXPENSIVE_NO_LIFT_CASE, f"Case {case_id} cost ${cost} with no objective lift — spend without signal.", spend)
         judge_only_ids = {
             case_id for case in cases if is_judge_only_case(case)
             if isinstance((case_id := case.get("id")), str)
@@ -20133,7 +20830,7 @@ def audit_manifest_report(
         for case_id in sorted(judge_only_ids):
             cost = (cost_by_case.get(case_id) or {}).get("total_cost_usd")
             if cost is not None and cost >= expensive_case_usd:
-                finding("high-cost-judge-only-case", "recommended", f"Case {case_id} cost ${cost} and is graded only by judge assertions; a deterministic/script oracle would make the spend verifiable.", cost_by_case.get(case_id))
+                finding(FindingKind.HIGH_COST_JUDGE_ONLY_CASE, f"Case {case_id} cost ${cost} and is graded only by judge assertions; a deterministic/script oracle would make the spend verifiable.", cost_by_case.get(case_id))
         ablation_rows = [{**result_cost_facts(r), "variant": str(r.get("variant", ""))}
                          for r in bench_report.get("results", []) if is_ablation_variant(r.get("variant", ""))]
         ablation_spend = {variant: slot["total_cost_usd"] for variant, slot in group_spend(ablation_rows, lambda r: r["variant"]).items()
@@ -20141,11 +20838,11 @@ def audit_manifest_report(
         structured = {f"ablation:{a.get('id')}" for a in manifest.get("ablations", []) if any(isinstance(spec, dict) and spec.get("cases") and spec.get("assertions") for spec in a.get("expected_regressions", []))}
         for variant, spend_usd in sorted(ablation_spend.items()):
             if spend_usd >= expensive_case_usd and variant not in structured:
-                finding("ablation-high-spend-no-structured-regression", "recommended", f"Ablation arm {variant} cost ${spend_usd} but declares no structured expected_regressions (cases+assertions) to confirm — the spend cannot become causal evidence.", {"variant": variant, "total_cost_usd": spend_usd})
+                finding(FindingKind.ABLATION_HIGH_SPEND_NO_REGRESSION, f"Ablation arm {variant} cost ${spend_usd} but declares no structured expected_regressions (cases+assertions) to confirm — the spend cannot become causal evidence.", {"variant": variant, "total_cost_usd": spend_usd})
         overall_lift = (bench_report.get("paired_summary", {}) or {}).get("absolute_delta")
         static_tokens = approximate_tokens(skill_text)
         if static_tokens >= 3000 and isinstance(overall_lift, (int, float)) and overall_lift <= 0.05:
-            finding("high-footprint-low-lift-skill", "recommended", f"Skill carries ~{static_tokens} static tokens into every run but measured lift is {overall_lift:.3f}; the footprint is not buying signal.", {"static_tokens": static_tokens, "lift": overall_lift})
+            finding(FindingKind.HIGH_FOOTPRINT_LOW_LIFT_SKILL, f"Skill carries ~{static_tokens} static tokens into every run but measured lift is {overall_lift:.3f}; the footprint is not buying signal.", {"static_tokens": static_tokens, "lift": overall_lift})
 
     # 2.7b: a held-out case's grading criteria must stay out of the skill and
     # the public eval text — a skill must not teach to the rubric it will be
@@ -20189,7 +20886,7 @@ def audit_manifest_report(
                         leak["normalization"] = prompt_match.normalization_dict()
                     held_out_leaks.append(leak)
     if held_out_leaks:
-        finding("held-out-rubric-leak", "required", f"{len(held_out_leaks)} held-out rubric string(s) appear in the skill or public eval text; held-out grading criteria must stay invisible to generation.", held_out_leaks[:10])
+        finding(FindingKind.HELD_OUT_RUBRIC_LEAK, f"{len(held_out_leaks)} held-out rubric string(s) appear in the skill or public eval text; held-out grading criteria must stay invisible to generation.", held_out_leaks[:10])
 
     # 1.3: the judge must not be the model under test. Compare the declared
     # judge model against the manifest's jetty.model and, when run data is
@@ -20210,10 +20907,7 @@ def audit_manifest_report(
                     under_test.add(meta_model)
         for jm in judge_models:
             if jm in under_test:
-                finding(
-                    "judge-is-model-under-test",
-                    "required",
-                    f"judge model {jm!r} is also a model under test; a model grading its own output inflates qualitative scores. Use a different judge model (or pass --strict-judge in CI to make this fatal).",
+                finding(FindingKind.JUDGE_IS_MODEL_UNDER_TEST, f"judge model {jm!r} is also a model under test; a model grading its own output inflates qualitative scores. Use a different judge model (or pass --strict-judge in CI to make this fatal).",
                     sorted(under_test),
                 )
 
@@ -20227,24 +20921,90 @@ def audit_manifest_report(
     for ablation in manifest.get("ablations", []):
         aid = ablation.get("id")
         if not ablation_components(ablation):
-            finding("ablation-instruction-simulated", "recommended", f"ablation {aid!r} is instruction-simulated (label-only): the full skill is mounted with a prompt directive to ignore the component, so the arm is non-blind and yields a raw measurement only (it cannot be confirmation-graded). Declare a mechanism+target (section/list_item/frontmatter_field/reference/patch) to materialize it as a blind, removal-based ablation.")
+            finding(FindingKind.ABLATION_INSTRUCTION_SIMULATED, f"ablation {aid!r} is instruction-simulated (label-only): the full skill is mounted with a prompt directive to ignore the component, so the arm is non-blind and yields a raw measurement only (it cannot be confirmation-graded). Declare a mechanism+target (section/list_item/frontmatter_field/reference/patch) to materialize it as a blind, removal-based ablation.")
             continue
         if not ablation.get("expected_regressions"):
-            finding("ablation-no-expected-regression", "recommended", f"ablation {aid!r} declares a removal but no expected_regressions; without a discriminating case it cannot become evidence.")
+            finding(FindingKind.ABLATION_NO_EXPECTED_REGRESSION, f"ablation {aid!r} declares a removal but no expected_regressions; without a discriminating case it cannot become evidence.")
         for comp in ablation_components(ablation):
             if comp.get("mechanism") == "reference":
                 rpath = comp.get("target", {}).get("path")
                 if rpath and f"]({rpath})" not in skill_text:
-                    finding("ablation-dangling-reference", "recommended", f"ablation {aid!r}: reference {rpath!r} is not linked from the skill body; its pointer removal may be a no-op.")
+                    finding(FindingKind.ABLATION_DANGLING_REFERENCE, f"ablation {aid!r}: reference {rpath!r} is not linked from the skill body; its pointer removal may be a no-op.")
         for spec in ablation.get("expected_regressions", []):
             if not isinstance(spec, dict):
                 continue
             for cid in spec.get("cases", []):
                 if cid not in ablation_case_ids:
-                    finding("ablation-unknown-case", "recommended", f"ablation {aid!r}: expected_regression names unknown case {cid!r}.")
+                    finding(FindingKind.ABLATION_UNKNOWN_CASE, f"ablation {aid!r}: expected_regression names unknown case {cid!r}.")
             for an in spec.get("assertions", []):
                 if an not in ablation_assertion_names:
-                    finding("ablation-unknown-assertion", "recommended", f"ablation {aid!r}: expected_regression names unknown assertion {an!r}.")
+                    finding(FindingKind.ABLATION_UNKNOWN_ASSERTION, f"ablation {aid!r}: expected_regression names unknown assertion {an!r}.")
+
+    readiness = eval_readiness(manifest, manifest_path, split=split, leakage_min_chars=leakage_min_chars, benchmark_report=bench_report)
+
+    # Mark 1: where the cases came from.
+    answer_cases = [c for c in cases if c.get("kind") != "trigger"]
+    sources = collections.Counter(str(c["source"]) for c in cases if c.get("source"))
+    unsourced = [c.get("id") for c in cases if not c.get("source")]
+    if cases and unsourced:
+        finding(FindingKind.CASE_SOURCE_UNRECORDED,
+                f"{len(unsourced)} of {len(cases)} case(s) record no source (production, bug-report, "
+                "hand-written, synthesized or imported), so nothing shows the cases mirror real use.",
+                unsourced[:30])
+    elif cases and set(sources) == {"synthesized"}:
+        finding(FindingKind.SYNTHESIZED_CASES_ONLY,
+                "every case is synthesized; add cases drawn from real requests or bug reports.")
+
+    # Mark 2: the grader on known answers.
+    known = known_answer_check(manifest, manifest_path, split=split)
+    if known["reference_failures"]:
+        finding(FindingKind.REFERENCE_ANSWER_FAILS,
+                f"{len(known['reference_failures'])} case(s) fail their own reference answer; "
+                "fix the check or the answer before trusting a score.", known["reference_failures"])
+    null_passes = [cid for cid in known["null_answer_passes"]
+                   if cid not in set(readiness["leak_saturated_cases"])]
+    if null_passes:
+        finding(FindingKind.NULL_ANSWER_PASSES,
+                f"{len(null_passes)} case(s) pass every gate check when the answer only echoes the "
+                "prompt; the checks cannot tell an answer from no answer.", null_passes)
+
+    # Marks 3-5 on runs: only a complete benchmark can support them.
+    bench_complete = bool(bench_report) and bench_report.get("availability") == "complete"
+    if bench_complete:
+        runs_notes: list[str] = []
+    elif bench_report:
+        runs_notes = ["the benchmark is incomplete: " + "; ".join(
+            incomplete_remedy(cause) for cause in bench_report.get("incomplete_reasons") or [])]
+    else:
+        runs_notes = ["measured on runs: pass --runs"]
+    if bench_report:
+        measured = run_measured_findings(bench_report) if bench_complete else []
+        for item in [*measured, *run_condition_findings(bench_report)]:
+            findings.append(item.as_dict())
+
+    health = eval_health(
+        [*findings, *readiness["blocker_findings"]],
+        observed={
+            EvalMark.REALISTIC: bool(sources),
+            EvalMark.GRADER: bool(known["references_checked"] or known["null_answers_checked"]),
+            EvalMark.HEADROOM: bench_complete,
+            EvalMark.NOISE: bench_complete,
+            EvalMark.ISOLATION: bench_complete,
+        },
+        notes={
+            EvalMark.REALISTIC: ([(
+                "activation is forced: the task tells the agent to use the skill, while real use "
+                "relies on discovery (issue #48)")] if answer_cases else []),
+            EvalMark.GRADER: ([] if known["references_checked"] else [
+                "no case declares reference_answer, so no known-good answer was graded"]),
+            EvalMark.HEADROOM: runs_notes,
+            EvalMark.NOISE: runs_notes,
+            EvalMark.ISOLATION: runs_notes + ([(
+                "the leakage lint ran on the manifest; the effort and served-model checks "
+                "read only the runs present" if bench_report else
+                "the leakage lint ran on the manifest; effort and served-model checks need "
+                "--runs")] if not bench_complete else []),
+        })
 
     return {
         "generated_at": int(time.time()),
@@ -20255,12 +21015,22 @@ def audit_manifest_report(
         "findings": findings,
         "recommendations": recommendations,
         "recommended_fixture_repos_files": fixtures,
-        "readiness": eval_readiness(manifest, manifest_path, split=split, leakage_min_chars=leakage_min_chars, benchmark_report=bench_report),
+        "readiness": readiness,
+        "known_answer_check": known,
+        "case_sources": dict(sorted(sources.items())),
+        "eval_health": health,
         "benchmark": benchmark_summary,
+        "benchmark_availability": bench_report.get("availability") if bench_report else None,
     }
 
 
 def audit_manifest(args: argparse.Namespace) -> int:
+    fail_on = None
+    if getattr(args, "fail_on", None):
+        try:
+            fail_on = gate_policy.parse_fail_on(args.fail_on)
+        except ValueError as exc:
+            die(str(exc))
     report = audit_manifest_report(
         Path(args.manifest),
         skill_path=args.skill_path,
@@ -20273,11 +21043,13 @@ def audit_manifest(args: argparse.Namespace) -> int:
         min_trigger_neg=args.min_trigger_neg,
         leakage_min_chars=args.leakage_min_chars,
         expensive_case_usd=getattr(args, "expensive_case_usd", 1.0),
+        min_lift=getattr(args, "min_lift", None),
+        judge_results_path=getattr(args, "judge_results", None),
+        grading=grading_options(args),
     )
     if args.format == "markdown":
-        lines = [f"# Eval audit — {report['skill_name']}", "", "## Counts", "", "| Metric | Value |", "|---|---:|"]
-        for k, v in report["counts"].items():
-            lines.append(f"| {k} | {v} |")
+        lines = [f"# Eval audit — {report['skill_name']}", "", "## Counts", "",
+                 *md_table(["Metric", "Value"], report["counts"].items(), align="lr")]
         rd = report.get("readiness", {})
         lines += ["", "## Readiness", "",
                   (f"- ablations materialized: {rd.get('ablations',{}).get('materialized',0)}/{rd.get('ablations',{}).get('total',0)} "
@@ -20285,8 +21057,9 @@ def audit_manifest(args: argparse.Namespace) -> int:
                   f"- leak-saturated cases: {len(rd.get('leak_saturated_cases',[]))}",
                   f"- objective-only cases (no judge assertion): {len(rd.get('objective_only_cases',[]))}",
                   f"- adversarial cases: {rd.get('adversarial_cases',0)}   judge-only cases: {rd.get('judge_only_cases',0)}"]
-        if rd.get("base_saturated_cases") or rd.get("qualitative_only_cases"):
+        if rd.get("base_saturated_cases") or rd.get("qualitative_only_cases") or rd.get("floor_cases"):
             lines.append(f"- measured signals: base-saturated (with==without): {len(rd.get('base_saturated_cases',[]))}   "
+                         f"floor (both arms fail): {len(rd.get('floor_cases',[]))}   "
                          f"qualitative-only (judge carries the lift): {len(rd.get('qualitative_only_cases',[]))}")
         if rd.get("regression_guards_holding"):
             lines.append(f"- regression guards holding (expected steady-state green): {len(rd.get('regression_guards_holding',[]))}")
@@ -20296,6 +21069,14 @@ def audit_manifest(args: argparse.Namespace) -> int:
                 lines.append(f"    - {b}")
         else:
             lines.append("- **ready**: no blockers ✓")
+        lines += ["", "## Eval health", "", *md_table(
+            ["Mark", "Question", "Status", "Findings"],
+            [[mark["mark"], mark["question"], mark["status"], mark["finding_kinds"]]
+             for mark in report["eval_health"]["marks"]],
+            align="rlll")]
+        for mark in report["eval_health"]["marks"]:
+            for note in mark.get("notes", []):
+                lines.append(f"- mark {mark['mark']}: {note}")
         lines += ["", "## Findings", ""]
         if report["findings"]:
             for f in report["findings"]:
@@ -20310,30 +21091,41 @@ def audit_manifest(args: argparse.Namespace) -> int:
                 lines.append("  " + json.dumps(r["example"], indent=2, ensure_ascii=False).replace("\n", "\n  "))
                 lines.append("  ```")
         text = "\n".join(lines) + "\n"
-        if args.out:
-            Path(args.out).write_text(text, encoding="utf-8")
-        else:
-            print(text)
+        emit_text(text, args.out)
     else:
         emit_report(report, args.out)
     # CI gate: non-zero exit when the readiness blockers are non-empty, so a skill
     # repo can keep its eval suite at "worth paying to run" the same way it keeps
     # tests green. Off by default — the audit stays a report unless asked to gate.
-    blockers = report.get("readiness", {}).get("blockers", [])
-    if getattr(args, "fail_on_blockers", False) and blockers:
-        for b in blockers:
+    readiness = report.get("readiness", {})
+    blocker_findings = readiness.get("blocker_findings", [])
+    if getattr(args, "fail_on_blockers", False) and gate_policy.READINESS.decide(blocker_findings).failed:
+        for b in readiness.get("blockers", []):
             print(f"readiness blocker: {b}", file=sys.stderr)
-        print(f"audit-manifest: {len(blockers)} readiness blocker(s) for {report.get('skill_name')!r}", file=sys.stderr)
+        print(f"audit-manifest: {len(blocker_findings)} readiness blocker(s) for {report.get('skill_name')!r}", file=sys.stderr)
         return 1
     # 1.3 guard: warn by default (the finding is in the report), error under
     # --strict-judge so CI can refuse a self-judging eval suite.
     if getattr(args, "strict_judge", False):
-        offenders = [f for f in report.get("findings", []) if f.get("kind") == "judge-is-model-under-test"]
+        offenders = [f for f in report.get("findings", []) if gate_policy.SELF_JUDGING.matches(f)]
         if offenders:
             for f in offenders:
                 print(f"strict-judge: {f['message']}", file=sys.stderr)
             return 1
+    if fail_on is not None:
+        decision = fail_on.decide(
+            [*report.get("findings", []), *blocker_findings],
+            complete=report.get("benchmark_availability") in (None, "complete"),
+            incomplete_reason="the benchmark report is incomplete, so run-measured findings are unknown")
+        return gate_exit(decision, "fail-on")
     return 0
+
+
+def gate_exit(decision: gate_policy.GateDecision, label: str) -> int:
+    """Print each reason a gate failed to stderr and return the exit code."""
+    for reason in decision.reasons:
+        print(f"{label}: {reason}", file=sys.stderr)
+    return decision.exit_code
 
 
 SUITE_TIERS = {"preflight", "static", "prepare", "jetty-dry-run"}
@@ -20791,7 +21583,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """The complete CLI surface, buildable without parsing. Split out of
     main() so tests can enumerate every subcommand and flag (e.g. the
     README-coverage doc-sync guard) without invoking anything."""
-    parser = argparse.ArgumentParser(description=__doc__)
+    # allow_abbrev=False on the parser and every subparser: a prefix of a long
+    # option is an error, not that option, so renaming a flag cannot leave its
+    # old spelling's prefix working and a user's abbreviation never silently
+    # picks a flag.
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("agent-capabilities", help="list unified backend registrations and supported surfaces")
@@ -20874,6 +21670,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--runs", required=True, help="output runs directory")
     p.add_argument("--codex-cmd", default=CODEX_ANSWER_DEFAULT_CMD, help="argv-style Codex command prefix that reads prompt on stdin and emits Codex JSONL; shell metacharacters are not interpreted")
     p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
+    p.add_argument("--effort", choices=EFFORT_LEVELS, help="requested reasoning effort, recorded on every run; omit to run at the backend default (also recorded, since defaults differ by model and CLI)")
 
     p = sub.add_parser("run-claude", help="run prepared tasks through `claude -p --output-format json`, capturing cost/usage")
     p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
@@ -20881,6 +21678,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", help="claude model id (e.g. claude-haiku-4-5-20251001); omit for the CLI default")
     p.add_argument("--claude-bin", default="claude", help="path to the claude executable (a stub in tests)")
     p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
+    p.add_argument("--effort", choices=EFFORT_LEVELS, help="requested reasoning effort, recorded on every run; omit to run at the backend default (also recorded, since defaults differ by model and CLI)")
 
     p = sub.add_parser("run-agent", help="run prepared tasks through a registered native agent backend")
     p.add_argument("--agent", required=True, choices=sorted(AGENT_BACKENDS), help="native backend to use")
@@ -20888,13 +21686,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--runs", required=True, help="output runs directory")
     p.add_argument("--model", help="model id passed to the backend; a row-level model wins")
     p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
+    p.add_argument("--effort", choices=EFFORT_LEVELS, help="requested reasoning effort, recorded on every run; omit to run at the backend default (also recorded, since defaults differ by model and CLI)" + "; refused on backends with no known effort control or for a level the backend's CLI does not accept")
     add_surface_cli_options(p, "answer")
 
     p = sub.add_parser("run-subagent", help="run prepared tasks through an in-process subagent backend (Claude CLI by default, --agent-cmd for any provider); hosts tool replay")
     p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
     p.add_argument("--runs", required=True, help="output runs directory")
     p.add_argument("--model", help="model id passed to the backend; a row-level model wins")
-    p.add_argument("--agent-cmd", help="shell command reading {prompt, model, workspace} JSON on stdin and emitting {answer, trace?, usage?} JSON on stdout")
+    p.add_argument("--agent-cmd", help="shell command reading {prompt, model, workspace} JSON on stdin and emitting {answer, trace?, usage?, stop_class?, stop_reason?, served_models?} JSON on stdout")
     p.add_argument("--claude-bin", default="claude", help="path to the claude executable for the default backend")
     p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
     p.add_argument("--tool-replay", choices=sorted(TOOL_REPLAY_MODES), help=f"tool replay mode; defaults from ${TOOL_REPLAY_ENV} (off)")
@@ -20906,10 +21705,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--variant", action="append")
     p.add_argument("--out")
     p.add_argument("--judge-tasks")
-    p.add_argument("--judge-results", help="JSONL/JSON results keyed by judge_task_id; merges qualitative scoring")
-    p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from the manifest")
-    p.add_argument("--strict", action="store_true", help="promote soft-severity assertions to gates (roadmap 2.2)")
-    p.add_argument("--embed-cmd", help="external embedding command enabling similarity mode=embedding (opt-in; stdin {texts:[a,b]} -> stdout {embeddings:[[..],[..]]})")
+    add_grading_options(p)
     p.add_argument("--write-grading-files", action="store_true", help="write Anthropic-compatible grading.json files into each run directory")
 
     p = sub.add_parser("judge")
@@ -20935,10 +21731,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--runs", required=True)
     p.add_argument("--split", choices=sorted(VALID_SPLITS))
     p.add_argument("--variant", action="append")
-    p.add_argument("--judge-results", help="merge qualitative judge scoring into combined pass rates")
-    p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from the manifest")
-    p.add_argument("--strict", action="store_true", help="promote soft-severity assertions to gates (roadmap 2.2)")
-    p.add_argument("--embed-cmd", help="external embedding command enabling similarity mode=embedding (opt-in)")
+    add_grading_options(p)
+    p.add_argument("--min-lift", type=float, help="smallest pass-rate lift you would act on (e.g. 0.1); the noise check reports whether the eval can resolve it")
     p.add_argument("--out")
 
     p = sub.add_parser("report", help="serialize a benchmark.json for CI: JUnit XML or GitHub job-summary markdown + annotations")
@@ -20952,7 +21746,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--out")
 
     p = sub.add_parser("judge-alignment", help="validate a judge against HUMAN labels: agreement, Cohen's kappa, precision/recall/F1 (feature 2)")
-    p.add_argument("--labels", required=True, help="human labels keyed by judge_task_id ({judge_task_id, passed}); JSONL or JSON")
+    p.add_argument("--labels", required=True, help="the served review's feedback.json (entries naming a judge assertion with a pass/fail verdict), or a legacy {judge_task_id, passed} JSONL/JSON file")
     p.add_argument("--judge-results", required=True, help="judge verdicts keyed by judge_task_id (the judge output to validate)")
     p.add_argument("--min-labels", type=int, default=50, help="warn below this many matched labels (metrics unstable)")
     p.add_argument("--out")
@@ -20960,6 +21754,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("error-analysis", help="open-coding review queue + axial failure taxonomy over a benchmark.json (feature 8; model-free)")
     p.add_argument("--benchmark", required=True, help="benchmark.json produced by `skill-benchmark benchmark --out`")
     p.add_argument("--limit", type=int, default=100, help="max review-queue rows to emit")
+    p.add_argument("--feedback", help="the served review's feedback.json; run-level notes fill the queue's note slot")
     p.add_argument("--out")
 
     p = sub.add_parser("contamination", help="output-side contamination perimeter: canary tripwire, output<->answer n-gram overlap, released_at/cutoff gate (model-free)")
@@ -20969,7 +21764,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--ngram", type=int, default=8, help="word n-gram size for output<->answer overlap")
     p.add_argument("--overlap-threshold", type=float, default=0.6, help="flag when this fraction of the answer key's n-grams appear verbatim in the output")
     p.add_argument("--model-cutoff", help="model training cutoff (e.g. 2025-01); flags cases whose released_at is at/before it")
-    p.add_argument("--fail-on-contamination", action="store_true", help="exit non-zero if any contamination finding fires (CI gate)")
+    p.add_argument("--fail-on-contamination", action="store_true", help="exit non-zero if a contamination finding fires or an answer arm has no saved output to check (CI gate)")
     p.add_argument("--out")
 
     p = sub.add_parser("judge-robustness", help="probe a judge's stability: order-flip self-consistency + empty/master-key negative controls a robust judge must reject (model-touching; opt-in)")
@@ -20988,8 +21783,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--runs", required=True)
     p.add_argument("--split", choices=sorted(VALID_SPLITS))
     p.add_argument("--variant", action="append")
-    p.add_argument("--judge-results")
-    p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from the manifest before exporting")
+    add_grading_options(p)
     p.add_argument("--skill-path", default="")
     p.add_argument("--out")
 
@@ -21069,6 +21863,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--runs", help="single runs directory to use for every manifest")
     p.add_argument("--runs-subdir", default="eval-runs/latest", help="repo-relative runs directory when --runs is omitted")
     p.add_argument("--split", choices=sorted(VALID_SPLITS))
+    p.add_argument("--judge-results", help="judge verdicts for manifests with judge assertions; without them their lift reads as partial coverage")
     p.add_argument("--format", choices=["json", "markdown"], default="json")
     p.add_argument("--out")
 
@@ -21087,6 +21882,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--leakage-min-chars", type=int, default=4)
     p.add_argument("--fail-on-blockers", action="store_true", help="exit non-zero if the readiness block has any blockers (for CI gating of an eval suite)")
     p.add_argument("--strict-judge", action="store_true", help="exit non-zero when the declared judge model is also a model under test")
+    p.add_argument("--fail-on", action="append", metavar="KINDS", help="exit non-zero on these finding kinds, severities (required, recommended) or presets (blockers, strict-judge, contamination, judge-robustness); comma-separated, repeatable; fails closed on an incomplete benchmark")
+    p.add_argument("--min-lift", type=float, help="smallest lift worth acting on, for the noise check behind eval-health mark 4 (with --runs)")
+    add_grading_options(p)
     p.add_argument("--expensive-case-usd", type=float, default=1.0, help="dollar threshold above which cost-quality findings fire for saturated/no-lift/judge-only cases and unstructured ablation arms (issue #21)")
 
     p = sub.add_parser("materialize-ablations", help="Write real, ablated skill trees for declared materialized ablations")
@@ -21101,8 +21899,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--runs", help="Use one explicit runs dir for all manifests")
     p.add_argument("--split", choices=sorted(VALID_SPLITS))
     p.add_argument("--variant", action="append")
-    p.add_argument("--judge-results")
-    p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from manifests while aggregating")
+    add_grading_options(p)
     p.add_argument("--out")
 
     p = sub.add_parser("suite-run", help="Run an explicit allowlisted suite preflight/tier and write RUN_SCOPE.json")
@@ -21123,6 +21920,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow-extra-manifests", action="store_true", help="do not fail when --workspace-root has top-level manifests outside the suite allowlist")
     p.add_argument("--skip-pin-check", action="store_true", help="load the suite without verifying --pins tree hashes")
 
+    for subparser in sub.choices.values():
+        subparser.allow_abbrev = False
     return parser
 
 
@@ -21228,9 +22027,12 @@ def main() -> int:
         raise RuntimeError(
             f"CLI commands have no handler: {sorted(item.value for item in missing)}")
     answer_handler = answer_handlers.get(invocation.command.value)
-    if answer_handler is not None:
-        return answer_handler(args)
-    return builtin_handlers[invocation.command](args)
+    try:
+        if answer_handler is not None:
+            return answer_handler(args)
+        return builtin_handlers[invocation.command](args)
+    except RunLayoutError as exc:
+        die(str(exc))
 
 
 if __name__ == "__main__":

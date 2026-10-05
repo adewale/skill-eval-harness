@@ -183,10 +183,6 @@ def trigger_cohort_as_dict(cohort: TriggerCohort) -> dict[str, Any]:
     return _assert_never(cohort)
 
 
-def trigger_cohort_exit_code(cohort: TriggerCohort) -> int:
-    return 0 if isinstance(cohort, CompleteTriggerCohort) else 1
-
-
 def _query_summary_as_dict(query_id: str, query: str, expectation: TriggerExpectation,
                            observations: Sequence[TriggerObservation]) -> dict[str, Any]:
     block = trigger_cohort_as_dict(summarize_trigger_cohort(observations))

@@ -2,7 +2,7 @@
 
 This is the harness's executable example. It runs end to end with **no model and no
 API key**: a deterministic stub stands in for the model, so the whole
-prepare → run → report → ablation-confirmation loop is reproducible (and runs in
+prepare → run → judge → report → ablation-confirmation loop is reproducible (and runs in
 CI via `tests/test_example_demo.py`).
 
 The skill (`skills/demo/`) has two answer-path load-bearing pieces, each targeted by one
@@ -36,26 +36,40 @@ python3 $HARNESS validate evals/shared-benchmark.json --check-ablations
 
 # 2. prepare the with_skill / without_skill / ablation arms (materializes the ablations)
 python3 $HARNESS prepare evals/shared-benchmark.json --split tune \
-  --include-ablations --ablation-dir /tmp/demo-abl --runs-per-variant 4 \
+  --include-ablations --ablation-dir /tmp/demo-abl --runs-per-variant 6 \
   --out /tmp/demo-tasks.jsonl
 
 # 3. run every arm with the deterministic stub 'model'
 python3 $HARNESS run-codex --tasks /tmp/demo-tasks.jsonl --runs /tmp/demo-runs \
   --codex-cmd "python3 $(pwd)/stub_runner.py"
 
-# 4. score + see the ablation_regressions block
-python3 $HARNESS benchmark evals/shared-benchmark.json --runs /tmp/demo-runs \
-  --variant with_skill --variant without_skill \
-  --variant ablation:no-severity --variant ablation:no-checklist
+# 4. judge the one qualitative assertion with the offline stub judge
+V="--variant with_skill --variant without_skill \
+   --variant ablation:no-severity --variant ablation:no-checklist"
+python3 $HARNESS judge evals/shared-benchmark.json --runs /tmp/demo-runs $V \
+  --judge-cmd "python3 $(pwd)/stub_judge.py" --out /tmp/demo-judge.jsonl
+
+# 5. score, then read the ablation_regressions block in /tmp/demo-bench.json
+python3 $HARNESS benchmark evals/shared-benchmark.json --runs /tmp/demo-runs $V \
+  --judge-results /tmp/demo-judge.jsonl --out /tmp/demo-bench.json
 ```
 
-You should see `with_skill` pass both objective assertions, `without_skill` fail both
-(the `actionable-review` judge assertion stays deferred until you run `judge`), and each
-ablation arm fail exactly the one assertion whose guidance it removed — each reported
-as an `expected_regression_confirmed` because the ablation is **materialized** (a real
-edited tree, blind, with verified provenance) and the four repeated runs clear the
-per-case significance gate. With a single run per arm the same observed drop is reported
-as indeterminate, not confirmed. Swap the stub for a real runner
+You should see `with_skill` pass both objective assertions and `without_skill` fail both.
+The stub judge passes `actionable-review` on `with_skill` and `ablation:no-checklist` and
+fails it on `without_skill` and `ablation:no-severity`. Each ablation arm fails exactly the
+one objective assertion whose guidance it removed, and each is reported with
+`evidence_class: "confirmed_causal"` and `expected_regression_confirmed: true`, for two
+reasons. The ablation is **materialized** (a real edited tree, blind, with verified
+provenance), and six unanimous repeats reach the per-case sign-flip test's threshold:
+`min_p_value: 0.03125` (2/2^6), under 0.05.
+
+Fewer repeats, or a skipped step 4, give `indeterminate` for the same observed drop, each
+with its own note. At four repeats the smallest possible p is 0.125, and the note reads
+`regression observed but not significant per case across replicates (min p=0.125); p <= 0.05
+needs at least 6 matched replicate pairs that move the same way (the smallest reachable p with 6
+is 0.03125)`. Without step 4 the report is partial and the note
+reads `grading evidence is incomplete`, however many repeats you ran, because a declared
+grader has not produced its verdicts. Swap the stub for a real runner
 (`--codex-cmd "codex exec"`, etc.) to run it against an actual model — for Claude, use `skill-benchmark run-claude` instead, which parses the `claude -p` JSON envelope and captures cost.
 
 ## Measure activation (does the skill load on its own?)

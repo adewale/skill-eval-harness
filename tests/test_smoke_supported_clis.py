@@ -1,9 +1,8 @@
 """Offline contract tests for the opt-in supported-CLI live-smoke runner."""
 from __future__ import annotations
 
-import argparse
-import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -11,15 +10,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from helpers import ROOT, load_example_module
+
 from agent_capabilities import AGENT_CAPABILITIES, SMOKE_TARGETS, SmokeTarget
 from trigger_contracts import InvocationOutcome
 
-ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "smoke_supported_clis.py"
-_spec = importlib.util.spec_from_file_location("smoke_supported_clis", SCRIPT)
-assert _spec and _spec.loader
-smoke = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(smoke)
+smoke = load_example_module("smoke_supported_clis", "scripts/smoke_supported_clis.py")
 
 
 class SupportedCliSmokeTests(unittest.TestCase):
@@ -47,22 +44,21 @@ class SupportedCliSmokeTests(unittest.TestCase):
              for name, target in SMOKE_TARGETS.items()},
             expected,
         )
-        self.assertEqual(set(smoke.DEFAULT_MODELS), set(SMOKE_TARGETS))
         for name, target in SMOKE_TARGETS.items():
             capability = AGENT_CAPABILITIES[name]
             self.assertTrue(capability.answer_runner if target.population == "answer" else capability.autonomous_trigger)
             self.assertEqual(target.resolved_model({target.model_env: "  "}), target.fallback_model)
             self.assertEqual(target.resolved_model({target.model_env: "custom/model"}), "custom/model")
-        parser = smoke.argparse.ArgumentParser()
-        with mock.patch.object(smoke.argparse, "ArgumentParser", return_value=parser):
-            # parse_args owns one --<agent>-model option per registry target.
-            with mock.patch.object(parser, "parse_args", return_value=None):
-                smoke.parse_args()
-        defaults = {
-            action.dest: action.default for action in parser._actions
-            if action.dest.endswith("_model")
-        }
-        self.assertEqual(defaults, {f"{name}_model": smoke.DEFAULT_MODELS[name] for name in SMOKE_TARGETS})
+        # The CLI owns one --<agent>-model option per registry target, which
+        # defaults to that target's environment-resolved model.
+        argv = ["smoke_supported_clis.py", "--out-dir", "out"]
+        with mock.patch.object(sys, "argv", argv):
+            defaults = smoke.parse_args()
+        for name, target in SMOKE_TARGETS.items():
+            with self.subTest(target=name):
+                self.assertEqual(getattr(defaults, f"{name}_model"), target.resolved_model(os.environ))
+                with mock.patch.object(sys, "argv", [*argv, f"--{name}-model", "custom/model"]):
+                    self.assertEqual(getattr(smoke.parse_args(), f"{name}_model"), "custom/model")
 
     def test_smoke_target_rejects_invalid_registry_states(self):
         for args in (("", "ENV", "model", "answer"), ("pi", "", "model", "trigger"),
@@ -167,11 +163,9 @@ class SupportedCliSmokeTests(unittest.TestCase):
 
     def test_failed_prepare_short_circuits_before_any_answer_call(self):
         with tempfile.TemporaryDirectory() as td:
-            args = argparse.Namespace(out_dir=str(Path(td) / "out"), live=True, agents="claude",
-                                      claude_model="haiku", codex_model="unused",
-                                      gemini_model="unused", vibe_model="unused",
-                                      pi_model="unused", timeout=1)
-            with mock.patch.object(smoke, "parse_args", return_value=args), \
+            argv = [str(SCRIPT), "--out-dir", str(Path(td) / "out"), "--live", "--agents", "claude",
+                    "--claude-model", "haiku", "--timeout", "1"]
+            with mock.patch.object(sys, "argv", argv), \
                  mock.patch.object(smoke.shutil, "which", return_value="/mock/claude"), \
                  mock.patch.object(smoke, "run", return_value=False) as run:
                 self.assertEqual(smoke.main(), 1)
@@ -200,11 +194,9 @@ class SupportedCliSmokeTests(unittest.TestCase):
 
     def test_registry_population_dispatches_pi_to_trigger_runner(self):
         with tempfile.TemporaryDirectory() as td:
-            args = argparse.Namespace(out_dir=str(Path(td) / "out"), live=True, agents="pi",
-                                      claude_model="unused", codex_model="unused",
-                                      gemini_model="unused", vibe_model="unused",
-                                      pi_model="model", timeout=1)
-            with mock.patch.object(smoke, "parse_args", return_value=args), \
+            argv = [str(SCRIPT), "--out-dir", str(Path(td) / "out"), "--live", "--agents", "pi",
+                    "--pi-model", "model", "--timeout", "1"]
+            with mock.patch.object(sys, "argv", argv), \
                  mock.patch.object(smoke.shutil, "which", return_value="/mock/pi"), \
                  mock.patch.object(smoke, "run", return_value=True) as run, \
                  mock.patch.object(smoke, "assess_trigger_report", return_value=True):
@@ -216,10 +208,11 @@ class SupportedCliSmokeTests(unittest.TestCase):
     def test_registry_dispatch_supports_a_non_pi_trigger_target(self):
         synthetic = SmokeTarget("other", "SMOKE_OTHER_MODEL", "cheap", "trigger")
         with tempfile.TemporaryDirectory() as td:
-            args = argparse.Namespace(out_dir=str(Path(td) / "out"), live=True, agents="other",
-                                      other_model="cheap", timeout=1)
+            argv = [str(SCRIPT), "--out-dir", str(Path(td) / "out"), "--live", "--agents", "other",
+                    "--other-model", "cheap", "--timeout", "1"]
             with mock.patch.object(smoke, "SMOKE_TARGETS", {"other": synthetic}), \
-                 mock.patch.object(smoke, "parse_args", return_value=args), \
+                 mock.patch.dict(smoke.DEFAULT_MODELS, {"other": "unused-default"}), \
+                 mock.patch.object(sys, "argv", argv), \
                  mock.patch.object(smoke.shutil, "which", return_value="/mock/other"), \
                  mock.patch.object(smoke, "run", return_value=True) as run, \
                  mock.patch.object(smoke, "assess_trigger_report", return_value=True) as assess:

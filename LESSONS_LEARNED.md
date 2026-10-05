@@ -68,6 +68,8 @@ This file records durable lessons from building and using the shared skill evalu
 - Trigger saturation: every tune trigger/no-trigger case passes autonomous skill-discovery classification.
 - Do not weaken evals just to make flags disappear.
 
+**Update (2026-09-29):** aiming every `with_skill` row at 1.0 spends the headroom the next round needs. The [hillclimbing post](https://claude.dev/blog/automating-eval-design-and-hillclimbing/)'s third mark of a good eval, that the best model score well below 100%, becomes two conditions on a lift eval. `without_skill` must stay well below 1.0, because its pass rate caps the lift the eval can show (`noise_check.headroom` is 1 minus the `without_skill` rate). `with_skill` needs room below 1.0 while you are still iterating, or the next edit has nothing to move. Once `tune` saturates, change the objective to the same quality at lower cost (`token-overhead`, `cost-summary`). When a case does need hardening, pick one a person can say is hard and why: a case kept because today's model fails it samples that model's weak spots (the post calls this adversarial sampling), and `suggest-cases` now asks for the reason in each candidate's rationale.
+
 ## 2026-06-09 — Missing outputs are not failed/no-lift cases
 
 **Problem:** Unrun or missing outputs were initially counted like failed rows, creating false no-lift flags.
@@ -85,10 +87,12 @@ This file records durable lessons from building and using the shared skill evalu
 **Lesson:** Eval runners need stricter execution envelopes than normal agent work.
 
 **Rule:**
-- Use minimal thinking for smoke runs.
-- Add bounded-response instructions.
+- Use minimal thinking for plumbing smoke runs only (see the update below).
+- Add bounded-response instructions to plumbing smoke runs only.
 - Capture timeout output/metadata instead of aborting the whole round.
 - For underspecified project-deck tasks, require bounded/no-write mode rather than open-ended build loops.
+
+**Update (2026-09-29):** the first two rules hold only for plumbing smoke runs, whose job is to prove a runner writes a gradable artifact. A measurement run needs the effort and prompt the skill will meet in production, the same in both arms and pinned for every model compared: a lift measured at minimal thinking or under a length cap belongs to a configuration nobody ships, and the cap can cut a correct answer short. Runs now record effort (`metadata.json` `effort: {requested, applied_by}`, with `backend-default` when `--effort` is omitted; spelled `backend_default` since 2026-09-30), pairing blocks a pair whose arms ran at different effort (`effort_mismatch`), and a Claude run that hit its output or turn limit is recorded as `stop_class: truncated` or `turn_limit` and excluded from scoring instead of graded as a miss.
 
 ## 2026-06-09 — Fixture-backed cases are better than keyword-only prompts
 
@@ -122,6 +126,7 @@ This file records durable lessons from building and using the shared skill evalu
 - Include common positive trigger phrases in `description`.
 - Include explicit negative boundaries when adjacent skills exist.
 - Re-run autonomous trigger tests after every description change.
+- Validate description edits on held-out trigger queries (`skill-trigger-matrix --split holdout`); never paste failing query phrases into the description.
 
 Examples from saturation work:
 - `good-readme`: narrowed away full docs sites and launch-readiness audits.
@@ -130,6 +135,8 @@ Examples from saturation work:
 - `cfdoctor`: narrowed away generic Cloudflare status questions.
 - `guardrails`: narrowed away README/prose-only edits.
 - `anti-slop-writing`: added “tighten,” “talk intro,” and “generic launch copy.”
+
+**Update (2026-09-29):** the last rule is new. A description edit is a hillclimb on the trigger rate, so it overfits the way a prompt edit does, and the [hillclimbing post](https://claude.dev/blog/automating-eval-design-and-hillclimbing/) and the `/claude-api hillclimb` guide give prompts the same two defenses: score on cases the edit was not written from, and describe the failing behavior instead of pasting the failing content. The `anti-slop-writing` example shows the risk: “tighten,” “talk intro,” and “generic launch copy” are the words of its tune trigger query `trig-talk-intro` (“tighten this talk intro so it sounds less like generic launch copy”), so that query passing afterwards shows the description matches its own eval, not that it generalizes.
 
 ## 2026-06-09 — Ablations are not evidence until they are run
 
@@ -155,6 +162,8 @@ Examples from saturation work:
 - Holdout is for end-of-round scoring.
 - Holdback stays hidden from skill/docs/evals until after scoring to detect overfitting.
 - Do not claim release-quality proof until hidden prompts, private answer keys, and real fixtures are filled and scored.
+
+**Update (2026-09-29):** the claude-api skill's cost-hillclimb guide reaches the same conclusion: “The split whose score picks winners each round is a selection set, even if the guide calls it ‘test’.”
 
 ## 2026-06-09 — Jetty should be an adapter, not a rewrite
 
@@ -709,3 +718,180 @@ correctness protocol.
 - Treat inventories according to meaning: packaging, static-analysis coverage, and causal identity
   are different sets. A stack-wide guard should enforce their relationship, not collapse them into
   filesystem equality.
+
+## 2026-09-29 — Check that the eval could show a lift before reading one
+
+**Problem:** Comparing the harness with the [hillclimbing post](https://claude.dev/blog/automating-eval-design-and-hillclimbing/)
+and the `/claude-api build-eval` and `/claude-api hillclimb` guides in the claude-api skill
+([`docs/comparing-with-claude-api-evals.md`](docs/comparing-with-claude-api-evals.md)) found two
+gaps. The first was resolution. The post's held-out result is 38/42 (90.5%) against 33/42 (78.6%)
+on 14 tickets at 3 repeats, a gain of 5 runs, and however those 5 runs are spread across tickets,
+an exact paired sign-flip test cannot go below p = 0.0625 (2/2^5). The harness printed p-values
+for results that size without saying how low the test could ever go; `noise_check.smallest_achievable_p`
+and the lift `interval` now say it. The second was attribution:
+failures the harness recorded as model misses were sometimes the eval's limits. A cut-off answer
+was graded as wrong; a case that failed in both arms on every run was sent to `suggest-cases` for
+hardening, though a case nothing passes is more often broken; and a regression guard at 0/0 counted
+as holding. Separately, one human verdict could be written twice, in the served review's
+`feedback.json` and again in a `judge-alignment` labels file, with nothing keeping the copies in step.
+
+**Lesson:** The post's four marks of a good eval each translate into a check on a lift eval.
+Tasks mirror production: cases are requests the skill will actually get. A stronger model and more
+effort score higher: an arm whose pass rate falls as effort rises points at an ambiguous case or a
+miscalibrated assertion. There is headroom: `without_skill` stays well below 1.0 and no case fails
+in both arms on every run. Variance is low: both arms run at the same effort in fresh workspaces,
+and the noise floor sits below the smallest lift worth acting on. By that last mark the post's own
+14-ticket quality gain is inside the noise. The claim that eval can support is the cost one, about
+one fifth of the cost at parity, because parity needs quality to hold rather than to rise past the
+noise.
+
+*Update (2026-09-30):* the harness now rates an eval on five marks that fit a lift eval, and
+`audit-manifest` reports them as `eval_health`. Which of the post's four were kept, re-scoped or
+replaced, and why "stronger models score higher" became a per-arm diagnostic, is in
+[`docs/comparing-with-claude-api-evals.md`](docs/comparing-with-claude-api-evals.md#five-marks-of-a-lift-eval).
+
+**Rule:**
+- Read `paired_summary.noise_check` before the lift. `smallest_achievable_p` is 2/2^k for k moved
+  cases, so fewer than 6 cases moving the same way can never reach p ≤ 0.05
+  (`too-few-cases-moved`); `benchmark --min-lift` compares the noise floor with the lift you would act on.
+- Quote a lift with its `interval`, not the point estimate alone.
+- Score only runs that finished as asked: `stop_class` `truncated` or `turn_limit` and
+  `served_model_check: mismatch` are unscorable and block their pair; refusals stay graded and are
+  counted in `run_endings`.
+- Audit a `floor: fails in both arms` case (`floor-eval`) before hardening anything; `suggest-cases`
+  no longer seeds from it, and a floor case is not counted as a regression guard holding.
+- Keep human verdicts in one store: the `feedback.json` that `render-viewer --serve` writes feeds
+  `judge-alignment --labels` and `error-analysis --feedback` directly.
+
+## 2026-10-02 — Coverage is shown by breaking the code, not by reading the tests
+
+**Problem:** A second test audit asked whether the suite would notice if a central production
+behaviour broke, and answered it by breaking things in scratch copies:
+
+- 6 of 45 faults seeded into central behaviours failed no test at all. They included
+  `audit-manifest --fail-on blockers` ignoring readiness blockers on a complete benchmark, a judge
+  with no verdict publishing the lift, Codex `--effort` never reaching the CLI, and a weakened
+  Jetty upload check.
+- Two production guards could be deleted with the suite green. Ablation provenance verification
+  was tested with one run per arm, which can never confirm, so "not confirmed" held regardless of
+  provenance. The trigger-report design-agreement check had a negative control that died earlier
+  on an unrelated guard.
+- Removing `--fail-on-contamination` from the parser left the suite green. Command tests built
+  their argument namespaces by hand, and the commands read flags with `getattr` defaults.
+- The gates had gaps:
+  - a test docstring cited a collection-parity script that existed only on another branch;
+  - renaming a `RUN_*` variable silently skipped its live smoke;
+  - `|| true` on a CI step would have passed every guard;
+  - CI never installed the built wheel;
+  - the release workflow uploaded a wheel without running a test.
+- A wire format was a belief, not an observation. Offline fixtures put Claude's `result` event
+  last; a real Claude Code 2.1.269 run (#85) appends a `system` record, so every real run would
+  have parsed as an empty answer with its stop class unreadable.
+- An upgrade note said `trigger-compare` still read old Pi reports. A report produced on `main`
+  showed it refused them: the identity's module set had changed without a version bump.
+
+**Lesson:** A test proves only what would make it fail. A negative control proves the guard
+whose message it asserts, not the command that exits. A command test proves the wiring only if
+it goes through the parser. A parser test proves the wire format only if it reads recorded real
+output. A gate proves nothing until a planted violation turns it red, and a compatibility claim
+proves nothing until an old artifact is read.
+
+**Rule:**
+- Before calling a behaviour covered, seed one realistic fault in it, in a scratch copy, and record
+  which test fails and why. An import error or a doc line-reference shift is not a detection.
+- Assert the message of the guard a negative control names (`assert_dies`), not a bare `SystemExit`.
+- Drive commands through `run_cli`. `tests/test_cli_contracts.py` fails when a command reads a flag
+  its parser lacks or defines one no handler reads.
+- Test provider parsers against recorded real output (`tests/fixtures/claude/`). When a real run
+  disagrees with a hand-built fixture, the recorded sample wins and becomes a fixture.
+- Give every gate a test with a planted violation. `tests/test_gate_integrity.py` rejects a CI step
+  that cannot fail and requires every skip to be a ledgered live smoke or platform gate. A release
+  repeats every gate of CI's test job on the release tag (compile, ruff, ty, the unit tests,
+  collection parity) and checks the exact wheel it uploads; the gate test fails when a CI gate has
+  no release counterpart.
+- A guard cited by name must exist on this branch and run in CI; a guard on another branch is a plan.
+- Bump an identity version whenever its inventory changes, and test any "still reads" claim in an
+  upgrade note against an artifact the previous release produced.
+
+## 2026-10-02 — The paths no test runs carry the bugs a test audit cannot see
+
+**Problem:** After the fault-seeding audit above, four auditors ran this branch's entry points with
+fake `claude`, `codex` and `pi` executables, re-ran every quoted doc command, and planted
+violations against the gates. Seeding faults into tested code could not have found most of what
+they found, because no test ran those paths:
+
+- `run-subagent` without `--agent-cmd` failed every run (`usage.source must be finite`), on `main`
+  too. No test ran it.
+- Every Codex cell was blocked in `trigger-compare`. A file list ended in `_copied`, which made it a
+  protocol observation, and protocol observations must be booleans.
+- Claude Code 2.1.269 calls a project skill by its mounted directory name, so every should-fire
+  Claude cell read as a miss while the matrix reported a complete measurement.
+- A gate that fails closed could never go green: a case gated only by judges has no objective rate,
+  its pairs were blocked, and `audit-manifest --fail-on-blockers` failed on every complete run.
+- Two registered finding kinds, `arm-conditions-differ` and `served-model-mismatch`, could never be
+  raised. Only complete benchmarks raised them, and the conditions they describe make a benchmark
+  partial.
+- Moving Pi's home out of the working directory deleted it before the secret scan, so a token Pi
+  refreshed during the run reached the artifacts unredacted.
+- Real model ids (`sonnet[1m]`, Bedrock and Vertex ids, `-latest` aliases) read as a served-model
+  mismatch, which made every run unscorable.
+- One more tied case flipped a significant lift to not significant, because the exact/sampled
+  switch counted zero deltas. Six equal deltas gave a point interval and a zero noise floor.
+- Five of eleven faults seeded into this branch's own new code survived, among them deleting the
+  line that makes an effort-mismatched benchmark partial.
+- The gate tests passed every plant they had, yet missed a branch, path or `types` filter on the
+  gated event, a shell without errexit, a multi-line PowerShell step, an early `return` in a live
+  smoke, and a runtime skip wrapped around a product assertion.
+
+**Lesson:** Seeding faults measures the tests that exist; it says nothing about the paths no test
+runs. A gate that fails closed must also be shown to pass on each valid input shape, and a
+registered finding exists only if a public command can raise it. Real identifiers and real
+lifecycles (aliases, directory names, a token refreshed mid-run) break checks written against the
+names and the order the author assumed.
+
+**Rule:**
+- Keep a list of entry points (each command, backend and run layout the docs show) and one
+  end-to-end test per entry that reaches a non-error result through `run_cli` or the real script,
+  with fake executables standing in for agents.
+- Give each gate a planted violation that turns it red and a complete valid input of each
+  supported shape (judge-only, multi-model, three arms) that keeps it green.
+- For every finding kind or report value a command can emit, keep a test that produces it through
+  the command.
+- Test numeric switches on both sides of the threshold (14 and 15 moved units, a sample with no
+  spread).
+- Scan for secrets after the agent exits and before anything it wrote is deleted, and test with a
+  token the agent writes during the run.
+- Test identity and parsing checks against a table of real identifiers, not only the canonical
+  spelling.
+
+## 2026-10-02 — A run records what the harness asked for; check that the agent got it
+
+**Problem:** The second fix round found settings the harness recorded faithfully that the agent
+never received:
+
+- `claude --effort minimal` prints a warning, ignores the level and runs at the default, so runs
+  recorded `requested: minimal` while running at another effort.
+- `run-subagent`'s default backend ran Claude in an empty temporary directory, so a `with_skill`
+  run could not read the skill its prompt named, and its tool-use trace was dropped.
+- Claude trigger runs that logged in through environment variables were not isolated, so the
+  user's own skills could compete with the one under test.
+- Every skill mounted under a flattened name (`skills_demo_SKILL.md`) that no real install shows,
+  so activation was measured for a name users never see.
+- Vibe 2.23 changed its output to public history entries, and every current-Vibe trigger cell
+  read as incomplete.
+- A whitelist of record types allowed after Claude's `result` would have made every real run
+  unreadable the day Claude Code added one more metadata record.
+
+**Lesson:** A recorded setting is a request, not an observation. When a CLI warns and continues,
+drops a field, or changes its output, the run records what the harness meant to do, and every
+number built on it is about a different experiment.
+
+**Rule:**
+- Validate each setting against what the backend's CLI accepts before the run (`effort_levels`),
+  and record evidence of what the agent actually ran with wherever the CLI exposes it.
+- Run each agent where its prompt says the files are, and keep its trace on every backend.
+- Mount the skill as a user's install would, and isolate the agent's config on every login path.
+- Parse a provider's output by the shape you see, one parser per known version, and reject only
+  what breaks the contract (session content after the end), not whatever is unfamiliar.
+- Keep a runbook of live checks (`docs/live-verification.md`) for everything CI can only fake, and
+  run it after any CLI upgrade.

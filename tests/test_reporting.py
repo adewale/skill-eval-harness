@@ -9,8 +9,6 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
-from unittest import mock
 
 from helpers import (
     CODEX_CRASH_OUTPUT as CRASH,
@@ -20,8 +18,10 @@ from helpers import (
 )
 from helpers import (
     attest_answer_design,
+    make_eval_repo,
     report_fixture,
     result_row,
+    run_cli,
     trace_event,
     write_run,
 )
@@ -130,25 +130,51 @@ class ReportFormatsTests(unittest.TestCase):
             bench = Path(td) / "benchmark.json"
             bench.write_text(json.dumps(self.REPORT), encoding="utf-8")
             out = Path(td) / "junit.xml"
-            rc = sb.report_command(SimpleNamespace(benchmark=str(bench), format="junit", out=str(out)))
-            self.assertEqual(rc, 0)
+            self.assertEqual(run_cli("report", "--benchmark", bench, "--format", "junit", "--out", out), (0, "", ""))
             self.assertIn("testsuite", out.read_text(encoding="utf-8"))
 
     def test_aggregate_rejects_duplicate_skill_identities_before_mapping(self):
-        report = {
-            "availability": "complete", "skill_name": "demo",
-            "summary": {}, "results": [], "case_flags": [],
-            "cost_summary": {"totals": {}},
-        }
-        for manifests in (["same.json", "same.json"], ["one.json", "two.json"]):
-            with self.subTest(manifests=manifests), mock.patch.object(
-                sb, "build_benchmark_report", side_effect=[report, report]
-            ), self.assertRaises(SystemExit):
-                sb.aggregate(SimpleNamespace(
-                    manifests=manifests, runs_root=".", runs_subdir="runs",
-                    runs=None, split=None, variant=None, judge_results=None,
-                    allow_scripts=False, out=None,
-                ))
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            one, two = (make_eval_repo(root / name) for name in ("one", "two"))
+            other = make_eval_repo(root / "other", skill_name="other")
+            runs = root / "runs"
+            for variant in ("with_skill", "without_skill"):
+                write_run(runs / "case-1" / variant, "alpha")
+            out = root / "aggregate.json"
+            for manifests in ((one, one), (one, two)):
+                with self.subTest(manifests=[str(path.parents[2].name) for path in manifests]):
+                    self.assertEqual(
+                        run_cli("aggregate", *manifests, "--runs", runs, "--out", out),
+                        (1, "", "FAIL: aggregate manifests declare duplicate skill_name identities: demo\n"))
+                    self.assertFalse(out.exists())
+            # Distinct identities aggregate: the rejection is about the names, not the runs.
+            self.assertEqual(run_cli("aggregate", one, other, "--runs", runs, "--out", out)[0], 0)
+            reports = json.loads(out.read_text(encoding="utf-8"))["reports"]
+            self.assertEqual([report["skill_name"] for report in reports], ["demo", "other"])
+
+    def test_github_status_names_each_cause_once_from_incomplete_reasons(self):
+        # A gate judge with no verdict leaves every row's grading partial;
+        # incomplete_reasons lists the root cause once, and the job summary
+        # prints that list rather than re-deriving a second one.
+        manifest = base_manifest()
+        manifest["cases"][0]["assertions"].append(
+            {"name": "quality", "type": "judge", "severity": "gate", "rubric": ["complete"]})
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = write_manifest(root, manifest)
+            runs, bench, summary = root / "runs", root / "benchmark.json", root / "summary.md"
+            write_run(runs / "case-1" / "with_skill", "alpha")
+            write_run(runs / "case-1" / "without_skill", "none")
+            attest_answer_design(path, runs)
+            self.assertEqual(run_cli("benchmark", path, "--runs", runs, "--out", bench)[0], 0)
+            report = json.loads(bench.read_text(encoding="utf-8"))
+            self.assertEqual(run_cli("report", "--benchmark", bench, "--format", "github",
+                                     "--out", summary)[0], 0)
+            status = [line for line in summary.read_text(encoding="utf-8").splitlines()
+                      if line.startswith("**Experiment status:**")]
+        self.assertEqual(report["incomplete_reasons"], ["deferred_judge_verdicts"])
+        self.assertEqual(status, ["**Experiment status:** incomplete (deferred judge verdicts)"])
 
 
 class MultiModelFanOutTests(unittest.TestCase):
@@ -369,21 +395,15 @@ class ServedReportArtifactTests(unittest.TestCase):
             doc = json.loads((ws / "feedback.json").read_text(encoding="utf-8"))
         self.assertEqual(len(doc["entries"]), 2)
         c1 = next(e for e in doc["entries"] if e["case_id"] == "c1")
-        self.assertEqual(c1["verdict"], "good")
+        # The first form's good/bad are stored as pass/fail, the one vocabulary
+        # judge-alignment reads.
+        self.assertEqual(c1["verdict"], "pass")
+        self.assertEqual(c1["note"], "fixed")
+        self.assertEqual(doc["schema_version"], 2)
 
 
 class IterationWorkflowTests(unittest.TestCase):
     """2.9 — iteration-N convention and the previous-workspace diff."""
-
-    def test_iteration_dir_helpers(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            self.assertEqual(sb.next_iteration_dir(root).name, "iteration-1")
-            (root / "iteration-1").mkdir()
-            (root / "iteration-3").mkdir()
-            (root / "not-an-iteration").mkdir()
-            self.assertEqual([p.name for p in sb.iteration_dirs(root)], ["iteration-1", "iteration-3"])
-            self.assertEqual(sb.next_iteration_dir(root).name, "iteration-4")
 
     def test_benchmark_report_diff(self):
         previous = {
@@ -499,12 +519,11 @@ class LivingEvalLoopTests(unittest.TestCase):
             path, report_path = self.setup_repo(root)
             manifest_bytes = path.read_bytes()
             out = root / "candidates.json"
-            args = SimpleNamespace(
-                benchmark=str(report_path), manifest=str(path),
-                generate_cmd="python3 -c \"import sys,json; json.load(sys.stdin); print(json.dumps({'prompt': 'harder variant', 'rationale': 'raise difficulty'}))\"",
-                timeout=30, out=str(out))
-            rc = sb.suggest_cases(args)
-            self.assertEqual(rc, 0)
+            generate = ("python3 -c \"import sys,json; json.load(sys.stdin); "
+                        "print(json.dumps({'prompt': 'harder variant', 'rationale': 'raise difficulty'}))\"")
+            code, _, _ = run_cli("suggest-cases", "--benchmark", report_path, "--manifest", path,
+                                 "--generate-cmd", generate, "--out", out)
+            self.assertEqual(code, 0)
             doc = json.loads(out.read_text(encoding="utf-8"))
             self.assertEqual(doc["candidates"][0]["generated"]["prompt"], "harder variant")
             self.assertIn("never edits", doc["note"])
@@ -515,8 +534,7 @@ class LivingEvalLoopTests(unittest.TestCase):
             root = Path(td)
             path, report_path = self.setup_repo(root)
             out = root / "candidates.json"
-            args = SimpleNamespace(benchmark=str(report_path), manifest=str(path), generate_cmd=None, timeout=30, out=str(out))
-            sb.suggest_cases(args)
+            self.assertEqual(run_cli("suggest-cases", "--benchmark", report_path, "--manifest", path, "--out", out)[0], 0)
             doc = json.loads(out.read_text(encoding="utf-8"))
         self.assertNotIn("generated", doc["candidates"][0])
         self.assertIn("instruction", doc["candidates"][0])

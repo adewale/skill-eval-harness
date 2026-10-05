@@ -1,16 +1,21 @@
 """First-class Claude adapter: parse the `claude -p --output-format json`
 envelope in one place, capture real cost/usage into metrics.json, and total it
 in the benchmark report."""
-import argparse
 import json
 import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
+from helpers import (
+    CLAUDE_POST_RESULT_RECORDS,
+    claude_streams_ending_after_result,
+    claude_trailing_record_sources,
+    run_cli,
+    write_with_skill_task,
+)
 from helpers import claude_stream_records as _canonical_stream_records
-from helpers import make_eval_repo
 from helpers import stub_claude as _stub_claude
 from helpers import stub_claude_stream as _stub_claude_stream
 
@@ -26,11 +31,6 @@ def claude_stream_records(**overrides) -> list[dict]:
 
 def stream_text(records: list[dict]) -> str:
     return "\n".join(json.dumps(r) for r in records) + "\n"
-
-
-def _manifest(rp: Path, cases):
-    # Shared builder: writes the demo skill AND the manifest.
-    return make_eval_repo(rp.parent, skill_name="demo", cases=cases)
 
 
 class ParseClaudeEnvelopeTests(unittest.TestCase):
@@ -93,6 +93,54 @@ class ParseClaudeStreamTests(unittest.TestCase):
         self.assertEqual(p["answer"], "")
         self.assertIsNotNone(p["parse_error"])
 
+    def test_system_records_after_the_result_are_tolerated(self):
+        # Claude Code 2.1.269 appends `system`/`task_summary` after the result
+        # (observed in a real run on 2026-09-23, PR #85); the envelope is still
+        # final. Every recording that continues after `result` runs here too.
+        for source, trailing in claude_trailing_record_sources():
+            with self.subTest(source=source):
+                p = sb.parse_claude_cli_json(stream_text(claude_stream_records() + trailing))
+                self.assertIsNone(p["parse_error"])
+                self.assertEqual((p["answer"], p["cost_usd"]), ("All tests pass.", 0.05))
+
+    def test_parser_and_trace_dialect_share_one_terminal_rule(self):
+        rejected = claude_stream_records() + [{"type": "assistant", "message": {"content": []}}]
+        self.assertIsNone(sb.claude_terminal_result_index(rejected))
+        self.assertIsNone(sb.claude_terminal_result_index(claude_stream_records(result_event=False)))
+        dialect = sb.trace_dialect_for("claude")
+        self.assertIsNotNone(dialect.protocol_error(rejected, None))
+        for source, trailing in claude_trailing_record_sources():
+            with self.subTest(source=source):
+                tolerated = claude_stream_records() + trailing
+                self.assertIsNotNone(sb.claude_terminal_result_index(tolerated))
+                self.assertIsNone(dialect.protocol_error(tolerated, None))
+                _, metrics = sb.normalize_trace_records(tolerated, source="claude")
+                self.assertTrue(metrics["skill_invoked"])
+
+    def test_the_parser_rejects_session_content_after_the_result_and_reads_past_metadata(self):
+        # One `result`, then metadata only: a record type Claude Code adds
+        # after the result must not make every real run unreadable, while a
+        # second result or a late turn still means the stream has no final word.
+        for label, trailing, allowed in CLAUDE_POST_RESULT_RECORDS:
+            with self.subTest(trailing=label):
+                p = sb.parse_claude_cli_json(stream_text(claude_stream_records() + [trailing]))
+                if allowed:
+                    self.assertIsNone(p["parse_error"])
+                    self.assertEqual((p["answer"], p["cost_usd"]), ("All tests pass.", 0.05))
+                else:
+                    self.assertEqual(p["answer"], "")
+                    self.assertIsNotNone(p["parse_error"])
+
+    def test_the_trace_dialect_applies_the_same_rule_after_the_result(self):
+        dialect = sb.trace_dialect_for("claude")
+        for label, trailing, allowed in CLAUDE_POST_RESULT_RECORDS:
+            with self.subTest(trailing=label):
+                error = dialect.protocol_error(claude_stream_records() + [trailing], None)
+                if allowed:
+                    self.assertIsNone(error)
+                else:
+                    self.assertEqual(error, "Claude trace must contain exactly one final result event")
+
     def test_malformed_line_before_terminal_result_is_protocol_invalid(self):
         text = "not-json\n" + stream_text(claude_stream_records())
         p = sb.parse_claude_cli_json(text)
@@ -141,6 +189,29 @@ class ClaudeStreamTraceNormalizationTests(unittest.TestCase):
         self.assertIn("unmatched Claude tool_result", event["input_summary"])
         self.assertEqual(event["raw_ref"], {"file": "trace.jsonl", "line": 1})
         self.assertEqual(event["raw_result_ref"], {"file": "trace.jsonl", "line": 1})
+        self.assertIn("unmatched Claude tool_result", " ".join(metrics["trace_protocol_errors"]))
+
+    def test_malformed_message_and_lifecycle_fields_are_protocol_invalid(self):
+        malformed = [
+            {"type": "assistant", "message": {"content": {"type": "tool_use"}}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": 1, "name": "Read", "input": {}},
+                {"type": "tool_use", "id": "x", "name": "", "input": {}},
+                {"type": "tool_use", "id": "y", "name": "Read", "input": []},
+            ]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "x", "is_error": "false"},
+            ]}},
+        ]
+        _, metrics = sb.normalize_trace_records(malformed, source="claude")
+        # One error per malformed field, in record order.
+        self.assertEqual(metrics["trace_protocol_errors"], [
+            "Claude message content must be a string or list",
+            "Claude tool_use id must be a non-empty string",
+            "Claude tool_use name must be a non-empty string",
+            "Claude tool_use input must be an object",
+            "Claude tool_result is_error must be boolean",
+        ])
 
     def test_duplicate_open_tool_id_is_error_and_cannot_replace_first_call(self):
         records = [
@@ -281,20 +352,17 @@ class ClaudeStreamTraceNormalizationTests(unittest.TestCase):
 
 
 class RunClaudeAdapterTests(unittest.TestCase):
-    def _run(self, td: Path, *, cost=0.0123, returncode=0, answer="STUB ANSWER token-XYZ"):
-        rp = td / "repo"
+    def _run(self, td: Path, *, cost=0.0123, returncode=0, answer="STREAM ANSWER token-XYZ"):
         case = {"id": "c", "split": "tune", "prompt": "do it",
                 "assertions": [{"name": "a", "type": "contains", "value": "token-XYZ"}]}
-        p = _manifest(rp, [case])
-        rows = [r for r in sb.prepared_task_rows(p, sb.validate_manifest(p)) if r["variant"] == "with_skill"]
-        tasks = td / "tasks.jsonl"
-        tasks.write_text("".join(json.dumps(r) + "\n" for r in rows))
-        stub = _stub_claude(td / "claude_stub.py", cost=cost, returncode=returncode, answer=answer)
+        p, tasks, run_dir = write_with_skill_task(td, cases=[case])
+        stub = _stub_claude_stream(td / "claude_stub.py", cost=cost, returncode=returncode, answer=answer)
         runs = td / "runs"
-        ns = argparse.Namespace(tasks=str(tasks), runs=str(runs),
-                                model="claude-haiku-4-5-20251001", claude_bin=str(stub), timeout=60)
-        sb.run_claude(ns)
-        return p, runs, rows[0]["run_dir"]
+        code, _, stderr = run_cli("run-claude", "--tasks", tasks, "--runs", runs,
+                                  "--model", "claude-haiku-4-5-20251001", "--claude-bin", stub,
+                                  "--timeout", "60")
+        self.assertEqual(code, 0, stderr)
+        return p, runs, run_dir
 
     def test_writes_output_and_cost_metrics(self):
         with tempfile.TemporaryDirectory() as t:
@@ -315,10 +383,13 @@ class RunClaudeAdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             td = Path(t)
             _, runs, run_dir = self._run(td, returncode=3)
-            text = (runs / run_dir / "output.md").read_text()
+            base = runs / run_dir
+            text = (base / "output.md").read_text()
+            meta = sb.read_metrics_base(base)
+            self.assertEqual(meta["returncode"], 3)
             self.assertTrue(text.lstrip().startswith(sb.CLAUDE_FAILURE))
-            # and it is recognized as a non-scorable infra failure
-            self.assertFalse(sb.execution_valid({"returncode": 3}, text))
+            # and the run as written is a non-scorable infra failure
+            self.assertFalse(sb.execution_valid(meta, text))
 
     def test_json_is_error_marks_infra_failure_even_with_zero_exit(self):
         with tempfile.TemporaryDirectory() as t:
@@ -333,7 +404,10 @@ class RunClaudeAdapterTests(unittest.TestCase):
             _, runs, run_dir = self._run(td, cost=0.0, answer="unused")
             # Re-run the same prepared task through the quota-shaped stub.
             tasks = td / "tasks.jsonl"
-            sb.run_claude(argparse.Namespace(tasks=str(tasks), runs=str(runs), model="claude-haiku-4-5-20251001", claude_bin=str(stub), timeout=60))
+            code, _, stderr = run_cli("run-claude", "--tasks", tasks, "--runs", runs,
+                                      "--model", "claude-haiku-4-5-20251001", "--claude-bin", stub,
+                                      "--timeout", "60")
+            self.assertEqual(code, 0, stderr)
             base = runs / run_dir
             text = (base / "output.md").read_text()
             meta = json.loads((base / "metadata.json").read_text())
@@ -351,12 +425,13 @@ class RunClaudeAdapterTests(unittest.TestCase):
                                  encoding="utf-8")
             malformed.chmod(malformed.stat().st_mode | stat.S_IXUSR)
             _, runs, run_dir = self._run(td)
-            sb.run_claude(argparse.Namespace(
-                tasks=str(td / "tasks.jsonl"), runs=str(runs),
-                model="claude-haiku-4-5-20251001", claude_bin=str(malformed), timeout=60))
+            code, _, stderr = run_cli("run-claude", "--tasks", td / "tasks.jsonl", "--runs", runs,
+                                      "--model", "claude-haiku-4-5-20251001", "--claude-bin", malformed,
+                                      "--timeout", "60")
+            self.assertEqual(code, 0, stderr)
             base = runs / run_dir
             text = (base / "output.md").read_text(encoding="utf-8")
-            meta = sb.read_metadata_base(base)
+            meta = sb.read_metrics_base(base)
             self.assertEqual(meta["returncode"], 0)
             self.assertTrue(meta["process_observation_complete"])
             self.assertFalse(meta["provider_response_complete"])
@@ -378,20 +453,8 @@ class RunClaudeAdapterTests(unittest.TestCase):
         # so events.json carries the run's actual tool-use trajectory and
         # process assertions have evidence on Claude answer runs.
         with tempfile.TemporaryDirectory() as t:
-            td = Path(t)
-            rp = td / "repo"
-            case = {"id": "c", "split": "tune", "prompt": "do it",
-                    "assertions": [{"name": "a", "type": "contains", "value": "token-XYZ"}]}
-            p = _manifest(rp, [case])
-            rows = [r for r in sb.prepared_task_rows(p, sb.validate_manifest(p)) if r["variant"] == "with_skill"]
-            tasks = td / "tasks.jsonl"
-            tasks.write_text("".join(json.dumps(r) + "\n" for r in rows))
-            stub = _stub_claude_stream(td / "claude_stream_stub.py", cost=0.031)
-            runs = td / "runs"
-            sb.run_claude(argparse.Namespace(tasks=str(tasks), runs=str(runs),
-                                             model="claude-haiku-4-5-20251001",
-                                             claude_bin=str(stub), timeout=60))
-            base = runs / rows[0]["run_dir"]
+            _, runs, run_dir = self._run(Path(t), cost=0.031)
+            base = runs / run_dir
             self.assertIn("token-XYZ", (base / "output.md").read_text())
             trace = (base / "trace.jsonl").read_text(encoding="utf-8")
             self.assertIn("tool_use", trace)   # raw provider stream is preserved verbatim
@@ -405,7 +468,7 @@ class RunClaudeAdapterTests(unittest.TestCase):
             # provider-reported usage/cost still win over trace-derived counts
             self.assertEqual(metrics["input_tokens"], 11)
             self.assertEqual(metrics["cost_usd"], 0.031)
-            meta = sb.read_metadata_base(base)
+            meta = sb.read_metrics_base(base)
             self.assertEqual(meta["usage_normalized"]["source"], "provider_reported")
             env = json.loads((base / "environment.json").read_text())
             self.assertIn("stream-json", env["command"])
@@ -413,6 +476,85 @@ class RunClaudeAdapterTests(unittest.TestCase):
             passed, evidence = sb.process_or_efficiency_assertion_result(
                 {"type": "command_ran", "pattern": "npm test"}, base, meta)
             self.assertTrue(passed, evidence)
+
+    def test_run_agent_reads_a_recorded_claude_stream(self):
+        # Real Claude Code output (tests/fixtures/claude/README.md) rather than
+        # the canonical hand-built stream; expected values are read off its
+        # terminal result event.
+        recorded = Path(__file__).parent / "fixtures" / "claude" / "stream-json.plugin-skill.jsonl"
+        records = [json.loads(line) for line in recorded.read_text(encoding="utf-8").splitlines()]
+        served = records[1]["model"]   # the init event names the model that ran
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            _, tasks, run_dir = write_with_skill_task(td)
+            stub = td / "claude"
+            stub.write_text(f"#!{sys.executable}\nimport sys\nsys.stdin.read()\n"
+                            "assert 'stream-json' in sys.argv\n"
+                            f"sys.stdout.write(open({str(recorded)!r}, encoding='utf-8').read())\n",
+                            encoding="utf-8")
+            stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+            result = run_cli("run-agent", "--agent", "claude", "--tasks", tasks, "--runs", td / "runs",
+                             "--model", served, "--claude-bin", stub)
+            base = td / "runs" / run_dir
+            output = (base / "output.md").read_text(encoding="utf-8")
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(result[0], 0, result)
+        self.assertEqual(output, records[-1]["result"])
+        self.assertTrue(meta["trace_observation_complete"])
+        self.assertEqual((meta["stop_class"], meta["stop_reason"]), ("completed", "end_turn"))
+        self.assertEqual((meta["served_models"], meta["served_model_check"]), ([served], "match"))
+        self.assertEqual(meta["cost_normalized"]["total_cost"], 0.046597)
+        self.assertEqual(
+            {key: meta["usage_normalized"][key]
+             for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")},
+            {"input_tokens": 4, "output_tokens": 246, "cache_read_tokens": 29905, "cache_write_tokens": 9537})
+        self.assertEqual(meta["skill_invocation_evidence"], ["probe-plugin:tidy-commit Skill"])
+        # Every recording that continues after `result` reads the same way; its
+        # expected values come from its own terminal event.
+        for source, text in claude_streams_ending_after_result():
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as t:
+                records = [json.loads(line) for line in text.splitlines() if line.strip()]
+                terminal = next(record for record in records if record.get("type") == "result")
+                td = Path(t)
+                _, tasks, run_dir = write_with_skill_task(td)
+                (td / "stream.jsonl").write_text(text, encoding="utf-8")
+                stub = td / "claude"
+                stub.write_text(f"#!{sys.executable}\nimport sys\nsys.stdin.read()\n"
+                                "assert 'stream-json' in sys.argv\n"
+                                f"sys.stdout.write(open({str(td / 'stream.jsonl')!r}, encoding='utf-8').read())\n",
+                                encoding="utf-8")
+                stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+                code, _, stderr = run_cli("run-agent", "--agent", "claude", "--tasks", tasks,
+                                          "--runs", td / "runs", "--claude-bin", stub)
+                base = td / "runs" / run_dir
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual((base / "output.md").read_text(encoding="utf-8"), terminal["result"])
+                meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+                self.assertTrue(meta["trace_observation_complete"])
+                self.assertEqual(meta["stop_reason"], terminal.get("stop_reason"))
+                self.assertEqual(meta["cost_normalized"]["total_cost"], terminal["total_cost_usd"])
+
+    def test_the_answer_run_mounts_the_skill_under_its_own_directory_name(self):
+        # skills/demo/SKILL.md is installed as a skill directory named `demo`;
+        # the with_skill workspace mounts it there and the prompt points the
+        # model at that path, not at the flattened manifest path.
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            _, tasks, _ = write_with_skill_task(td)
+            seen = td / "seen.json"
+            stub = td / "claude"
+            stub.write_text(
+                f"#!{sys.executable}\nimport json, os, sys\nprompt = sys.stdin.read()\n"
+                "files = sorted(os.path.relpath(os.path.join(r, f)) for r, _, fs in os.walk('.') for f in fs)\n"
+                f"open({str(seen)!r}, 'w').write(json.dumps({{'prompt': prompt, 'files': files}}))\n"
+                f"sys.stdout.write({stream_text(claude_stream_records())!r})\n", encoding="utf-8")
+            stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+            code, _, stderr = run_cli("run-agent", "--agent", "claude", "--tasks", tasks,
+                                      "--runs", td / "runs", "--claude-bin", stub)
+            observed = json.loads(seen.read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("skills/demo/SKILL.md", observed["files"])
+        self.assertIn("\n- skills/demo/SKILL.md", observed["prompt"])
 
 
 class ClaudeJudgeAndPanelTests(unittest.TestCase):
@@ -484,21 +626,18 @@ class ClaudeJudgeAndPanelTests(unittest.TestCase):
         self.assertEqual(result["observed"]["judges"], ["complete"])
 
     def test_compare_judges_rejects_blank_and_duplicate_identities_before_loading(self):
-        def rejected(message):
-            raise ValueError(message)
-
+        # None of the report files exist, so a check that ran after loading
+        # would fail on the missing file instead of naming the identity.
         for reports, message in (
-            (["=first.json", "b=second.json"], "non-empty"),
-            (["same=first.json", "same=second.json", "b=third.json"], "duplicate"),
-            (["a=", "b=second.json"], "path"),
+            (["=first.json", "b=second.json"], "--report judge name must be non-empty"),
+            (["same=first.json", "same=second.json", "b=third.json"], "duplicate --report judge name 'same'"),
+            (["a=", "b=second.json"], "--report path for judge 'a' must be non-empty"),
         ):
-            args = argparse.Namespace(report=reports, magnitude_eps=0.1, out=None)
-            with self.subTest(reports=reports), \
-                 mock.patch.object(sb, "load_json") as load_json, \
-                 mock.patch.object(sb, "die", side_effect=rejected), \
-                 self.assertRaisesRegex(ValueError, message):
-                sb.compare_judges(args)
-            load_json.assert_not_called()
+            with self.subTest(reports=reports), tempfile.TemporaryDirectory() as td:
+                argv = [arg for report in reports for arg in ("--report", report)]
+                self.assertEqual(run_cli("compare-judges", *argv, "--out", Path(td) / "out.json"),
+                                 (1, "", f"FAIL: {message}\n"))
+                self.assertFalse((Path(td) / "out.json").exists())
 
 
 if __name__ == "__main__":

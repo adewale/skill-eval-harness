@@ -39,11 +39,12 @@ from types import MappingProxyType
 from typing import Any
 
 from agent_capabilities import BACKENDS
+from completion_contracts import completion_unscorable_reason
 from json_contracts import freeze_json_value
 from manifest_contracts import (
-    ABLATION_VARIANT_PREFIX,
     CaseId,
     CaseKind,
+    CasePopulation,
     ExecutionVariant,
     RunNumber,
     Split,
@@ -86,12 +87,8 @@ JETTY_FAILURE = RUNNER_FAILURE_MARKER_BY_PROVIDER["jetty"]
 CLAUDE_FAILURE = RUNNER_FAILURE_MARKER_BY_PROVIDER["claude"]
 VIBE_FAILURE = RUNNER_FAILURE_MARKER_BY_PROVIDER["vibe"]
 TIMEOUT_FAILURE = "[TIMEOUT"
-_LEGACY_FAILURE_MARKER_ORDER = ("codex", "jetty", "claude", "vibe")
 RUNNER_FAILURE_MARKERS = tuple(dict.fromkeys(
-    [RUNNER_FAILURE_MARKER_BY_PROVIDER[name]
-     for name in _LEGACY_FAILURE_MARKER_ORDER]
-    + list(RUNNER_FAILURE_MARKER_BY_PROVIDER.values())
-)) + (TIMEOUT_FAILURE,)
+    RUNNER_FAILURE_MARKER_BY_PROVIDER.values())) + (TIMEOUT_FAILURE,)
 
 
 def metadata_lifecycle_error(metadata: dict[str, Any] | None) -> str | None:
@@ -122,10 +119,17 @@ def metadata_lifecycle_error(metadata: dict[str, Any] | None) -> str | None:
 
 def execution_valid(metadata: dict[str, Any] | None, text: str | None) -> bool:
     """False when a run is an INFRASTRUCTURE failure — a nonzero exit, a timeout,
-    or a synthetic failure body a runner wrote when it never got a real answer."""
+    or a synthetic failure body a runner wrote when it never got a real answer.
+
+    Recorded completion evidence also disqualifies a run: an answer cut off at
+    an output or turn limit the eval set, or an answer served by a different
+    model than the one requested. Both would otherwise be graded as the
+    requested model's genuine answer."""
     m = metadata or {}
     if (metadata_lifecycle_error(m) is not None
             or m.get("metadata_artifact_valid") is False or m.get("metadata_error")):
+        return False
+    if completion_unscorable_reason(m) is not None:
         return False
     rc = m.get("returncode")
     if rc not in (0, None):
@@ -257,9 +261,6 @@ class AblationMode(str, Enum):
     INSTRUCTION_SIMULATED = "instruction_simulated"
 
 
-class Population(str, Enum):
-    ANSWER = "answer"
-    TRIGGER = "trigger"
 
 
 class ComponentClass(str, Enum):
@@ -342,11 +343,11 @@ class Component:
                    removed_bytes=rb)
 
 
-def _component_population(components: tuple[Component, ...], label: str) -> Population:
+def _component_population(components: tuple[Component, ...], label: str) -> CasePopulation:
     classes = {component.cls for component in components}
     if ComponentClass.DISCOVERY in classes and classes != {ComponentClass.DISCOVERY}:
         raise ValueError(f"{label} cannot mix discovery and answer-population components")
-    return Population.TRIGGER if classes == {ComponentClass.DISCOVERY} else Population.ANSWER
+    return CasePopulation.TRIGGER if classes == {ComponentClass.DISCOVERY} else CasePopulation.ANSWER
 
 
 @dataclass(frozen=True)
@@ -358,7 +359,7 @@ class Provenance:
 
     id: str
     mode: AblationMode
-    population: Population
+    population: CasePopulation
     identity: TreeIdentity
     components: tuple[Component, ...]
 
@@ -366,7 +367,7 @@ class Provenance:
         object.__setattr__(self, "id", _nonempty_identifier(self.id, "Provenance.id", slug=True))
         try:
             mode = AblationMode(self.mode)
-            population = Population(self.population)
+            population = CasePopulation(self.population)
         except ValueError as exc:
             raise ValueError(f"Provenance has unknown mode/population: {exc}") from exc
         if mode not in {AblationMode.MATERIALIZED, AblationMode.INVALID_SKILL}:
@@ -409,11 +410,6 @@ class Provenance:
             components=tuple(Component.from_dict(c) for c in comps),
         )
 
-    # The exact key set as_dict() emits / from_dict() requires. Tests and
-    # verifiers reference THIS instead of re-typing the literal set (six copies
-    # of it once drifted independently across three test files).
-    SCHEMA_KEYS = frozenset({"id", "mode", "population", "skill_hash", "parent_skill_hash", "components"})
-
     def matches(self, expected: Provenance | ExpectedProvenance) -> bool:
         """Exact declared identity match; tree revision is checked separately."""
         return (
@@ -430,14 +426,14 @@ class ExpectedProvenance:
 
     id: str
     mode: AblationMode
-    population: Population
+    population: CasePopulation
     components: tuple[Component, ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "id", _nonempty_identifier(self.id, "ExpectedProvenance.id", slug=True))
         try:
             mode = AblationMode(self.mode)
-            population = Population(self.population)
+            population = CasePopulation(self.population)
         except ValueError as exc:
             raise ValueError(f"ExpectedProvenance has unknown mode/population: {exc}") from exc
         if mode not in {AblationMode.MATERIALIZED, AblationMode.INVALID_SKILL}:
@@ -460,7 +456,7 @@ class InstructionSimulated:
     longer drift apart one hand-built key at a time."""
 
     id: str
-    population: Population
+    population: CasePopulation
     removed_component: str | None = None
     expected_regressions: tuple[str, ...] = ()
 
@@ -469,10 +465,10 @@ class InstructionSimulated:
     def __post_init__(self) -> None:
         object.__setattr__(self, "id", _nonempty_identifier(self.id, "InstructionSimulated.id", slug=True))
         try:
-            population = Population(self.population)
+            population = CasePopulation(self.population)
         except ValueError as exc:
             raise ValueError(f"InstructionSimulated has unknown population: {exc}") from exc
-        if population is not Population.ANSWER:
+        if population is not CasePopulation.ANSWER:
             raise ValueError("InstructionSimulated is only valid for the answer population")
         object.__setattr__(self, "population", population)
         if self.removed_component is not None and (
@@ -552,15 +548,6 @@ class Arm:
         if not self.blind:
             return self.variant_truth
         return OPAQUE_TOKEN_PREFIX + hashlib.sha256(self.variant_truth.encode("utf-8")).hexdigest()[:10]
-
-    # --- harness-only surface (truth) ---
-    def harness_record(self) -> dict[str, Any]:
-        rec: dict[str, Any] = {"variant": self.variant_truth}
-        if self.provenance is not None:
-            rec["ablation"] = self.provenance.as_dict()
-        if self.identity is not None:
-            rec["skill_tree_hash"] = self.identity.canonical
-        return rec
 
 
 @dataclass(frozen=True)
@@ -730,10 +717,14 @@ class PreparedTask:
                 raise ValueError("PreparedTask.skill_root_keys must be unique safe path segments")
         if self.variant_truth == "without_skill" and self.skill_paths:
             raise ValueError("without_skill task cannot carry skill paths")
+        if self.variant_truth in {"without_skill", "old_skill"} and self.skill_tree_hash is not None:
+            # The hash names the current canonical skill tree; an arm that mounts
+            # no skill, or the previous one, cannot truthfully record it.
+            raise ValueError(f"{self.variant_truth} task cannot carry the current skill_tree_hash")
         if self.is_ablation:
             if self.ablation is None or self.ablation.id != ablation_id_of(self.variant_truth):
                 raise ValueError("ablation task requires a matching typed ablation record")
-            if self.ablation.population is not Population.ANSWER:
+            if self.ablation.population is not CasePopulation.ANSWER:
                 raise ValueError("answer task cannot carry trigger-population ablation provenance")
             if isinstance(self.ablation, Provenance):
                 if not self.skill_paths:

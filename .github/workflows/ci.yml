@@ -48,6 +48,9 @@ jobs:
           python run_pi_trigger_eval.py --help
           python run_trigger_matrix.py --help
 
+      - name: Check the installed wheel outside the checkout
+        run: python scripts/check_installed_wheel.py
+
   windows-text-contracts:
     name: Windows Python 3.12 text contracts
     runs-on: windows-latest

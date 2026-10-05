@@ -1,4 +1,3 @@
-import copy
 import io
 import json
 import tempfile
@@ -7,29 +6,14 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
+from helpers import (
+    FakeJettyClient,
+    jetty_payload,
+    jetty_task_upload,
+)
+
 import jetty_contracts as jc
 import skill_benchmark as sb
-
-
-def executable_payload(*, collection="c", task="t"):
-    payload = {
-        "harness": {"executable": True},
-        "jetty_request": {
-            "model": "m",
-            "messages": [],
-            "jetty": {
-                "collection": collection,
-                "task": task,
-                "agent": "claude-code",
-                "model_provider": "anthropic",
-                "snapshot": "s",
-            },
-        },
-        "upload_plan": {"files": []},
-    }
-    payload["harness"]["jetty_task_contract_sha256"] = (
-        sb.jetty_task_contract_sha256(payload))
-    return payload
 
 
 class JettyLifecycleTruthTableTests(unittest.TestCase):
@@ -38,7 +22,7 @@ class JettyLifecycleTruthTableTests(unittest.TestCase):
             **{raw: jc.Queued for raw in ("pending", "queued", "starting")},
             **{raw: jc.Running for raw in ("running", "in_progress")},
             **{raw: jc.Succeeded for raw in ("completed", "complete", "succeeded", "success")},
-            **{raw: jc.Failed for raw in ("failed", "failure", "error", "errored", "canceled", "cancelled")},
+            **{raw: jc.Failed for raw in ("failed", "failure", "error", "errored", "canceled", "cancelled", "archived")},
             **{raw: jc.TimedOut for raw in ("timeout", "timed_out")},
         }
         for raw, expected_type in table.items():
@@ -48,6 +32,8 @@ class JettyLifecycleTruthTableTests(unittest.TestCase):
                 self.assertEqual(lifecycle.terminal, not isinstance(lifecycle, (jc.Queued, jc.Running)))
         self.assertTrue(jc.lifecycle_from_status("completed").successful)
         self.assertFalse(jc.lifecycle_from_status("failed").successful)
+        # A trajectory archived mid-poll ends the run as an explained failure.
+        self.assertIn("archived", jc.lifecycle_from_status("archived").message)
 
     def test_unknown_missing_and_non_string_statuses_are_protocol_invalid(self):
         for raw in (None, "", "new-provider-state", 7, True):
@@ -82,93 +68,32 @@ class JettyLifecycleTruthTableTests(unittest.TestCase):
 
 
 class JettyBoundaryIntegrationTests(unittest.TestCase):
-    def test_executor_rejects_conflicting_submission_identity_before_poll(self):
-        class Client:
-            polled = False
+    def test_executor_rejects_conflicting_submission_evidence_before_download(self):
+        cases = {
+            "trajectory identity": (
+                {"id": "chatcmpl-trajectory-1", "jetty_metadata": {
+                    "trajectory_id": "other-trajectory",
+                    "collection": "c", "task": "t"}},
+                "conflicting", 0),
+            "collection metadata": (
+                {"trajectory_id": "trajectory-1",
+                 "jetty_metadata": {"collection": "other", "task": "t"}},
+                "collection conflicts", 0),
+            "storage root": (
+                {"trajectory_id": "trajectory-1",
+                 "jetty_metadata": {"storage_path": "c/t/0001"}},
+                "submit and completed storage_path", 1),
+        }
+        for label, (submission, error, polls) in cases.items():
+            with self.subTest(label=label):
+                client = FakeJettyClient(submission=submission, artifact=True)
+                record = next(iter(sb.execute_jetty_payloads(
+                    [jetty_payload()], client=client)))
 
-            def submit(self, request):
-                return {
-                    "id": "chatcmpl-trajectory-1",
-                    "jetty_metadata": {
-                        "trajectory_id": "other-trajectory",
-                        "collection": "c",
-                        "task": "t",
-                    },
-                }
-
-            def poll(self, *args, **kwargs):
-                self.polled = True
-                raise AssertionError("conflicting submission must not be polled")
-
-        client = Client()
-        record = next(iter(sb.execute_jetty_payloads(
-            [executable_payload()], client=client)))
-
-        self.assertEqual(record["status"], "failed")
-        self.assertIn("conflicting", record["error"])
-        self.assertFalse(client.polled)
-
-    def test_executor_rejects_conflicting_submission_metadata_before_poll(self):
-        class Client:
-            polled = False
-
-            def submit(self, request):
-                return {
-                    "trajectory_id": "trajectory-1",
-                    "jetty_metadata": {"collection": "other", "task": "t"},
-                }
-
-            def poll(self, *args, **kwargs):
-                self.polled = True
-                raise AssertionError("conflicting submission must not be polled")
-
-        client = Client()
-        record = next(iter(sb.execute_jetty_payloads(
-            [executable_payload()], client=client)))
-
-        self.assertEqual(record["status"], "failed")
-        self.assertIn("collection conflicts", record["error"])
-        self.assertFalse(client.polled)
-
-    def test_executor_rejects_submission_storage_mismatch(self):
-        class Client:
-            downloaded = False
-
-            def submit(self, request):
-                return {
-                    "trajectory_id": "trajectory-1",
-                    "jetty_metadata": {"storage_path": "c/t/0001"},
-                }
-
-            def poll(self, *args, **kwargs):
-                return {
-                    "status": "completed",
-                    "trajectory_id": "trajectory-1",
-                    "storage_path": "c/t/0000",
-                }
-
-            def fetch_trajectory(self, *args, **kwargs):
-                return {
-                    "status": "completed",
-                    "trajectory_id": "trajectory-1",
-                    "storage_path": "c/t/0000",
-                    "steps": {"run": {"outputs": {
-                        "success": True,
-                        "results_files": [],
-                    }}},
-                }
-
-            def download_file(self, storage_path):
-                self.downloaded = True
-                return b"must not download"
-
-        client = Client()
-        record = next(iter(sb.execute_jetty_payloads(
-            [executable_payload()], client=client)))
-
-        self.assertEqual(record["status"], "failed")
-        self.assertIn("submit and completed storage_path", record["error"])
-        self.assertFalse(client.downloaded)
+                self.assertEqual(record["status"], "failed")
+                self.assertIn(error, record["error"])
+                self.assertEqual(client.poll_calls, polls)
+                self.assertEqual(client.download_calls, 0)
 
     def test_executor_rejects_mismatched_completed_evidence(self):
         poll = {
@@ -221,89 +146,62 @@ class JettyBoundaryIntegrationTests(unittest.TestCase):
 
         for label, (polled, fetched, error) in cases.items():
             with self.subTest(label=label):
-                class Client:
-                    downloaded = False
-
-                    def __init__(self, poll_response, detail_response):
-                        self.poll_response = poll_response
-                        self.detail_response = detail_response
-
-                    def submit(self, request):
-                        return {"trajectory_id": "trajectory-1"}
-
-                    def poll(self, *args, **kwargs):
-                        return copy.deepcopy(self.poll_response)
-
-                    def fetch_trajectory(self, *args, **kwargs):
-                        return copy.deepcopy(self.detail_response)
-
-                    def download_file(self, storage_path):
-                        self.downloaded = True
-                        return b"must not download"
-
-                client = Client(polled, fetched)
+                client = FakeJettyClient(
+                    poll_response=polled, detail_response=fetched)
                 record = next(iter(sb.execute_jetty_payloads(
-                    [executable_payload()], client=client)))
+                    [jetty_payload()], client=client)))
 
                 self.assertEqual(record["status"], "failed")
                 self.assertIn(error, record["error"])
-                self.assertFalse(client.downloaded)
+                self.assertEqual(client.download_calls, 0)
 
     def test_executor_projects_secret_bearing_detail_before_persistence(self):
         sentinel = "JETTY_SECRET_SENTINEL"
-
-        class Client:
-            def submit(self, request):
-                return {
-                    "trajectory_id": "trajectory-1",
-                    "provider_debug": {
-                        "authorization": sentinel,
-                        "steps": {"inputs": {"token": sentinel}},
-                    },
-                }
-
-            def poll(self, *args, **kwargs):
-                return {
-                    "status": "completed",
-                    "trajectory_id": "trajectory-1",
-                    "storage_path": "c/t/0000",
-                    "init_params": {"agent_env": {"TOKEN": sentinel}},
-                    "steps": {"run": {"inputs": {
+        client = FakeJettyClient(
+            submission={
+                "trajectory_id": "trajectory-1",
+                "provider_debug": {
+                    "authorization": sentinel,
+                    "steps": {"inputs": {"token": sentinel}},
+                },
+            },
+            poll_response={
+                "status": "completed",
+                "trajectory_id": "trajectory-1",
+                "storage_path": "c/t/0000",
+                "init_params": {"agent_env": {"TOKEN": sentinel}},
+                "steps": {"run": {"inputs": {
+                    "mcp_auth_token": sentinel,
+                }}},
+            },
+            detail_response={
+                "status": "completed",
+                "trajectory_id": "trajectory-1",
+                "storage_path": "c/t/0000",
+                "steps": {"run": {
+                    "inputs": {
                         "mcp_auth_token": sentinel,
-                    }}},
-                }
-
-            def fetch_trajectory(self, *args, **kwargs):
-                return {
-                    "status": "completed",
-                    "trajectory_id": "trajectory-1",
-                    "storage_path": "c/t/0000",
-                    "steps": {"run": {
-                        "inputs": {
-                            "mcp_auth_token": sentinel,
-                            "subscription_credential": sentinel,
-                            "agent_env": {"TOKEN": sentinel},
-                        },
-                        "outputs": {
-                            "success": True,
-                            "results_files": [{
-                                "path": "c/t/0000/trajectory-1.run.0000.app--results--output.md",
-                                "content_type": "text/markdown",
-                            }],
-                        },
-                        "activity": "runbook",
-                        "duration_seconds": 1.25,
-                    }},
-                }
-
-            def download_file(self, storage_path):
-                return b"answer"
+                        "subscription_credential": sentinel,
+                        "agent_env": {"TOKEN": sentinel},
+                    },
+                    "outputs": {
+                        "success": True,
+                        "results_files": [{
+                            "path": "c/t/0000/trajectory-1.run.0000.app--results--output.md",
+                            "content_type": "text/markdown",
+                        }],
+                    },
+                    "activity": "runbook",
+                    "duration_seconds": 1.25,
+                }},
+            },
+        )
 
         with tempfile.TemporaryDirectory() as td:
             journal_path = Path(td) / "attempts.json"
             record = next(iter(sb.execute_jetty_payloads(
-                [executable_payload()],
-                client=Client(),
+                [jetty_payload()],
+                client=client,
                 journal=sb.JettyAttemptJournal(journal_path),
             )))
 
@@ -395,102 +293,40 @@ class JettyBoundaryIntegrationTests(unittest.TestCase):
         self.assertEqual(metadata["cost_normalized"]["total_cost"], 0.25)
 
     def test_executor_rejects_blank_submitted_trajectory_id_before_poll(self):
-        class Client:
-            polled = False
-
-            def submit(self, request):
-                return {"trajectory_id": "   "}
-
-            def poll(self, *args, **kwargs):
-                self.polled = True
-                raise AssertionError("blank trajectory id must not be polled")
-
-        client = Client()
-        payload = {
-            "harness": {"executable": True},
-            "jetty_request": {"model": "m", "messages": [], "jetty": {
-                "collection": "c", "task": "t", "agent": "claude-code",
-                "model_provider": "anthropic", "snapshot": "s"}},
-            "upload_plan": {"files": []},
-        }
-        payload["harness"]["jetty_task_contract_sha256"] = (
-            sb.jetty_task_contract_sha256(payload))
-        record = next(iter(sb.execute_jetty_payloads([payload], client=client)))
+        client = FakeJettyClient(submission={"trajectory_id": "   "})
+        record = next(iter(sb.execute_jetty_payloads(
+            [jetty_payload()], client=client)))
         self.assertEqual(record["status"], "failed")
         self.assertEqual(record["lifecycle"]["kind"], "failed")
         self.assertIn("trajectory_id", record["error"])
-        self.assertFalse(client.polled)
+        self.assertEqual(client.poll_calls, 0)
 
-    def test_executor_rejects_model_visible_task_substitution_before_upload(self):
-        class Client:
-            uploaded = False
+    def test_executor_rejects_payload_changes_after_attestation_before_upload(self):
+        def substitute_task(payload):
+            payload["upload_plan"]["files"][0]["content"]["prompt"] = "substituted"
 
-            def upload(self, *args, **kwargs):
-                self.uploaded = True
-                raise AssertionError("changed task must be rejected before upload")
+        def substitute_runbook(payload):
+            payload["jetty_request"]["messages"][0]["content"] = "substituted"
 
-        for changed_field in ("task", "runbook"):
-            with self.subTest(changed_field=changed_field):
-                client = Client()
-                payload = {
-                    "harness": {"executable": True},
-                    "jetty_request": {
-                        "model": "m",
-                        "messages": [{"role": "system", "content": "runbook"}],
-                        "jetty": {"collection": "c", "task": "t"},
-                    },
-                    "upload_plan": {"files": [{
-                        "role": "task", "placeholder": "upload://task",
-                        "remote_path_hint": "task.json", "private": True,
-                        "content": {"prompt": "original"},
-                    }]},
-                }
-                payload["harness"]["jetty_task_contract_sha256"] = (
-                    sb.jetty_task_contract_sha256(payload))
-                if changed_field == "task":
-                    payload["upload_plan"]["files"][0]["content"]["prompt"] = "substituted"
-                else:
-                    payload["jetty_request"]["messages"][0]["content"] = "substituted"
+        def substitute_run_dir(payload):
+            payload["harness"]["run_dir"] = "case-1/without_skill"
+
+        for label, mutate in (("task", substitute_task),
+                              ("runbook", substitute_runbook),
+                              ("causal harness", substitute_run_dir)):
+            with self.subTest(changed=label):
+                payload = jetty_payload(
+                    files=[jetty_task_upload({"prompt": "original"})],
+                    messages=[{"role": "system", "content": "runbook"}],
+                )
+                mutate(payload)
+                client = FakeJettyClient()
 
                 record = next(iter(sb.execute_jetty_payloads([payload], client=client)))
 
                 self.assertEqual(record["status"], "failed")
                 self.assertIn("changed after attestation", record["error"])
-                self.assertFalse(client.uploaded)
-
-    def test_executor_rejects_causal_harness_substitution_before_upload(self):
-        class Client:
-            uploaded = False
-
-            def upload(self, *args, **kwargs):
-                self.uploaded = True
-                raise AssertionError("changed harness must be rejected before upload")
-
-        client = Client()
-        payload = {
-            "harness": {
-                "executable": True, "case_id": "case-1",
-                "variant": "with_skill", "run_number": 1,
-                "run_dir": "case-1/with_skill",
-            },
-            "jetty_request": {
-                "model": "m", "messages": [],
-                "jetty": {"collection": "c", "task": "t"},
-            },
-            "upload_plan": {"files": [{
-                "role": "task", "placeholder": "upload://task",
-                "remote_path_hint": "task.json", "content": {},
-            }]},
-        }
-        payload["harness"]["jetty_task_contract_sha256"] = (
-            sb.jetty_task_contract_sha256(payload))
-        payload["harness"]["run_dir"] = "case-1/without_skill"
-
-        record = next(iter(sb.execute_jetty_payloads([payload], client=client)))
-
-        self.assertEqual(record["status"], "failed")
-        self.assertIn("changed after attestation", record["error"])
-        self.assertFalse(client.uploaded)
+                self.assertEqual(client.upload_calls, 0)
 
     def test_executor_snapshots_every_local_upload_before_network_io(self):
         with tempfile.TemporaryDirectory() as td:
@@ -500,36 +336,10 @@ class JettyBoundaryIntegrationTests(unittest.TestCase):
             first.write_bytes(b"first-before")
             second.write_bytes(b"second-before")
 
-            class Client:
-                bundle: tuple[str, bytes] | None = None
-                submitted = None
-
+            class MutatingUploadClient(FakeJettyClient):
                 def upload_bundle(self, archive_name, data):
-                    self.bundle = (archive_name, data)
                     second.write_bytes(b"second-after")
-                    return "remote-bundle"
-
-                def submit(self, request):
-                    self.submitted = request
-                    return {"trajectory_id": "trajectory-1"}
-
-                def poll(self, *args, **kwargs):
-                    return {
-                        "status": "completed",
-                        "trajectory_id": "trajectory-1",
-                        "storage_path": "c/t/0000",
-                    }
-
-                def fetch_trajectory(self, *args, **kwargs):
-                    return {
-                        "status": "completed",
-                        "trajectory_id": "trajectory-1",
-                        "storage_path": "c/t/0000",
-                        "steps": {"run": {"outputs": {
-                            "success": True,
-                            "results_files": [],
-                        }}},
-                    }
+                    return super().upload_bundle(archive_name, data)
 
             files = [
                 {"role": "fixture", "placeholder": "upload://first",
@@ -540,41 +350,22 @@ class JettyBoundaryIntegrationTests(unittest.TestCase):
                  "remote_path_hint": "fixtures/second.txt",
                  "sandbox_path": "/app/assets/fixtures/second.txt",
                  "local_path": str(second)},
-                {"role": "task", "placeholder": "upload://task",
-                 "remote_path_hint": "tasks/task.json",
-                 "sandbox_path": "/app/assets/tasks/task.json",
-                 "content": json.dumps({
-                     "files": [
-                         "/app/assets/fixtures/first.txt",
-                         "/app/assets/fixtures/second.txt",
-                     ],
-                 })},
+                jetty_task_upload(json.dumps({
+                    "files": [
+                        "/app/assets/fixtures/first.txt",
+                        "/app/assets/fixtures/second.txt",
+                    ],
+                })),
             ]
-            payload = {
-                "harness": {"executable": True},
-                "jetty_request": {
-                    "model": "m", "messages": [],
-                    "jetty": {"collection": "c", "task": "t"},
-                },
-                "upload_plan": {
-                    "bundle": {
-                        "placeholder": "upload://bundle",
-                        "archive_name": "task.zip",
-                    },
-                    "files": files,
-                },
-            }
-            payload["jetty_request"]["jetty"]["file_paths"] = ["upload://bundle"]
-            payload["harness"]["jetty_task_contract_sha256"] = (
-                sb.jetty_task_contract_sha256(payload))
-            client = Client()
+            client = MutatingUploadClient()
 
-            record = next(iter(sb.execute_jetty_payloads([payload], client=client)))
+            record = next(iter(sb.execute_jetty_payloads(
+                [jetty_payload(files=files)], client=client)))
 
             self.assertEqual(record["status"], "completed")
             self.assertIsNotNone(client.bundle)
             assert client.bundle is not None
-            self.assertEqual(client.bundle[0], "task.zip")
+            self.assertEqual(client.bundle[0], "bundle.zip")
             with zipfile.ZipFile(io.BytesIO(client.bundle[1])) as archive:
                 self.assertEqual(archive.read("fixtures/first.txt"), b"first-before")
                 self.assertEqual(archive.read("fixtures/second.txt"), b"second-before")
@@ -583,6 +374,7 @@ class JettyBoundaryIntegrationTests(unittest.TestCase):
                 "/app/assets/fixtures/first.txt",
                 "/app/assets/fixtures/second.txt",
             ])
+            assert client.submitted is not None
             self.assertEqual(
                 client.submitted["jetty"]["file_paths"], ["remote-bundle"])
             self.assertNotIn("upload://", json.dumps(client.submitted))
@@ -595,68 +387,41 @@ class JettyBoundaryIntegrationTests(unittest.TestCase):
 
         self.assertEqual(replaced, {"one": "remote-I", "ten": "remote-J"})
 
-    def test_old_skill_variant_verifies_the_old_skill_upload_surface(self):
+    def test_mounted_skill_bytes_must_match_the_attested_skill_tree_hash(self):
+        # Each arm hashes the skill surface it mounts (old_skill mounts the old
+        # skill), and a harness hash that disagrees with those bytes is
+        # rejected before upload even when the task-contract digest agrees.
         with tempfile.TemporaryDirectory() as td:
             skill = Path(td) / "SKILL.md"
-            skill.write_text("old skill", encoding="utf-8")
-            files = [{
-                "role": "old_skill", "placeholder": "upload://old-skill",
-                "remote_path_hint": "skills/demo/SKILL.md",
-                "sandbox_path": "/app/assets/skills/demo/SKILL.md",
-                "local_path": str(skill),
-            }]
-            payload = {
-                "harness": {
-                    "executable": True, "variant": "old_skill",
-                    "skill_name": "demo",
-                    "skill_tree_hash": sb.planned_file_surface_hash(
-                        files, role="old_skill", path_prefix="skills/demo/"),
-                },
-                "jetty_request": {
-                    "model": "m", "messages": [],
-                    "jetty": {"collection": "c", "task": "t"},
-                },
-                "upload_plan": {
-                    "bundle": {
-                        "placeholder": "upload://bundle",
-                        "archive_name": "old-skill.zip",
-                    },
-                    "files": files,
-                },
-            }
-            payload["jetty_request"]["jetty"]["file_paths"] = ["upload://bundle"]
-            payload["harness"]["jetty_task_contract_sha256"] = (
-                sb.jetty_task_contract_sha256(payload))
+            skill.write_text("skill bytes", encoding="utf-8")
+            for variant, role in (("with_skill", "skill"), ("old_skill", "old_skill")):
+                files = [{
+                    "role": role, "placeholder": f"upload://{role}",
+                    "remote_path_hint": "skills/demo/SKILL.md",
+                    "sandbox_path": "/app/assets/skills/demo/SKILL.md",
+                    "local_path": str(skill),
+                }]
+                mounted = sb.planned_file_surface_hash(
+                    files, role=role, path_prefix="skills/demo/")
+                for claimed, error in ((mounted, None), (
+                        "0" * 64, "Jetty skill bytes changed after payload attestation")):
+                    with self.subTest(variant=variant, matches=error is None):
+                        payload = jetty_payload(harness={
+                            "variant": variant, "skill_name": "demo",
+                            "skill_tree_hash": claimed,
+                        }, files=files)
+                        client = FakeJettyClient()
 
-            class Client:
-                def upload_bundle(self, archive_name, data):
-                    return "remote-old-skill-bundle"
+                        record = next(iter(
+                            sb.execute_jetty_payloads([payload], client=client)))
 
-                def submit(self, request):
-                    return {"trajectory_id": "trajectory-1"}
-
-                def poll(self, *args, **kwargs):
-                    return {
-                        "status": "completed",
-                        "trajectory_id": "trajectory-1",
-                        "storage_path": "c/t/0000",
-                    }
-
-                def fetch_trajectory(self, *args, **kwargs):
-                    return {
-                        "status": "completed",
-                        "trajectory_id": "trajectory-1",
-                        "storage_path": "c/t/0000",
-                        "steps": {"run": {"outputs": {
-                            "success": True,
-                            "results_files": [],
-                        }}},
-                    }
-
-            record = next(iter(
-                sb.execute_jetty_payloads([payload], client=Client())))
-
-            self.assertEqual(record["status"], "completed")
+                        if error is None:
+                            self.assertEqual(record["status"], "completed")
+                            self.assertEqual(client.upload_calls, 1)
+                        else:
+                            self.assertEqual(record["status"], "failed")
+                            self.assertIn(error, record["error"])
+                            self.assertEqual(client.upload_calls, 0)
 
     def test_failed_trajectory_cannot_promote_partial_events_to_complete_operations(self):
         record = {

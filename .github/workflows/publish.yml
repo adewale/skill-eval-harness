@@ -41,6 +41,26 @@ jobs:
               raise SystemExit(f"release tag {tag!r} does not match package version {version!r}")
           PY
 
+      # A release tag may name a commit CI never ran, so the release repeats
+      # every gate a pull request runs, with the linters the test extra pins.
+      - name: Install package and dependencies
+        run: python -m pip install -e ".[test]"
+
+      - name: Compile Python files
+        run: python -m py_compile *.py scripts/*.py examples/adewale-workspace/*.py examples/demo-skill/*.py type_tests/*.py tests/*.py
+
+      - name: Run Ruff
+        run: ruff check .
+
+      - name: Run ty
+        run: ty check --error-on-warning --output-format github
+
+      - name: Run the test suite on the release tag
+        run: python -m unittest discover tests -v
+
+      - name: Check pytest/unittest collection parity
+        run: python scripts/check_test_collection_parity.py
+
       - name: Build distributions
         run: |
           python -m pip install --upgrade build
@@ -67,6 +87,9 @@ jobs:
           /tmp/skill-eval-wheel-smoke/bin/skill-benchmark --help
           /tmp/skill-eval-wheel-smoke/bin/skill-pi-trigger-eval --help
           /tmp/skill-eval-wheel-smoke/bin/skill-trigger-matrix --help
+
+      - name: Import every module from the built wheel
+        run: python scripts/check_installed_wheel.py --wheel dist/*.whl
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

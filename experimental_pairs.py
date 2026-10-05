@@ -12,7 +12,16 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Generic, TypeVar
 
-from manifest_contracts import CaseId, ModelId, RunNumber
+from completion_contracts import effort_identity
+from manifest_contracts import (
+    OLD_SKILL,
+    WITH_SKILL,
+    WITHOUT_SKILL,
+    CaseId,
+    ExecutionVariant,
+    ModelId,
+    RunNumber,
+)
 
 PayloadT = TypeVar("PayloadT")
 
@@ -63,15 +72,36 @@ class TreatmentCoordinate:
         object.__setattr__(self, "factors", ordered)
 
 
+class HeldFixedFactor(str, Enum):
+    """A condition both arms of a pair must share for their difference to be the skill's.
+
+    A contrast varies one ``ExperimentalFactor``; everything named here must be
+    equal between the two arms, or the pair is blocked. Each factor is read
+    from a result row or run metadata by one reader.
+    """
+
+    EFFORT = "effort"
+
+
+_HELD_FIXED_READERS: dict[HeldFixedFactor, Callable[[Mapping[str, Any]], str | None]] = {
+    HeldFixedFactor.EFFORT: effort_identity,
+}
+
+
 @dataclass(frozen=True)
 class ContrastSpec:
-    """One declared binary comparison and both of its treatment coordinates."""
+    """One declared binary comparison and both of its treatment coordinates.
+
+    ``held_fixed`` names the conditions that must match between the arms of a
+    pair, so an effort difference cannot pass as a skill effect.
+    """
 
     contrast_id: str
     treatment_arm: ExperimentalArmId
     control_arm: ExperimentalArmId
     treatment: TreatmentCoordinate
     control: TreatmentCoordinate
+    held_fixed: tuple[HeldFixedFactor, ...] = (HeldFixedFactor.EFFORT,)
 
     def __post_init__(self) -> None:
         if not isinstance(self.contrast_id, str) or not self.contrast_id.strip():
@@ -87,12 +117,33 @@ class ContrastSpec:
             raise TypeError("experimental contrast coordinates must be TreatmentCoordinate")
         if self.treatment == self.control:
             raise ValueError("experimental contrast coordinates must be distinct")
+        held = tuple(HeldFixedFactor(item) for item in self.held_fixed)
+        if len(set(held)) != len(held):
+            raise ValueError("a held-fixed factor can be named only once")
+        object.__setattr__(self, "held_fixed", held)
+
+    def comparability(self, left: Mapping[str, Any], right: Mapping[str, Any]) -> str | None:
+        """The block reason when two arms did not share a held-fixed condition.
+
+        Rows recorded before a factor existed carry none, and two such rows
+        still pair. One recorded arm against one unrecorded arm cannot be shown
+        to match, so that pair is blocked rather than trusted.
+        """
+        for factor in self.held_fixed:
+            reader = _HELD_FIXED_READERS[factor]
+            left_value, right_value = reader(left), reader(right)
+            if left_value == right_value:
+                continue
+            if left_value is None or right_value is None:
+                return f"{factor.value}_unrecorded_on_one_arm"
+            return f"{factor.value}_mismatch"
+        return None
 
 
 SKILL_PRESENCE_CONTRAST = ContrastSpec(
     contrast_id="skill_presence",
-    treatment_arm=ExperimentalArmId("with_skill"),
-    control_arm=ExperimentalArmId("without_skill"),
+    treatment_arm=ExperimentalArmId(WITH_SKILL),
+    control_arm=ExperimentalArmId(WITHOUT_SKILL),
     treatment=TreatmentCoordinate((
         FactorCoordinate(ExperimentalFactor.ACTIVATION, "forced"),
         FactorCoordinate(ExperimentalFactor.SKILL_SET, "all"),
@@ -104,6 +155,65 @@ SKILL_PRESENCE_CONTRAST = ContrastSpec(
         FactorCoordinate(ExperimentalFactor.CONTENT_REVISION, "current"),
     )),
 )
+
+
+# The current skill against the revision it replaces, in the same run.
+EDIT_CONTRAST = ContrastSpec(
+    contrast_id="skill_edit",
+    treatment_arm=ExperimentalArmId(WITH_SKILL),
+    control_arm=ExperimentalArmId(OLD_SKILL),
+    treatment=TreatmentCoordinate((
+        FactorCoordinate(ExperimentalFactor.ACTIVATION, "forced"),
+        FactorCoordinate(ExperimentalFactor.SKILL_SET, "all"),
+        FactorCoordinate(ExperimentalFactor.CONTENT_REVISION, "current"),
+    )),
+    control=TreatmentCoordinate((
+        FactorCoordinate(ExperimentalFactor.ACTIVATION, "forced"),
+        FactorCoordinate(ExperimentalFactor.SKILL_SET, "all"),
+        FactorCoordinate(ExperimentalFactor.CONTENT_REVISION, "previous"),
+    )),
+)
+
+
+def ablation_contrast(variant: object) -> ContrastSpec:
+    """The full skill against the same skill with one declared component removed."""
+    arm = ExecutionVariant.parse(variant)
+    ablation_id = arm.ablation_id
+    if ablation_id is None:
+        raise ValueError(f"{arm!r} is not an ablation arm")
+    return ContrastSpec(
+        contrast_id=f"ablation:{ablation_id}",
+        treatment_arm=ExperimentalArmId(WITH_SKILL),
+        control_arm=ExperimentalArmId(arm),
+        treatment=TreatmentCoordinate((
+            FactorCoordinate(ExperimentalFactor.ACTIVATION, "forced"),
+            FactorCoordinate(ExperimentalFactor.SKILL_SET, "all"),
+            FactorCoordinate(ExperimentalFactor.CONTENT_REVISION, "current"),
+        )),
+        control=TreatmentCoordinate((
+            FactorCoordinate(ExperimentalFactor.ACTIVATION, "forced"),
+            FactorCoordinate(ExperimentalFactor.SKILL_SET, f"without:{ablation_id}"),
+            FactorCoordinate(ExperimentalFactor.CONTENT_REVISION, "current"),
+        )),
+    )
+
+
+def contrast_for(treatment: object, control: object) -> ContrastSpec:
+    """The declared contrast between two execution arms, or an error.
+
+    Every comparison names a contrast, so an arm is never relabelled into
+    another arm's slot to reuse a pair constructor.
+    """
+    treatment_arm = ExecutionVariant.parse(treatment)
+    control_arm = ExecutionVariant.parse(control)
+    if treatment_arm == WITH_SKILL:
+        if control_arm == WITHOUT_SKILL:
+            return SKILL_PRESENCE_CONTRAST
+        if control_arm == OLD_SKILL:
+            return EDIT_CONTRAST
+        if control_arm.is_ablation:
+            return ablation_contrast(control_arm)
+    raise ValueError(f"no declared contrast compares {treatment_arm!r} with {control_arm!r}")
 
 
 class ExperimentalPopulation(str, Enum):
@@ -268,6 +378,10 @@ class PairConstruction(Generic[PayloadT]):
     contrast: ContrastSpec
     pairs: tuple[ExperimentalPair[PayloadT], ...]
     blocked: tuple[BlockedExperimentalPair, ...]
+    # Identities whose two arms both declare nothing the metric measures (a
+    # case with no objective assertion, for an objective rate): out of scope,
+    # so neither paired nor blocked.
+    not_applicable: tuple[ExperimentalPairKey, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.contrast, ContrastSpec):
@@ -280,35 +394,53 @@ class PairConstruction(Generic[PayloadT]):
             isinstance(item, BlockedExperimentalPair) for item in self.blocked
         ):
             raise TypeError("blocked pairs must be a tuple of BlockedExperimentalPair values")
+        if not isinstance(self.not_applicable, tuple) or not all(
+            isinstance(item, ExperimentalPairKey) for item in self.not_applicable
+        ):
+            raise TypeError("not-applicable identities must be a tuple of ExperimentalPairKey values")
         pair_keys = [item.key for item in self.pairs]
         blocked_keys = [item.key for item in self.blocked]
         if any(item.contrast != self.contrast for item in self.pairs):
             raise ValueError("constructed pairs must use the construction contrast")
         if any(item.contrast_id != self.contrast.contrast_id for item in self.blocked):
             raise ValueError("blocked pairs must use the construction contrast")
-        if len(set(pair_keys)) != len(pair_keys) or len(set(blocked_keys)) != len(blocked_keys):
+        if any(len(set(keys)) != len(keys)
+               for keys in (pair_keys, blocked_keys, list(self.not_applicable))):
             raise ValueError("pair construction cannot repeat an experimental identity")
-        if set(pair_keys) & set(blocked_keys):
+        if (set(pair_keys) & set(blocked_keys)
+                or set(self.not_applicable) & (set(pair_keys) | set(blocked_keys))):
             raise ValueError("an experimental identity cannot be paired and blocked")
 
     def diagnostics(self) -> dict[str, Any]:
         reason_counts: dict[str, int] = {}
         for item in self.blocked:
             reason_counts[item.reason] = reason_counts.get(item.reason, 0) + 1
-        return {
+        out: dict[str, Any] = {
             "contrast_id": self.contrast.contrast_id,
             "eligible_pairs": len(self.pairs),
             "blocked_pairs": len(self.blocked),
             "blocked_reason_counts": dict(sorted(reason_counts.items())),
         }
+        if self.not_applicable:
+            out["not_applicable_pairs"] = len(self.not_applicable)
+        return out
 
 
 def construct_pairs(
     arms: Iterable[ExperimentalArm[PayloadT]],
     *,
     contrast: ContrastSpec = SKILL_PRESENCE_CONTRAST,
+    comparable: Callable[[PayloadT, PayloadT], str | None] | None = None,
+    not_applicable: Callable[[PayloadT], bool] | None = None,
 ) -> PairConstruction[PayloadT]:
-    """Build matched pairs and reject duplicate observations for either arm."""
+    """Build matched pairs and reject duplicate observations for either arm.
+
+    ``comparable`` returns a block reason when two eligible arms share an
+    identity but ran under conditions that make their difference meaningless
+    (for example, different effort levels). ``not_applicable`` is true of an
+    arm that declares nothing the metric measures; an identity whose two arms
+    are both present and both not applicable is recorded as out of scope
+    instead of blocked. One such arm beside a measured one still blocks."""
     indexed: dict[
         ExperimentalPairKey, dict[ExperimentalArmId, ExperimentalArm[PayloadT]]
     ] = {}
@@ -330,12 +462,16 @@ def construct_pairs(
 
     pairs: list[ExperimentalPair[PayloadT]] = []
     blocked: list[BlockedExperimentalPair] = []
+    out_of_scope: list[ExperimentalPairKey] = []
     for key in sorted(indexed, key=lambda item: (
             item.case_id, item.model or "", item.run_number, item.population.value)):
         slots = indexed[key]
         left = slots.get(contrast.treatment_arm)
         right = slots.get(contrast.control_arm)
-        if left is None:
+        if (left is not None and right is not None and not_applicable is not None
+                and not_applicable(left.payload) and not_applicable(right.payload)):
+            out_of_scope.append(key)
+        elif left is None:
             blocked.append(BlockedExperimentalPair(
                 key, f"missing_{contrast.treatment_arm}", contrast.contrast_id))
         elif right is None:
@@ -347,9 +483,12 @@ def construct_pairs(
         elif not right.eligible:
             blocked.append(BlockedExperimentalPair(
                 key, str(right.blocked_reason), contrast.contrast_id))
+        elif comparable is not None and (
+                reason := comparable(left.payload, right.payload)) is not None:
+            blocked.append(BlockedExperimentalPair(key, reason, contrast.contrast_id))
         else:
             pairs.append(ExperimentalPair(key, contrast, left, right))
-    return PairConstruction(contrast, tuple(pairs), tuple(blocked))
+    return PairConstruction(contrast, tuple(pairs), tuple(blocked), tuple(out_of_scope))
 
 
 def pairs_from_rows(
@@ -358,6 +497,7 @@ def pairs_from_rows(
     population: ExperimentalPopulation,
     eligibility: Callable[[Mapping[str, Any]], tuple[bool, str | None]] | None = None,
     contrast: ContrastSpec = SKILL_PRESENCE_CONTRAST,
+    not_applicable: Callable[[Mapping[str, Any]], bool] | None = None,
 ) -> PairConstruction[Mapping[str, Any]]:
     """Parse untrusted result rows into arms, then construct validated pairs."""
     arms: list[ExperimentalArm[Mapping[str, Any]]] = []
@@ -370,4 +510,5 @@ def pairs_from_rows(
         assert isinstance(arm, str)
         arms.append(ExperimentalArm(
             key, ExperimentalArmId(arm), row, eligible, reason))
-    return construct_pairs(arms, contrast=contrast)
+    return construct_pairs(arms, contrast=contrast, comparable=contrast.comparability,
+                           not_applicable=not_applicable)

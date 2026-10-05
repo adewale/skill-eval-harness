@@ -22,10 +22,11 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+from helpers import FakeJettyClient, run_cli
 
 import skill_benchmark as sb
 from ablation_model import JETTY_FAILURE
@@ -84,15 +85,18 @@ def write_smoke_manifest(root: Path, *, failure_only: bool = False) -> Path:
 def export_smoke_payloads(
     manifest: Path, out: Path, *, task_prefix: str, model: str,
 ) -> list[dict]:
-    sb.export_jetty(SimpleNamespace(
-        manifest=str(manifest), split="tune", runs_per_variant=1,
-        include_old_skill=False, include_ablations=False, allow_missing_prompts=False,
-        jetty_collection=COLLECTION, jetty_task_prefix=task_prefix,
-        jetty_agent="claude-code", jetty_model=model,
-        jetty_model_provider="anthropic", jetty_snapshot="python312-uv",
-        use_trial_keys=False, out=str(out),
-    ))
+    cli("export-jetty", manifest, "--split", "tune", "--jetty-collection", COLLECTION,
+        "--jetty-task-prefix", task_prefix, "--jetty-agent", "claude-code", "--jetty-model", model,
+        "--jetty-model-provider", "anthropic", "--jetty-snapshot", "python312-uv", "--out", out)
     return sb.load_jsonl(out)
+
+
+def cli(*argv: str | Path) -> None:
+    """Run one skill-benchmark command line through the real parser; a nonzero
+    exit fails the test with the command's stderr."""
+    code, _, stderr = run_cli(*argv)
+    if code != 0:
+        raise AssertionError(f"skill-benchmark {argv[0]} exited {code}: {stderr}")
 
 
 class JettySmokePayloadContractTests(unittest.TestCase):
@@ -110,34 +114,8 @@ class JettySmokePayloadContractTests(unittest.TestCase):
                 row for row in payloads
                 if row["harness"]["variant"] == "with_skill")
 
-            class Client:
-                submitted = None
-
-                def upload_bundle(self, archive_name, data):
-                    return "skill-evals/_sandbox_uploads/offline/failure.zip"
-
-                def submit(self, request):
-                    self.submitted = request
-                    return {"jetty_metadata": {"trajectory_id": "failure-trajectory"}}
-
-                def poll(self, *args, **kwargs):
-                    return {
-                        "status": "failed",
-                        "trajectory_id": "failure-trajectory",
-                        "storage_path": f"{args[0]}/{args[1]}/0000",
-                    }
-
-                def fetch_trajectory(self, *args, **kwargs):
-                    return {
-                        "status": "completed",
-                        "trajectory_id": "failure-trajectory",
-                        "storage_path": f"{args[0]}/{args[1]}/0000",
-                        "steps": {"run": {"outputs": {
-                            "success": False, "results_files": [],
-                        }}},
-                    }
-
-            client = Client()
+            client = FakeJettyClient(
+                trajectory_id="failure-trajectory", status="failed")
             record = next(sb.execute_jetty_payloads([payload], client=client))
             self.assertIsNotNone(client.submitted)
             self.assertEqual(record["trajectory_id"], "failure-trajectory")
@@ -145,8 +123,7 @@ class JettySmokePayloadContractTests(unittest.TestCase):
             runs_jsonl = root / "failure-runs.jsonl"
             runs_jsonl.write_text(json.dumps(record) + "\n", encoding="utf-8")
             runs = root / "failure-runs"
-            sb.import_jetty_results(SimpleNamespace(
-                manifest=str(manifest), jetty_runs=str(runs_jsonl), runs=str(runs)))
+            cli("import-jetty-results", "--manifest", manifest, "--jetty-runs", runs_jsonl, "--runs", runs)
             self.assertIn(
                 JETTY_FAILURE,
                 (runs / "smoke-failure" / "with_skill" / "output.md").read_text(
@@ -219,16 +196,15 @@ class JettyLiveSmokeTests(unittest.TestCase):
                 "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records[:4]),
                 encoding="utf-8")
             runs_dir = root / "eval-runs" / "jetty"
-            sb.import_jetty_results(SimpleNamespace(manifest=str(manifest), jetty_runs=str(runs_jsonl), runs=str(runs_dir)))
+            cli("import-jetty-results", "--manifest", manifest, "--jetty-runs", runs_jsonl, "--runs", runs_dir)
             fixture_output = (runs_dir / "smoke-fixture" / "with_skill" / "output.md").read_text(encoding="utf-8")
             self.assertIn(FIXTURE_TOKEN, fixture_output)
             failure_jsonl = root / "jetty-failure-runs.jsonl"
             failure_jsonl.write_text(
                 json.dumps(records[-1], ensure_ascii=False) + "\n", encoding="utf-8")
             failure_runs_dir = root / "eval-runs" / "jetty-failure"
-            sb.import_jetty_results(SimpleNamespace(
-                manifest=str(failure_manifest), jetty_runs=str(failure_jsonl),
-                runs=str(failure_runs_dir)))
+            cli("import-jetty-results", "--manifest", failure_manifest, "--jetty-runs", failure_jsonl,
+                "--runs", failure_runs_dir)
             failure_output = (
                 failure_runs_dir / "smoke-failure" / "with_skill" / "output.md"
             ).read_text(encoding="utf-8")

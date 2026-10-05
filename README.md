@@ -13,6 +13,7 @@ General eval frameworks (openai/evals, vitest-evals, viteval) score one output a
 |---|---|
 | Does this skill improve outputs compared with no skill at all? | `prepare` paired `with_skill` / `without_skill` rows, then `benchmark` paired lift and significance. |
 | Which prompts improved, regressed, saturated, or showed no lift? | `benchmark` `case_flags`, `render-viewer`, and `error-analysis`. |
+| Could this eval have shown the lift I care about? | `benchmark --min-lift`, then the paired lift's `interval` and `noise_check`. |
 | Is the skill worth its extra tokens or dollars? | `profile-skill`, `token-overhead`, `cost-summary`, and lift-per-dollar summaries. |
 | Did my latest skill edit introduce a regression? | Re-run the same manifest, inspect `ablation_regressions`, `trend`, and `render-viewer --previous-workspace`. |
 | Which instruction, checklist, reference, script, or asset is load-bearing? | Materialized `ablation:<id>` arms plus declared `expected_regressions`. |
@@ -104,7 +105,9 @@ benchmark -> benchmark.json with summary, results, and case_flags
 viewer    -> review.html with assertion evidence and output previews
 ```
 
-`benchmark.json` records one row per case/variant/run, plus aggregate pass rates, timing/token summaries, and flags for saturated, no-lift, flaky, or with-skill-failed cases. It also carries a `reliability` block — unbiased **pass@k** and **pass^k** per (case, variant) from the repeated runs — beside the paired lift's sign-flip `significance`, and a `trajectory_diff` block: per case, over validated experimental pairs, the commands exclusive to one arm across the case's complete repetition set, event-count deltas (steps/commands/tool calls/file reads/file writes), and per-arm skill-load rates — how the arms *behaved*, beside whether they passed. An arm without non-empty, readable trace evidence blocks its pair with a named reason instead of reading as an empty diff.
+`benchmark.json` records one row per case/variant/run, plus aggregate pass rates, timing/token summaries, and flags for saturated (both arms always pass), floor (`floor: fails in both arms`), no-lift, flaky, or with-skill-failed cases. It also carries a `reliability` block — unbiased **pass@k** and **pass^k** per (case, variant) from the repeated runs — beside the paired lift's sign-flip `significance`, and a `trajectory_diff` block: per case, over validated experimental pairs, the commands exclusive to one arm across the case's complete repetition set, event-count deltas (steps/commands/tool calls/file reads/file writes), and per-arm skill-load rates — how the arms *behaved*, beside whether they passed. An arm without non-empty, readable trace evidence blocks its pair with a named reason instead of reading as an empty diff.
+
+Each paired lift also carries an `interval` (the sign-flip test inverted into a 95% confidence interval, unbounded below six paired cases; the six-unit bound is the **Inference unit** entry in [`docs/vocabulary.md`](docs/vocabulary.md#report-signals)) and a `noise_check` whose `verdict` names what stops the eval from resolving a lift: too few cases moved, a noise floor above the `without_skill` headroom, or one above the `--min-lift` you would act on. A `run_endings` block counts, per variant, how runs stopped, whether the served model matched the request, and the effort each ran at, so a refusal is not read as a capability miss. The fields are in [`docs/commands.md`](docs/commands.md#lift-interval-and-noise-check).
 
 ## Installation
 
@@ -154,49 +157,20 @@ skill-benchmark --help
 
 ## Documentation map
 
-[`docs/README.md`](docs/README.md) groups these by kind (user journeys, concepts, reference, specs, audits) and holds the convention for adding a new user-journey walkthrough.
+Everything under `docs/` is indexed once, in [`docs/README.md`](docs/README.md): user journeys (each titled by the question it answers), concepts, the command reference, specs, and audits, with the convention for adding a user-journey walkthrough. The table below covers the files outside `docs/`.
 
 | File | Use it for |
 |---|---|
 | `README.md` | Manifest shape, run layout, and the command index. |
-| `docs/README.md` | The docs index: journeys/concepts/reference/specs grouping and the convention for adding a user-journey walkthrough. |
-| `docs/commands.md` | Full per-command reference: flags, examples, and output shapes for every subcommand. |
 | `CHANGELOG.md` | Release history and unreleased repo-surface changes. |
 | `CONTRIBUTING.md` | Local setup, validation commands, and eval-safety rules. |
 | `LESSONS_LEARNED.md` | Design lessons from the multi-skill saturation work and the roadmap/cost build-out. |
-| `docs/architecture.md` | How the pipeline fits together: the stages, the runner boundary, the model/variant/run fan-out, and the invariants that keep grading honest. |
-| `docs/abstractions.md` | What each core object is: manifest, prepared task, run-output contract, assertion result, `ResultSet`. |
-| `docs/typed-python.md` | Which Python surfaces `ty` checks, the boundary inventory, and the drift rules for new modules. |
-| `docs/authoring-evals.md` | Opinionated workflow/quickstart for writing a new eval suite, including severity and graded assertions. |
-| `docs/tuning-skill-activation.md` | The activation-tuning loop: trigger cases in both polarities, the (agent, model) trigger-rate matrix, how to read under/over-trigger, and the adapter seam for adding agents. |
-| `docs/is-my-skill-worth-its-tokens.md` | Keep/trim/cut walkthrough: static footprint (`profile-skill`) vs. runtime lift-per-token and lift-per-dollar (`token-overhead`, `cost-summary`). |
-| `docs/gating-ci-on-evals.md` | The CI recipe: `report --format junit|github` for regressions plus `audit-manifest --fail-on-blockers` for manifest trust. |
-| `docs/did-my-skill-edit-regress.md` | The edit → re-run → diff loop: the within-run `ablation_regressions` block (assertion-level, significance-gated) and cross-iteration `render-viewer --previous-workspace` diffs over the `iteration-N/` convention. |
-| `docs/which-model-should-my-skill-target.md` | Ranking model tiers by lift: `prepare --models` fan-out, the `by_model` / `model_analysis` blocks, and reading real lift vs. base-model saturation per tier. |
-| `docs/why-did-this-run-fail.md` | Debugging one failing run: the `error-analysis` taxonomy + review queue, then the run dir (`output.md`/`metadata.json`), mapped to a failure class and a manifest-or-skill decision. |
-| `docs/can-i-trust-my-judge.md` | Calibrating a judge before believing its numbers: `judge-robustness` (order-flip + negative controls), `judge-alignment` (human labels, Cohen's kappa, precision/recall), and `compare-judges` (does the lift survive a judge swap?). |
-| `docs/eval-framework-roadmap-spec.md` | The implemented eval-framework roadmap: goals, abstractions, and tests per feature (CF.1–CF.4, buckets 1–4, migration). |
-| `docs/migrating-evals.md` | Upgrading a manifest between versions (v1 → v2): what `migrate` stamps and the judgment calls it leaves. |
-| `docs/upgrading.md` | Version-by-version harness upgrades: saved-run backup, artifact migration, strict input repairs, expected report changes, and rollback. |
-| `docs/porting-existing-evals.md` | Arriving from another framework: `dataset_files` + a template case carry the rows across, then the paired baseline, splits, leakage lint, and the `audit-manifest` punch list supply what the old suite had no slot for. |
-| `docs/vocabulary.md` | Glossary of harness terms: variants, splits, models, ablations, assertions, severity/oracle tiers, graded scoring, cost telemetry, trace artifacts, agent/judge backends, judge calibration, reliability, contamination, and report flags. |
-| `docs/evals-are-not-tests.md` | Why a skill eval is not a unit test, and what that changes about reading results. |
-| `docs/academic-grounding.md` | The research constructs behind the harness's terms, with citations; meshes the workflow, measurement, and theory layers. |
-| `docs/jetty-support-spec.md` | Jetty payload/import contract and live-token unknowns. |
-| `docs/trace-aware-eval-spec.md` | Trace artifact contract, shipped v0.4.1 runner support, process/efficiency assertions, and remaining trace work. |
-| `docs/telemetry-availability-and-comparability-spec.md` | Implemented schema-v3 contract for measured-zero, unavailable, partial, and blocked telemetry/comparisons, including legacy migration. |
-| `docs/agent-backend-interface-spec.md` | Draft spec for turning Claude/Codex/Gemini/Vibe support into a shared agent backend interface: parity matrix, judge backends, trigger adapters, telemetry, and tool replay. |
-| `docs/agent-cli-control-plane.md` | The shared native-CLI control plane: process invocation, config isolation, tool policy, final-answer channels, schemas, telemetry, where Claude/Codex/Gemini/Vibe intentionally differ, and the cheap comprehensive live-smoke command. |
-| `docs/agent-cli-tradeoffs.md` | Claude/Codex/Gemini/Vibe trade-offs: which CLI surfaces are strong or weak and what missing schema/telemetry/prompt controls mean for eval reports. |
-| `docs/agent-parity.md` | The per-agent support matrix: which answer/judge/trigger surfaces Claude, Codex, Gemini, Vibe, Pi, Jetty, subagent, and the stub each cover, with live-smoke status per backend. |
-| `docs/skill-ablation-spec.md` | Design spec for materialized (real, altered skill file) ablations: the three-layer model, manifest schema, removal mechanisms, gates, and phased plan. |
-| `docs/ablation-study-walkthrough.md` + `examples/skill-pins.json` | A worked ablation study across ten real skills, pinned to exact commit SHAs (+ canonical tree hashes) so it reproduces against the evaluated versions **without vendoring** any skill content. Includes the replication lesson (2 of 3 single-shot findings refuted at n=5). |
-| `docs/repo-effectiveness-audit.md` | `good-repo` audit, score, package metadata fixes, and manual GitHub settings checklist. |
-| `docs/correctness-by-construction-audit.md` | The closed trigger, experimental-pair, answer-outcome, judge-verdict, prepared-task, Jetty, trace, human-text comparison, and ablation-provenance constructions, their proof tests, and residual risks. |
 | `TODO.md` | Status tracker: the eval-framework roadmap, remaining Jetty work, Gemini's explicitly gated autonomous-trigger follow-up, the `swap:<id>` ablation follow-on, and migration/user-journey documentation. |
 | `examples/demo-skill/` | Self-contained, **offline** end-to-end example: a tiny synthetic skill, two answer-path materialized ablations, one discovery ablation for trigger examples, and a deterministic stub runner (no model/API). `prepare → run-codex → benchmark` confirms a regression per answer-path ablation; exercised by `tests/test_example_demo.py`. Also carries should-fire/should-not-fire trigger cases for `skill-trigger-matrix` (offline via `--agent stub`; live smoke via `RUN_TRIGGER_SMOKE=1`). Start here. |
+| `examples/skill-pins.json` | Exact commit SHAs and canonical tree hashes for the ten skills in [`docs/ablation-study-walkthrough.md`](docs/ablation-study-walkthrough.md), so that study reproduces without vendoring any skill content. |
 | `examples/adewale-workspace/` | Adewale-specific Pi smoke runner and cross-repo aggregate report (the trigger runners are the top-level `skill-pi-trigger-eval` and `skill-trigger-matrix`). |
 | `scripts/smoke_supported_clis.py` | Opt-in, low-cost smoke across native Claude/Codex/Gemini/Vibe answer paths and Pi trigger path using a disposable demo-skill eval. |
+| `scripts/record_claude_stream.py` | Records one redacted `claude -p --output-format stream-json` stream, with its provenance, into `tests/fixtures/claude/` for the parser tests; spends one real model call. |
 | `tests/test_skill_benchmark.py` | Executable examples for grading, leakage lint, script assertions, judge commands, Jetty export/import, trace artifacts, and trigger detection. |
 
 ## Manifest format
@@ -271,6 +245,8 @@ Further optional manifest surfaces (each with a behavior-preserving default; see
 - `turns` on a case: a scripted multi-turn sequence; each turn's assertions grade that turn's transcript entry (`turn-<n>/output.md`), case-level assertions grade the final answer.
 - YAML manifests: a `.yaml` manifest (plus `dataset_files` mapping dataset ids to JSONL row files) compiles to the same shape in memory — validation, lint, and grading are identical.
 - Reference floors: `reference_score` (0-1) / `reference_graded_score` (1-5).
+- `source` on a case: where it came from (`production`, `bug-report`, `hand-written`, `synthesized`, or `imported`); `audit-manifest` counts the sources and flags a suite that records none or only synthesized cases.
+- A known answer on a case: `reference_answer` (inline, tune cases only) or `reference_answer_ref` (a manifest-relative file, the form `holdout` and `holdback` cases must use). The two are mutually exclusive and not allowed on trigger cases. Only `audit-manifest`'s known-answer check reads it, and prepared tasks never carry it.
 
 ## Assertions
 
@@ -340,9 +316,9 @@ Negative assertions use the same view, so invisible
 characters cannot hide banned content. `golden_output`, structured JSON,
 scripts, commands, tool names, and paths retain their exact/protocol semantics.
 
-Every assertion may declare a **severity** — `critical` (an absorbing barrier: one failure vetoes the run, every rate collapses to 0.0 and the graded score is withheld), `gate` (lowers the pass rate; the default for objective types), or `soft` (feeds only the graded score channel — a soft failure never moves the objective, qualitative, or combined pass rates; the default for judge/similarity). Declare `severity: "gate"` on a judge assertion to keep it in the qualitative/combined rate. `--strict` on `grade`/`benchmark` promotes soft to gate. An `atLeast` floor on a plain scored judge requires a normalized 0–1 score and decides its pass; on `graded_dimensions` it tightens the normalized form of the dimension threshold. Missing score evidence remains unavailable rather than becoming a failure. Dynamic and per-step judges use `minimum_criteria` and `min_met_fraction` respectively instead of `atLeast`. Every assertion may also declare an **oracle tier** — `strong` (deterministic, the default for process/efficiency and structured/golden/file checks), `lexical` (keyword/regex matching, the default for `contains*`/`excludes_any`/`regex`/`not_regex`), `demo` (the default for `script`), or `live` (judge) — reported per case as `oracle_strength` and audited (`weak-oracle-only`, `lexical-oracle-only`, `generic-lexical-alternative`, `redundant-assertion`; recommendations, not blockers).
+Every assertion may declare a **severity** — `critical` (an absorbing barrier: one failure vetoes the run, every rate collapses to 0.0 and the graded score is withheld), `gate` (lowers the pass rate; the default for objective types), or `soft` (feeds only the graded score channel — a soft failure never moves the objective, qualitative, or combined pass rates; the default for judge/similarity). Declare `severity: "gate"` on a judge assertion to keep it in the qualitative/combined rate. `--strict`, one of the [grading options](docs/commands.md#grading-options) every grading command takes, promotes soft to gate. An `atLeast` floor on a plain scored judge requires a normalized 0–1 score and decides its pass; on `graded_dimensions` it tightens the normalized form of the dimension threshold. Missing score evidence remains unavailable rather than becoming a failure. Dynamic and per-step judges use `minimum_criteria` and `min_met_fraction` respectively instead of `atLeast`. Every assertion may also declare an **oracle tier** — `strong` (deterministic, the default for process/efficiency and structured/golden/file checks), `lexical` (keyword/regex matching, the default for `contains*`/`excludes_any`/`regex`/`not_regex`), `demo` (the default for `script`), or `live` (judge) — reported per case as `oracle_strength` and audited (`weak-oracle-only`, `lexical-oracle-only`, `generic-lexical-alternative`, `redundant-assertion`; recommendations, not blockers).
 
-Use `script` when a keyword check is too weak for the property you care about. The command sees the candidate run directory, so it can inspect `output.md`, generated files under `outputs/`, or metadata. Script assertions are blocked unless you pass `--allow-scripts` to `grade`, `benchmark`, `aggregate`, or `export-anthropic`:
+Use `script` when a keyword check is too weak for the property you care about. The command sees the candidate run directory, so it can inspect `output.md`, generated files under `outputs/`, or metadata. Script assertions are blocked unless you pass `--allow-scripts` to a command that grades ([grading options](docs/commands.md#grading-options)):
 
 ```json
 {
@@ -373,9 +349,9 @@ Qualitative assertion types:
 |---|---|
 | `judge` | Deferred as a keyed judge task; `grade --judge-tasks` can serialize the queue, and `--judge-results` merges verdicts. |
 | `rubric` | Same deferred, keyed qualitative flow. |
-| `factuality` | Preset: a judge assertion carrying a canned anchored factuality rubric (threshold 4). `preset: "factuality"` on a judge assertion does the same. |
+| `factuality` | Preset: a judge assertion carrying a canned anchored factuality rubric scored 1–5 (threshold 4). `preset: "factuality"` on a judge assertion does the same; add `score_scale: [1, 5]` to feed its score to the graded channel. |
 
-A judge assertion may carry **anchored graded dimensions** (`graded_dimensions: [{name, scale: "1-5", rubric: "5 = …observable…; 1 = …"}]` — the judge returns `dimension_scores`, normalized to 0-1, passing at `threshold` ≥ 4 by default), a **dynamic rubric** (`dynamic_rubric: {instruction, minimum_criteria}` — the judge drafts case-specific criteria and must meet the minimum), or a **per-step trajectory rubric** (`per_step: true`, or `per_step: {min_met_fraction: f}`). A per-step judge grades EACH completed trajectory step — one criterion per step, named step-1..step-N in trajectory order, with the untruncated invocation and result records resolved separately from `trace.jsonl` beside the normalized summaries — and passes when at least `ceil(f × steps)` steps are judged sound (default: every step). It is trace-evidence-backed and fails closed like a process assertion: a run with no completed steps fails the assertion at grade time and no judge task (no model spend) is emitted. Stored verdicts carry a hash of the exact step payload and are re-queued if the trajectory, criterion names, or derived minimum changes. Per-step assertions are case-level only; turn assertions do not have independent trace artifacts. A case may set a reference floor (`reference_score` 0-1 or `reference_graded_score` 1-5); scoring below it flags `below-reference-floor`. Paired reports carry a sign-flip permutation `significance` block beside every lift, and a `graded` channel when graded scores exist.
+A plain judge that scores on its own scale declares it as `score_scale: [low, high]` (for example `[1, 5]`, with `threshold` on that scale): it must return a `score` in range, passes when the raw score reaches `threshold`, and feeds the graded channel `(score - low) / (high - low)`. A judge assertion may carry **anchored graded dimensions** (`graded_dimensions: [{name, scale: "1-5", rubric: "5 = …observable…; 1 = …"}]` — the judge returns `dimension_scores`, normalized to 0-1, passing at `threshold` ≥ 4 by default), a **dynamic rubric** (`dynamic_rubric: {instruction, minimum_criteria}` — the judge drafts case-specific criteria and must meet the minimum), or a **per-step trajectory rubric** (`per_step: true`, or `per_step: {min_met_fraction: f}`). A per-step judge grades EACH completed trajectory step — one criterion per step, named step-1..step-N in trajectory order, with the untruncated invocation and result records resolved separately from `trace.jsonl` beside the normalized summaries — and passes when at least `ceil(f × steps)` steps are judged sound (default: every step). It is trace-evidence-backed and fails closed like a process assertion: a run with no completed steps fails the assertion at grade time and no judge task (no model spend) is emitted. Stored verdicts carry a hash of the exact step payload and are re-queued if the trajectory, criterion names, or derived minimum changes. Per-step assertions are case-level only; turn assertions do not have independent trace artifacts. A case may set a reference floor (`reference_score` 0-1 or `reference_graded_score` 1-5); scoring below it flags `below-reference-floor`. Paired reports carry a sign-flip permutation `significance` block and the `interval` that inverts it beside every lift, and a `graded` channel (with its own `interval`) when graded scores exist.
 
 Judge results are keyed by `judge_task_id`:
 
@@ -431,6 +407,8 @@ partial and expose any surviving calculations only under explicitly labelled obs
 }
 ```
 
+The native runners also record how each run ended: `stop_class` beside the raw `stop_reason` and its `stop_source`; `requested_model`, `served_model`, `served_models`, and `served_model_check`; and `effort`, which is `{"requested": null, "applied_by": "backend_default"}` unless `--effort` pinned it. A `truncated` or `turn_limit` stop, or a served-model `mismatch`, makes the run unscorable and blocks its pair; a refusal stays graded. The values are defined in [`docs/vocabulary.md`](docs/vocabulary.md#run-artifacts). A custom runner may write the same fields. Which backends observe what is in [`docs/commands.md`](docs/commands.md#effort-and-how-answer-runs-ended).
+
 ## Ablations
 
 Ablations are opt-in variants that remove part of a skill — by simulation, or by materializing a real altered skill (below). Add entries under `manifest.ablations`, then prepare with `--include-ablations`.
@@ -456,7 +434,7 @@ skill-benchmark materialize-ablations ../repo/evals/shared-benchmark.json \
 
 Each declared ablation is written to `ablated/<id>/` as a complete altered skill tree (every manifest root, identical surface to `with_skill`, differing only by the declared edit). Mechanisms are `frontmatter_field`, `section` (fence-aware), `list_item`, deletion-only `patch`, `reference` (pointer/content/both), `script`, `asset`, and `preprocess` (inline `` !`command` ``), composable across multiple components. Ablation is removal-only — replacement/substitution is the separate `swap:<id>` feature tracked in `TODO.md`. Materialized arms are blind: the model-visible input is identical to `with_skill` (the hypothesis lives only in harness metadata).
 
-The materialized tree flows through the runners: the Pi smoke runner mounts it (answer-population only), the autonomous-trigger runners (`skill-trigger-matrix --ablation <id>` with any registered adapter, or `run_pi_trigger_eval.py --ablation <id>`) trigger-test a discovery (e.g. weakened-description) skill, and `export-jetty --include-ablations --ablation-dir DIR` uploads it recursively. A discovery ablation graduates from raw measurement to a causal evidence class through `skill-benchmark trigger-compare`, which pairs the baseline and `--ablation` matrix reports of the same revision under the same provenance/coverage/significance gate the answer path uses. `prepare`/`export-jetty` emit only **answer-population** ablation rows (on non-trigger cases); discovery ablations are measured by the autonomous-trigger runners. The benchmark report's `ablation_regressions` block separates an aggregate "score regressed" from an assertion-level "expected regression confirmed", and only confirms when recorded provenance proves both arms ran the same skill revision **and** the replicated regression clears a significance test (a two-sided paired sign-flip test run **per (case, model)** over exact repetition-level deltas; a regression is significant iff at least one confirmed cohort clears p≤0.05). Because the exact test discretizes, a cohort needs **≥6 matched pairs** to ever reach significance (`2/2^6=0.03125`; five pairs floor at `0.0625`); fewer pairs are reported `INDETERMINATE`, never confirmed. See [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md) for the mechanism table, the component-class model, and the correctness gates.
+The materialized tree flows through the runners: the Pi smoke runner mounts it (answer-population only), the autonomous-trigger runners (`skill-trigger-matrix --ablation <id>` with any registered adapter, or `run_pi_trigger_eval.py --ablation <id>`) trigger-test a discovery (e.g. weakened-description) skill, and `export-jetty --include-ablations --ablation-dir DIR` uploads it recursively. A discovery ablation graduates from raw measurement to a causal evidence class through `skill-benchmark trigger-compare`, which pairs the baseline and `--ablation` matrix reports of the same revision under the same provenance/coverage/significance gate the answer path uses. `prepare`/`export-jetty` emit only **answer-population** ablation rows (on non-trigger cases); discovery ablations are measured by the autonomous-trigger runners. The benchmark report's `ablation_regressions` block separates an aggregate "score regressed" from an assertion-level "expected regression confirmed", and only confirms when recorded provenance proves both arms ran the same skill revision **and** the replicated regression clears a significance test (a two-sided paired sign-flip test run **per (case, model)** over exact repetition-level deltas; a regression is significant iff at least one confirmed cohort clears p≤0.05). A cohort with fewer than **6 matched pairs** can never reach significance and is reported `INDETERMINATE`, never confirmed ([inference unit](docs/vocabulary.md#report-signals)). See [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md) for the mechanism table, the component-class model, and the correctness gates.
 
 **Evidence paths (discovery vs answer).** A single runner report and a paired comparison have deliberately different evidentiary strength:
 
@@ -479,16 +457,16 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 | `skill-benchmark prepare` | Emit answer-key-safe task rows per case/variant/run (`--include-ablations` materializes ablated trees). |
 | `skill-benchmark materialize-ablations` | Write the declared ablated skill trees to disk without preparing tasks — inspect or diff an ablation before spending a run on it. |
 | `skill-benchmark grade` | Score saved outputs into per-run rows; emit pending judge tasks. |
-| `skill-benchmark benchmark` | Aggregate into variant summaries, paired lift + significance, by-model, cost, and case flags. |
-| `skill-benchmark render-viewer` | Static or `--serve`d review page with embedded artifacts and iteration diffs. |
+| `skill-benchmark benchmark` | Aggregate into variant summaries, paired lift + significance + `interval` + `noise_check` (`--min-lift`), by-model, cost, `run_endings`, and case flags. |
+| `skill-benchmark render-viewer` | Static or `--serve`d review page with embedded artifacts and iteration diffs; served mode stores pass/fail/unsure verdicts and notes in `feedback.json`. |
 
-**Runners** (the only model-touching commands)
+**Runners** (every one but `import-trace` calls a model; so do `judge` and `judge-robustness` below)
 
 | Command | What it does |
 |---|---|
-| `skill-benchmark run-codex` | Drive prepared rows through isolated `codex exec --json --output-last-message`; save trace, events, metrics, answer. |
-| `skill-benchmark run-claude` | Drive `claude -p --output-format stream-json`, capturing real per-run cost + token usage AND the full tool-use stream as the run's trace (`trace.jsonl`/`events.json`), so process assertions have evidence on Claude answer runs. |
-| `skill-benchmark run-agent` | Provider-neutral native runner over registered backends (`--agent claude`, `--agent codex`, `--agent gemini`, or `--agent vibe`); compatibility wrappers delegate here. |
+| `skill-benchmark run-codex` | Drive prepared rows through isolated `codex exec --json --output-last-message`; save trace, events, metrics, answer. `--effort` sets `model_reasoning_effort`. |
+| `skill-benchmark run-claude` | Drive `claude -p --output-format stream-json`, capturing real per-run cost + token usage AND the full tool-use stream as the run's trace (`trace.jsonl`/`events.json`), so process assertions have evidence on Claude answer runs. Records the stop reason and served model; `--effort` passes `claude --effort`. |
+| `skill-benchmark run-agent` | Provider-neutral native runner over registered backends (`--agent claude`, `--agent codex`, `--agent gemini`, or `--agent vibe`); compatibility wrappers delegate here. `--effort` is refused for Gemini and Vibe, and for a level the backend's CLI does not accept (`minimal` on Claude). |
 | `skill-benchmark run-subagent` | In-process backend seam: any provider via `--agent-cmd`, tool replay, multi-turn `turns`. |
 | `skill-benchmark import-trace` | Normalize a raw JSONL trace into `events.json`/`metrics.json` for process/efficiency checks. |
 
@@ -496,14 +474,14 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 
 | Command | What it does |
 |---|---|
-| `skill-benchmark audit-manifest` | Readiness verdict + blockers; `--fail-on-blockers` gates CI on "worth paying to run". |
+| `skill-benchmark audit-manifest` | Readiness verdict + blockers, the known-answer check, and eval health over five marks; `--fail-on-blockers` or `--fail-on KINDS` gates CI. |
 | `skill-benchmark report` | Serialize `benchmark.json` as JUnit XML or GitHub job-summary + annotations. |
 | `skill-benchmark contamination` | Output-side perimeter: canary tripwire, output↔answer n-gram overlap, released-at/cutoff gate. |
-| `skill-benchmark error-analysis` | Open-coding review queue + axial failure taxonomy over a `benchmark.json`. |
+| `skill-benchmark error-analysis` | Open-coding review queue + axial failure taxonomy over a `benchmark.json`; `--feedback feedback.json` fills each row's note from the served review. |
 | `skill-benchmark compare-judges` | Flag whether measured lift depends on which judge model graded. |
-| `skill-benchmark judge-alignment` | Score a judge against human labels: agreement, Cohen's kappa, precision/recall/F1. |
+| `skill-benchmark judge-alignment` | Score a judge against human labels (`--labels feedback.json`, or a legacy labels file): agreement, Cohen's kappa, precision/recall/F1. |
 | `skill-benchmark judge-robustness` | Order-flip self-consistency + negative controls a robust judge must reject (opt-in, model-touching). |
-| `skill-benchmark judge` | Run deferred `judge`/`rubric` assertions through `--judge-backend`/`--judge-model` or `--judge-cmd`. |
+| `skill-benchmark judge` | Run deferred `judge`/`rubric` assertions through `--judge-backend`/`--judge-model` or `--judge-cmd` (model-touching). |
 
 **Cost and size**
 
@@ -521,7 +499,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 | `skill-benchmark suite-run` | Allowlisted multi-skill preflight/tier with cost ceilings; writes `RUN_SCOPE.json`. |
 | `skill-benchmark aggregate` | Cross-skill report over many manifests. |
 | `skill-benchmark trend` | Append-only history: series, diffs, prevalence×severity failure ranking, prune candidates. |
-| `skill-benchmark suggest-cases` | Turn saturated/no-lift flags into harder-case seeds (generation opt-in, never edits a manifest). |
+| `skill-benchmark suggest-cases` | Turn saturated/no-lift flags into harder-case seeds, never from a floor case (generation opt-in, never edits a manifest). |
 | `skill-benchmark migrate` | Upgrade a v1 manifest to v2: stamp severity/oracle tiers, print the judgment-call checklist. |
 
 **Interop and export**
@@ -537,7 +515,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 | Command | What it does |
 |---|---|
 | `skill-trigger-matrix` | Autonomous trigger rate per (agent × model), split by should-fire / should-not-fire. |
-| `skill-pi-trigger-eval` | The deeper Pi-specific trigger tool: discovery-population ablation arms, traces, cost. |
+| `skill-pi-trigger-eval` | `skill-trigger-matrix --agent pi` under its own name, kept for existing scripts. |
 | `skill-benchmark trigger-compare` | Pair baseline and `--ablation` trigger reports of the same skill revision: declared-cell/repetition completeness, duplicate rejection, agent/model cells collapsed by stable authored-query ID, direction-aware sign-flip significance, and a causal-confirmation evidence class. |
 
 ## Compatibility notes
@@ -556,18 +534,21 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for local setup, validation commands, a
 ```bash
 pip install -e ".[test]"
 python3 -m py_compile *.py scripts/*.py examples/adewale-workspace/*.py examples/demo-skill/*.py type_tests/*.py tests/*.py
+ruff check .
 ty check --error-on-warning
 python3 -m unittest discover tests -v
+python3 scripts/check_test_collection_parity.py
+python3 scripts/check_installed_wheel.py
 ```
 
 For manifest or grading changes, add or update `tests/test_skill_benchmark.py`. For docs-only changes, still run the same commands so CLI examples stay tied to current behavior.
 
 ## Non-goals
 
-- Grading and aggregation do not call a model. Model execution happens outside that path, except for the explicit runner/judge commands that exist to call one: `run-codex`, `run-claude`, `run-agent`, `run-jetty`, and `judge` (via `--judge-cmd` or a native `--judge-backend`).
+- Grading and aggregation do not call a model. Model execution happens outside that path, in the explicit commands that exist to call one: the runners (`run-codex`, `run-claude`, `run-agent`, `run-subagent`, `run-jetty`, and the `skill-trigger-matrix` / `skill-pi-trigger-eval` entry points), `judge` (via `--judge-cmd` or a native `--judge-backend`), and `judge-robustness`.
 - The harness does not decide qualitative truth by itself; it emits judge prompts, runs a judge (an opt-in `--judge-cmd`, or a native `--judge-backend` plus `--judge-model`), and merges the returned JSON — recording which backend/model produced each verdict.
 - Hidden prompts are not protected if you pass `--include-answer-key` to generation jobs.
-- A passing answer benchmark does not prove autonomous skill loading; run `skill-trigger-matrix` (any adapter-backed agent × model) or `skill-pi-trigger-eval` (Pi, with ablation arms) for that.
+- A passing answer benchmark does not prove autonomous skill loading; run `skill-trigger-matrix` (any adapter-backed agent × model; `skill-pi-trigger-eval` is its Pi-only form) for that.
 
 ## Repository layout
 
@@ -580,13 +561,17 @@ skill-eval-harness/
 ├── TODO.md
 ├── pyproject.toml
 ├── skill_benchmark.py          # the CLI, grading, reporting, and runner adapters
-├── run_pi_trigger_eval.py      # autonomous-trigger runner (Pi: ablation arms, traces, cost)
+├── run_pi_trigger_eval.py      # skill-pi-trigger-eval: the trigger matrix with the Pi adapter alone
 ├── run_trigger_matrix.py       # activation matrix across agents × models (claude/codex/pi/vibe/stub adapters)
 ├── ablation_model.py           # typed ablation/provenance/task value objects
 ├── agent_capabilities.py       # unified backend surfaces, capabilities, CLI options, smoke, and failure policy
 ├── artifact_contracts.py       # closed persisted-artifact observations and integrity verification
+├── content_digests.py          # file and file-tree digests: skill, fixture, oracle, and Jetty upload trees
 ├── cli_contracts.py            # validated command, path, model, variant, and numeric CLI values
 ├── experimental_pairs.py       # exact pair identities and blocked-pair construction
+├── completion_contracts.py     # stop class, served-model check, and effort per answer run
+├── effect_estimates.py         # sign-flip lift interval, noise check, floor vs ceiling
+├── human_judgements.py         # the one feedback.json human-judgement record
 ├── grading_contracts.py        # closed assertion observations and immutable judge tasks
 ├── report_contracts.py         # empty/complete/partial report coverage cohorts and rates
 ├── runner_contracts.py         # closed answer-runner outcome union
@@ -595,7 +580,17 @@ skill-eval-harness/
 ├── trace_contracts.py          # normalized event-log and event lifecycle contracts
 ├── trigger_contracts.py        # autonomous-trigger invocation/detection/observation contract
 ├── telemetry.py                # schema-v3 availability/provenance/comparison domain
-├── docs/                       # architecture, abstractions, vocabulary, specs, guides (see the map above)
+├── observation_contracts.py    # the Availability vocabulary and telemetry source lists
+├── findings.py                 # case flags, the finding-kind registry, and the eval-health view
+├── gate_policy.py              # which findings fail a command: --fail-on and its presets
+├── manifest_contracts.py       # case, split, variant, model, and run-coordinate identities
+├── invocation_contracts.py     # frozen provider process plans and invocation results
+├── json_contracts.py           # strict JSON parsing shared by every reader
+├── judge_contracts.py          # the judge invocation boundary
+├── text_contracts.py           # rendered human-text comparison views
+├── gemini_contracts.py         # Gemini JSON and stream-JSON contracts
+├── trigger_reporting.py        # complete/incomplete/empty trigger cohorts
+├── docs/                       # architecture, abstractions, vocabulary, specs, guides (indexed in docs/README.md)
 ├── .github/
 │   ├── PULL_REQUEST_TEMPLATE.md
 │   ├── ISSUE_TEMPLATE/
@@ -612,18 +607,21 @@ skill-eval-harness/
 ```bash
 pip install -e ".[test]"
 python3 -m py_compile *.py scripts/*.py examples/adewale-workspace/*.py examples/demo-skill/*.py type_tests/*.py tests/*.py
+ruff check .
 ty check --error-on-warning
 python3 -m unittest discover tests -v
+python3 scripts/check_test_collection_parity.py
+python3 scripts/check_installed_wheel.py
 ```
 
-The test suite is organized by subject: manifest validation and eval hygiene (`test_manifest.py`), grading (`test_grading.py`), human-text construction and matching (`test_text_contracts.py`), judge plumbing (`test_judging.py`), report views (`test_reporting.py`), closed-form statistics and pair identity (`test_stats.py`, `test_experimental_pairs.py`), runner/Jetty adapters and lifecycle contracts (`test_runners.py`, `test_jetty_contracts.py`), the ablation experiment end to end (`test_ablations.py`), cost telemetry (`test_cost_telemetry.py`), the confidence floor and detector fixtures (`test_confidence_floor.py`), the trigger matrix (`test_trigger_matrix.py`), plus four executable drift guards: doc code references (`test_doc_refs.py`), shared-owner/doc-sync consolidation guards (`test_consolidation_guards.py`), relative-link resolution across the docs (`test_doc_links.py`), and Python type/package/semantic coverage (`test_type_coverage.py`). Shared fixture builders live in `tests/helpers.py`.
+The test suite is organized by subject: manifest validation and eval hygiene (`test_manifest.py`), grading (`test_grading.py`), human-text construction and matching (`test_text_contracts.py`), judge plumbing (`test_judging.py`), report views (`test_reporting.py`), closed-form statistics and pair identity (`test_stats.py`, `test_experimental_pairs.py`), runner/Jetty adapters and lifecycle contracts (`test_runners.py`, `test_jetty_contracts.py`), the ablation experiment end to end (`test_ablations.py`), cost telemetry (`test_cost_telemetry.py`), the confidence floor and detector fixtures (`test_confidence_floor.py`), the trigger matrix (`test_trigger_matrix.py`), plus six executable drift guards: doc code references (`test_doc_refs.py`), shared-owner/doc-sync consolidation guards (`test_consolidation_guards.py`), relative-link resolution across the docs (`test_doc_links.py`), doc lists checked against the code they enumerate (`test_doc_facts.py`), Python type/package/semantic coverage (`test_type_coverage.py`), and gate integrity: every CI gate runs unconditionally and can fail, and every skipped test is a ledgered live smoke or a platform gate (`test_gate_integrity.py`). Shared fixture builders live in `tests/helpers.py`.
 
 ## Source checked
 
 This README was written against:
 
 - `skill_benchmark.py` CLI and assertion implementation
-- `run_pi_trigger_eval.py` trigger runner
+- `run_pi_trigger_eval.py` Pi entry point over the trigger matrix
 - `run_trigger_matrix.py` agent×model activation matrix
 - `pyproject.toml` package metadata
 - `docs/repo-effectiveness-audit.md` for the current `good-repo` audit

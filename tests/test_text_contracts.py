@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from helpers import demo_manifest, write_demo_manifest
-from hypothesis import given
+from hypothesis import example, given
 from hypothesis import strategies as st
 
 import skill_benchmark as sb
@@ -35,14 +35,6 @@ OBSCURED_COORDINATE = "androidx.lifecycle:\u200blifecycle-viewmodel"
 
 
 class ComparisonTextConstructionTests(unittest.TestCase):
-    def test_contract_module_remains_packaged_and_in_the_focused_ty_gate(self):
-        project = (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
-        packaged = project.split("[tool.setuptools]", 1)[1].split("\n[", 1)[0]
-        ty_sources = project.split("[tool.ty.src]", 1)[1].split("\n[", 1)[0]
-        self.assertIn('"text_contracts"', packaged)
-        self.assertIn('"*.py"', ty_sources)
-        self.assertIn('"regex==2026.7.19"', project)
-
     def test_rendered_v1_removes_issue_55_character_and_records_it(self):
         value = ComparisonText.from_text(OBSCURED_COORDINATE, ComparisonProfile.RENDERED_V1)
         self.assertEqual(value.value, COORDINATE)
@@ -65,12 +57,9 @@ class ComparisonTextConstructionTests(unittest.TestCase):
         self.assertEqual(value.value, preserved)
         self.assertFalse(value.changed)
 
-    def test_rendered_v1_policy_is_narrow_and_does_not_erase_directionality(self):
+    def test_rendered_v1_policy_removes_exactly_three_invisible_codepoints(self):
+        # Directional and joiner controls stay (see the preserved-controls test).
         self.assertEqual(RENDERED_V1_REMOVED_CODEPOINTS, {0x200B, 0x2060, 0xFEFF})
-        directional = "abc\u202e123\u202c"
-        value = ComparisonText.from_text(directional, ComparisonProfile.RENDERED_V1)
-        self.assertEqual(value.value, directional)
-        self.assertFalse(value.changed)
 
     def test_normalization_is_idempotent(self):
         once = ComparisonText.from_text("e\u200b\u0301", ComparisonProfile.RENDERED_V1)
@@ -138,15 +127,6 @@ class TypedTextAssertionTests(unittest.TestCase):
                 self.assertTrue(result["normalization"]["verdict_changed"])
                 self.assertIn("U+200B ZERO WIDTH SPACE", result["evidence"])
 
-    def test_every_rendered_v1_control_is_covered_by_the_policy(self):
-        insertion = COORDINATE.index(":") + 1
-        for codepoint in sorted(RENDERED_V1_REMOVED_CODEPOINTS):
-            with self.subTest(codepoint=f"U+{codepoint:04X}"):
-                obscured = COORDINATE[:insertion] + chr(codepoint) + COORDINATE[insertion:]
-                result = self.result({"type": "contains", "value": COORDINATE}, obscured)
-                self.assertTrue(result["passed"])
-                self.assertTrue(result["normalization"]["verdict_changed"])
-
     def test_direction_changing_controls_cannot_create_a_rendered_pass(self):
         directional = "abc\u202e123\u202c"
         assertions = [
@@ -164,12 +144,19 @@ class TypedTextAssertionTests(unittest.TestCase):
         st.sampled_from(sorted(RENDERED_V1_REMOVED_CODEPOINTS)),
         st.integers(min_value=0, max_value=len(COORDINATE)),
     )
+    @example(0x200B, COORDINATE.index(":") + 1)
+    @example(0x2060, COORDINATE.index(":") + 1)
+    @example(0xFEFF, COORDINATE.index(":") + 1)
     def test_rendered_control_insertion_cannot_change_literal_semantics(self, codepoint: int, position: int):
         obscured = COORDINATE[:position] + chr(codepoint) + COORDINATE[position:]
         result = self.result({"type": "contains", "value": COORDINATE}, obscured)
         self.assertTrue(result["passed"])
         removed = result["normalization"]["candidate"]["removed"]
         self.assertEqual(removed[0]["codepoint"], f"U+{codepoint:04X}")
+        # Inside the literal, normalization is what makes it pass; at either end
+        # the raw text already contained it.
+        self.assertEqual(result["normalization"]["verdict_changed"],
+                         0 < position < len(COORDINATE))
 
     def test_exact_opt_out_preserves_positive_and_negative_behavior(self):
         assertions_and_passes = [
@@ -351,12 +338,15 @@ class TypedTextAssertionTests(unittest.TestCase):
         self.assertEqual(result["score"], 1.0)
 
     def test_embedding_verdict_uses_the_public_rounded_score(self):
-        with mock.patch.object(sb, "embedding_similarity", return_value=(0.79996, "")):
-            result = self.result_with_embedder(
-                {"type": "similarity", "mode": "embedding", "expected": "target", "threshold": 0.8},
-                "candidate",
-                "stub",
-            )
+        # Vectors whose cosine is 0.79996: the raw score misses the 0.8
+        # threshold, and the four-decimal public score reaches it.
+        command = ("python3 -c \"import json, math; "
+                   "print(json.dumps({'embeddings': [[1, 0], [0.79996, math.sqrt(1 - 0.79996 ** 2)]]}))\"")
+        result = self.result_with_embedder(
+            {"type": "similarity", "mode": "embedding", "expected": "target", "threshold": 0.8},
+            "candidate",
+            command,
+        )
         self.assertEqual(result["score"], 0.8)
         self.assertTrue(result["passed"])
         self.assertEqual(result["evidence"], "embedding similarity=0.8000 vs threshold=0.8")

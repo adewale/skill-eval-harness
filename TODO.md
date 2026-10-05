@@ -41,7 +41,7 @@ Current support is an adapter scaffold, not production-proven Jetty evidence. Th
 - [x] Upload fixture repos/files referenced by eval cases.
 - [x] Materialize true ablated skill files (removal-only engine, `materialize-ablations` CLI, validation, and gates) — spec: [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md).
 - [x] Wire materialized ablation trees into the executors: Pi smoke mounts the altered tree, Pi trigger `--ablation` mounts a materialized skill, Jetty `export-jetty` uploads the tree recursively (relative paths preserved). Population-based case routing, run provenance, and an `ablation_regressions` report distinguishing "score regressed" from assertion-level "expected regression confirmed" all landed.
-- [ ] Support component **swap/substitution**, not just removal: generalize the ablation mechanisms with `replace_with`/`set`, add whole-file swap for `reference`/`script`/`asset`, and report A-B deltas between two live variants. Recommended as a sibling `swap:<id>` variant (keeping `ablation:<id>` removal-only); framing decision and design in [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md). Builds on materialized ablations above; unlocks the `model`/`effort` confound control and degrees-of-freedom experiments.
+- [ ] **Priority.** Support component **swap/substitution**, not just removal: generalize the ablation mechanisms with `replace_with`/`set`, add whole-file swap for `reference`/`script`/`asset`, and report A-B deltas between two live variants. Recommended as a sibling `swap:<id>` variant (keeping `ablation:<id>` removal-only); framing decision and design in [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md). Builds on materialized ablations above; unlocks the `model`/`effort` confound control and degrees-of-freedom experiments. It is also the missing arm for the surface the [hillclimbing post](https://claude.dev/blog/automating-eval-design-and-hillclimbing/) names as its example of attributable tuning, a skill description scored by its trigger rate: `trigger-compare` pairs a baseline with an `--ablation` run of the same skill revision and blocks when the `skill_tree_hash` differs, so it cannot compare two descriptions.
 
 ## Running and polling
 
@@ -71,7 +71,7 @@ Jetty runbooks emit a standardized machine-readable `validation_report.json` per
 (`jettyio/jettyio-skills`, `skills/create-runbook/SKILL.md`). Rubric evaluation scores 3-7
 dimensions on a 1-5 scale; programmatic evaluation returns `PASS` / `PARTIAL` / `FAIL`. The
 items below map that report onto the harness judge-result row `{judge_task_id, passed, score,
-threshold, evidence}` (`load_judge_results:11686`, merged in `grade_case_variant:13991`).
+threshold, evidence}` (`load_judge_results:11865`, merged in `grade_case_variant:14379`).
 
 - [ ] Export qualitative judge tasks to Jetty workflows using `simple_judge` where useful.
       Carry `judge_task_id` (`case::variant::run-n::assertion`) into the Jetty task so the
@@ -109,6 +109,7 @@ threshold, evidence}` (`load_judge_results:11686`, merged in `grade_case_variant
 - [ ] Add opt-in live smoke gated by `RUN_JETTY_SMOKE=1` and `JETTY_API_TOKEN`; never run it in default CI.
 - [ ] Live smoke should exercise one fixture-free tune case, one fixture-backed tune case, and one cheap failure/timeout path if Jetty exposes one.
 - [ ] Add README live-smoke notes after API behavior is verified with a real account.
+- [ ] Record a redacted `claude -p --output-format stream-json` stdout (Claude Code ≥ 2.1.269) that ends with the trailing `system`/`task_summary` record: run `python3 scripts/record_claude_stream.py --model haiku` on a credentialed machine and commit the `.jsonl` and `.provenance.json` it writes to `tests/fixtures/claude/`. The trailing-record tests pick it up with no edits; until then they run on hand-built records (see `tests/fixtures/claude/README.md`).
 
 ## Open questions to verify against current Jetty docs/API
 
@@ -135,7 +136,7 @@ shared backend protocols and conformance tests, not one-off grading or benchmark
 - [x] Add a native Gemini judge backend (`judge --judge-backend gemini`) that returns the canonical
       verdict JSON shape, stamps backend/requested-resolved-model/CLI-version/usage metadata,
       rejects unimplemented judge explore, and uses harness-side schema
-      validation (`verdict_schema_for`, `--strict-judge-schema`) unless Gemini exposes a reliable
+      validation (`verdict_schema_for`, always on) unless Gemini exposes a reliable
       provider-enforced schema hook.
 - [ ] Add a Gemini autonomous trigger adapter for `skill-trigger-matrix --agent gemini` only after a
       token-backed run proves `activate_skill` can be allowed safely in headless mode without
@@ -166,6 +167,9 @@ Mistral support should mean first-class Vibe CLI support, not a raw chat-complet
 - [x] Add Vibe offline conformance fixtures matching the Gemini fixture set, including tool-call /
       skill-activation evidence and missing-telemetry cases.
 - [x] Run token-backed Vibe live smokes after `MISTRAL_API_KEY` is available: direct no-tools prompt, `run-agent --agent vibe`, native `judge --judge-backend vibe`, `RUN_AGENT_INVOKE_SMOKE=1`, and `RUN_VIBE_TRIGGER_SMOKE=1` passed on 2026-07-09; Vibe usage/cost telemetry was absent and normalized as explicit `missing`.
+- [ ] Record a real Vibe 2.23+ `--output streaming` run that loads a skill and replace the
+      fixtures built from source in `tests/fixtures/vibe/` (steps in its README: `vibe --version`,
+      record, check the dialect reads it), then re-run `RUN_VIBE_TRIGGER_SMOKE=1`.
 
 ## Cross-provider registry/docs
 
@@ -201,11 +205,12 @@ own projects (`anti-slop-writing`, `slide-maker`, `xampler`, `pythonbyexample`).
 Design lives in [`docs/eval-framework-roadmap-spec.md`](docs/eval-framework-roadmap-spec.md),
 keyed to the same number (`1.1`, `2.2`, `CF.1`, …). This file tracks status only; open the
 spec for each item's goal, abstractions, design, and tests. Items with no spec section are
-marked *(TODO-native)*. The roadmap is implemented: migration tooling included
-(`migrate` + [`docs/migrating-evals.md`](docs/migrating-evals.md)); tests live in
-`tests/test_confidence_floor.py` and the subject files (`test_grading.py`,
+marked *(TODO-native)*. The confidence floor and Buckets 1-4 are implemented, migration
+tooling included (`migrate` + [`docs/migrating-evals.md`](docs/migrating-evals.md)); tests
+live in `tests/test_confidence_floor.py` and the subject files (`test_grading.py`,
 `test_reporting.py`, `test_runners.py`, `test_manifest.py`, `test_judging.py`,
-`test_stats.py`). The two TODO-native items below stay open by design.
+`test_stats.py`). Bucket 5 is partly shipped. The one TODO-native item below (the
+detector library) stays open by design.
 
 **Moat — do not dilute:** causal lift, `tune`/`holdout`/`holdback` splits, leakage lint,
 ablations, and saturation/no-lift flags are unique to this harness. None of the surveyed
@@ -247,7 +252,7 @@ These are tests of the harness, not a new eval suite; sequence them before the b
 - [x] 2.7 Built-in subagent runner (`run-subagent`: injectable agent seam, contract writer, CF.2-registered)
 - [x] 2.7b Held-out rubric discipline (`held-out-rubric-leak` audit finding; `qualitative_by_visibility` report split)
 - [x] 2.8 Interactive served report + richer artifacts (`render-viewer --serve`, feedback.json, image/pdf/xlsx encoders)
-- [x] 2.9 Iteration-over-time workflow (iteration-N helpers, `--previous-workspace` diff)
+- [x] 2.9 Iteration-over-time workflow (the user-made `iteration-N/` directory convention and the `render-viewer --previous-workspace` diff; the iteration-N helper functions were later deleted as unused)
 - [x] 2.10 "Living eval" loop on saturation (`suggest-cases`; generation opt-in via `--generate-cmd`, never edits a manifest)
 
 ## Bucket 3 — bigger lift (new axis or core-contract change)
@@ -260,6 +265,30 @@ These are tests of the harness, not a new eval suite; sequence them before the b
 
 - [x] 4.1 Embedding-backed `similarity` scorer (`mode: embedding` behind opt-in `--embed-cmd`; fails closed without it)
 - [x] 4.2 Auto-generation of harder cases (shipped inside 2.10: `suggest-cases --generate-cmd`, mocked in tests, no manifest mutation)
+
+## Bucket 5 — eval health (can the eval show the lift, and whose failure is it?)
+
+Follow-ups from comparing the harness with the [hillclimbing post](https://claude.dev/blog/automating-eval-design-and-hillclimbing/)
+and the `/claude-api build-eval` and `/claude-api hillclimb` guides in the claude-api skill
+([`docs/comparing-with-claude-api-evals.md`](docs/comparing-with-claude-api-evals.md)).
+
+- [x] 5.1 Completion evidence (stop class, served model, effort)
+- [x] 5.2 Lift interval + noise check + `--min-lift`
+- [x] 5.3 Floor vs ceiling
+- [x] 5.4 One human-judgement store
+- [ ] 5.5 Judge prompt guards ([#98](https://github.com/adewale/skill-eval-harness/issues/98))
+- [x] 5.6 Eval-health scorecard over five marks (`eval_health` in `audit-manifest`)
+- [x] 5.7 Typed findings and one gate vocabulary (`audit-manifest --fail-on` and presets)
+- [ ] 5.8 Effort as a prepared-task axis (`prepare --efforts`)
+- [ ] 5.9 Random stratified split helper and a holdback-read ledger
+- [ ] 5.10 Model-free keep/revert referee
+- [ ] 5.11 `export-hillclimb`
+
+The open 5.x items are tracked in [#99](https://github.com/adewale/skill-eval-harness/issues/99).
+5.11 replaces the punted "ship the harness as an agent-authoring skill" item: Anthropic
+now ships that agent-guided path as `/claude-api build-eval` and `/claude-api hillclimb`,
+so what is missing is interop. The arm and split mapping `export-hillclimb` would use is
+in the [spec's 5.11 entry](docs/eval-framework-roadmap-spec.md#bucket-5--eval-health-from-the-claude-api-build-eval-and-hillclimb-comparison).
 
 ## Post-#22 follow-ups (trustworthy-measurement gaps from the awesome-evals assessment)
 
@@ -275,19 +304,15 @@ These are tests of the harness, not a new eval suite; sequence them before the b
 
 Six gaps surfaced by an external-source review (see [`docs/academic-grounding.md`](docs/academic-grounding.md)),
 deduped against the awesome-evals follow-ups above — none is a dupe; only G3 is adjacent to the
-open "Judge robustness probes" item. Sequence:
+"Judge robustness probes" item, which has since shipped. Sequence:
 **G6** · **G4 → G1 → G3** (judge path, serialize) · **G5 → G2** (grade path, serialize).
 
 - [x] G6 Paired pass@k/pass^k lift — `reliability.paired_lift`: with−without delta on pass@k/pass^k, per case + pooled per shared k, sign-flip tested. The sliver of feature 5 (reliability) not merged.
-- [x] G4 Schema-constrained judge output — `verdict_schema_for` + post-hoc `json_schema_errors` gate; `report` default (byte-identical), `--strict-judge-schema` / `judge.schema_enforcement` opt-in; `extract_json_object` kept as fallback.
+- [x] G4 Schema-constrained judge output — `verdict_schema_for` + post-hoc `json_schema_errors` gate; malformed judge output now always fails closed, so `--strict-judge-schema` and `judge.schema_enforcement` are deprecated compatibility no-ops; `extract_json_object` kept as fallback.
 - [x] G1 Run-dir / trajectory judge — `--judge-trajectory` feeds the judge normalized events/metrics + a denylisted artifact inventory (`judge_artifact_inventory` excludes grading.json / answer-key / rubric / reserved files); byte-identical when off. Tool-using follow-on landed: `--judge-explore` lets a native judge explore a SANITIZED copy of the run dir (`sanitized_run_copy` removes every oracle file by construction) with read-only tools (`JUDGE_EXPLORE_TOOLS`), so a filesystem-reading judge cannot read the answer key.
 - [x] G3 Cross-judge consensus — `merge_cross_judge_rows` folds a ≥2-model panel into one verdict (majority/median, `agreement` block, ties → `unresolved`/`--quorum`); `--judge-panel`/manifest `judge.panel` via `effective_judge_models`; panel cost summed once; guard checks every member. Distinct from compare-judges/judge-alignment; 1-member short-circuits unchanged.
-- [x] G5 Capability/regression intent — per-case `eval_intent`; regression guards route to `regression_guards_holding` (never a blocker), exempt from staleness/suggest, saturated/no-lift findings suppressed. Optional, defaults to `capability`.
+- [x] G5 Capability/regression intent — per-case `eval_intent`; a saturated regression guard routes to `regression_guards_holding` (not a blocker), exempt from staleness/suggest, saturated/no-lift findings suppressed. A guard at the floor is not holding: readiness lists it in `floor_cases` and blocks on `floor-eval`. Optional, defaults to `capability`.
 - [x] G2 Assertion dependencies — `depends_on` (validated: shape/target/uniqueness/cycle, rejected in turns); a failed/skipped prerequisite SKIPS the dependent out of every denominator + the critical veto (skip, not zero); transitive + deferred-qualitative via a fixed-point post-pass. Byte-identical when unused. Inline judge-call suppression landed (skips a resolved-failed dependent without emitting a judge task / running a script).
-
-## Punted — questionable value
-
-- [ ] Ship the harness as an agent-authoring skill *(TODO-native)*. Meta/self-referential, overlaps `docs/authoring-evals.md`, adds a packaging surface, narrow audience. Revisit only if external authors adopt the harness and ask for an agent-guided authoring path.
 
 ---
 
@@ -318,8 +343,10 @@ All of the audit's deferred items landed in the follow-up pass:
       test_skill_benchmark's ablation half and all of test_cbc), and the one strict-subset
       duplicate test (readiness capability-saturation, re-asserted from test_audit_fixes)
       was deleted rather than moved.
-- [x] `ABLATION_VARIANT_PREFIX` / `is_ablation_variant()` / `ablation_id_of()` in `ablation_model`
-      own the `ablation:<id>` encoding (14 inline `split(":", 1)[1]`/`startswith` sites rewired).
+- [x] `ABLATION_VARIANT_PREFIX` / `is_ablation_variant()` / `ablation_id_of()` own the
+      `ablation:<id>` encoding (14 inline `split(":", 1)[1]`/`startswith` sites rewired). All
+      three now live in `manifest_contracts`; `ablation_model` imports the two functions and no
+      longer re-exports the prefix.
 
 # User journeys the code supports but the docs don't walk
 
@@ -367,7 +394,7 @@ reading guide, honesty rules, boundary — is written down in [`docs/README.md`]
       the two-gate recipe (`report --format junit|github` for regressions +
       `audit-manifest --fail-on-blockers` for manifest trust), a workflow file, and the
       "gate on lift/named regressions, not raw pass count" reading guide. Runnable offline on
-      `examples/demo-skill` (real 2026-07-05 report/junit/readiness output).
+      `examples/demo-skill` (real report/junit/readiness output, refreshed 2026-09-30).
 - [x] **"How do I port my existing evals into the harness?"** — [`docs/porting-existing-evals.md`](docs/porting-existing-evals.md):
       `dataset_files` JSONL + one template case as the mechanical seam, then the additions the
       source framework had no slot for (paired baseline, splits, leakage-safe assertions),
@@ -380,6 +407,12 @@ reading guide, honesty rules, boundary — is written down in [`docs/README.md`]
       and apply telemetry migration, repair strict judge/pair/trigger/Jetty inputs, regenerate
       reports, distinguish expected semantic changes from regressions, and roll back from the
       untouched 0.5.1 artifacts.
+- [x] **"Should I use `/claude-api build-eval` and `/claude-api hillclimb`, or this harness?"** —
+      [`docs/comparing-with-claude-api-evals.md`](docs/comparing-with-claude-api-evals.md):
+      what each command does, where each is ahead, why the noise floor and the test set
+      mean different things in each, and which harness output answers each guide step.
+      Runnable offline on `examples/demo-skill` (real `noise_check` output, refreshed 2026-09-30:
+      2 cases at 4 repeats, every pair moved, `too-few-cases-moved`).
 - [ ] **"Did my skill change HOW the model works, not just whether it passes?"** — the
       machinery shipped with the trace-depth slice: Claude answer runs now stream real
       tool-use traces, the report's `trajectory_diff` block shows paired command/count/skill-load

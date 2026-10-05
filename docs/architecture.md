@@ -276,9 +276,8 @@ built to preserve them:
 - **Generation is answer-key-safe.** `prepare` omits expected behavior and rubrics unless you
   ask for them, so the model under test cannot read its own answer key.
 
-Each assertion carries a **severity** (`critical`/`gate`/`soft`), so pass/fail is not flat: a
-`critical` failure vetoes the run and is excluded from every mean, a `gate` carries the pass
-rate, and a `soft` result feeds only the per-run graded score — never a pass rate. That split
+Each assertion carries a **severity** (`critical`/`gate`/`soft`, defined in
+[`vocabulary.md`](vocabulary.md#things-you-assert)), so pass/fail is not flat. That split
 is threaded through every report view, which is what lets graded scores measure *how much
 better* without a soft miss quietly moving the headline number.
 

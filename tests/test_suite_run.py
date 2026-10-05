@@ -1,57 +1,31 @@
-import argparse
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
+from helpers import make_eval_repo, run_cli
+
 import skill_benchmark as sb
+
+# One answer case with a judge assertion and one trigger case: the suite scope
+# counts both, and the judge assertion once per tune pair.
+SUITE_CASES = [
+    {"id": "pos-one", "split": "tune", "kind": "behavior", "prompt": "Do the thing.",
+     "expected_behavior": ["Does the thing"],
+     "assertions": [{"name": "mentions-done", "type": "contains_any", "values": ["done"]},
+                    {"name": "judge-quality", "type": "judge", "rubric": ["clear"]}]},
+    {"id": "trig-one", "split": "tune", "kind": "trigger", "should_trigger": True,
+     "prompt": "Trigger decision eval. User prompt: do the thing",
+     "expected_behavior": ["Should trigger"],
+     "assertions": [{"name": "label", "type": "regex", "pattern": "TRIGGER"}]},
+]
 
 
 class SuiteRunTests(unittest.TestCase):
     def _repo(self, root: Path, name: str, *, skill_name: str | None = None, ablations: list[dict] | None = None) -> Path:
-        repo = root / name
-        (repo / "skills" / name).mkdir(parents=True)
-        (repo / "evals").mkdir()
-        (repo / "skills" / name / "SKILL.md").write_text(
-            "---\n"
-            f"name: {skill_name or name}\n"
-            f"description: Use {skill_name or name} when asked.\n"
-            "---\n\n"
-            "# Skill\n\n"
-            "Follow the checklist.\n",
-            encoding="utf-8",
-        )
-        manifest = {
-            "version": 1,
-            "skill_name": skill_name or name,
-            "skill_paths": [f"skills/{name}/SKILL.md"],
-            "variants": ["with_skill", "without_skill"],
-            "cases": [
-                {
-                    "id": "pos-one",
-                    "split": "tune",
-                    "kind": "behavior",
-                    "prompt": "Do the thing.",
-                    "expected_behavior": ["Does the thing"],
-                    "assertions": [
-                        {"name": "mentions-done", "type": "contains_any", "values": ["done"]},
-                        {"name": "judge-quality", "type": "judge", "rubric": ["clear"]},
-                    ],
-                },
-                {
-                    "id": "trig-one",
-                    "split": "tune",
-                    "kind": "trigger",
-                    "should_trigger": True,
-                    "prompt": "Trigger decision eval. User prompt: do the thing",
-                    "expected_behavior": ["Should trigger"],
-                    "assertions": [{"name": "label", "type": "regex", "pattern": "TRIGGER"}],
-                },
-            ],
-            "ablations": ablations or [],
-        }
-        (repo / "evals" / "shared-benchmark.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        return repo
+        """A repo at root/<name>, where suite scope discovers top-level manifests."""
+        make_eval_repo(root, skill_name=skill_name or name, cases=SUITE_CASES, ablations=ablations)
+        return (root / "repo").rename(root / name)
 
     def _pins(self, root: Path, repo: str) -> Path:
         manifest_path = root / repo / "evals" / "shared-benchmark.json"
@@ -60,22 +34,6 @@ class SuiteRunTests(unittest.TestCase):
         pins = root / "pins.json"
         pins.write_text(json.dumps({"skills": {manifest["skill_name"]: {"tree_hash": tree_hash}}}, indent=2), encoding="utf-8")
         return pins
-
-    def test_suite_scope_refuses_extra_top_level_manifest(self):
-        tmp = tempfile.TemporaryDirectory(prefix="suite-scope-")
-        self.addCleanup(tmp.cleanup)
-        root = Path(tmp.name)
-        self._repo(root, "allowed")
-        self._repo(root, "beautiful-mermaid", skill_name="agentic-mermaid-project-skills")
-        suite = root / "suite.txt"
-        suite.write_text("allowed/evals/shared-benchmark.json\n", encoding="utf-8")
-        pins = self._pins(root, "allowed")
-
-        scope = sb.build_suite_scope(suite, root, pins_file=pins)
-
-        self.assertIn("beautiful-mermaid/evals/shared-benchmark.json", scope["extra_manifests"])
-        self.assertEqual(scope["status"], "blocked")
-        self.assertTrue(any("extra top-level manifests" in b for b in scope["blockers"]))
 
     def test_suite_scope_verifies_pins_and_estimates_rows(self):
         tmp = tempfile.TemporaryDirectory(prefix="suite-scope-")
@@ -101,29 +59,22 @@ class SuiteRunTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
         self._repo(root, "allowed")
-        self._repo(root, "extra")
+        # A sibling repo whose directory and skill names differ is still found.
+        self._repo(root, "beautiful-mermaid", skill_name="agentic-mermaid-project-skills")
         suite = root / "suite.txt"
         suite.write_text("allowed/evals/shared-benchmark.json\n", encoding="utf-8")
         pins = self._pins(root, "allowed")
         out = root / "out"
 
-        code = sb.suite_run(argparse.Namespace(
-            suite_file=str(suite),
-            workspace_root=str(root),
-            pins=str(pins),
-            out_dir=str(out),
-            tier="preflight",
-            split="tune",
-            runs_per_variant=1,
-            include_ablations=False,
-            allow_extra_manifests=False,
-            skip_pin_check=False,
-        ))
+        code, _, stderr = run_cli("suite-run", suite, "--workspace-root", root, "--pins", pins, "--out-dir", out)
 
         self.assertEqual(code, 2)
+        self.assertIn("FAIL: extra top-level manifests not in suite allowlist: "
+                      "beautiful-mermaid/evals/shared-benchmark.json", stderr)
         written = json.loads((out / "RUN_SCOPE.json").read_text(encoding="utf-8"))
         self.assertEqual(written["status"], "blocked")
-        self.assertIn("extra/evals/shared-benchmark.json", written["extra_manifests"])
+        self.assertEqual(written["extra_manifests"], ["beautiful-mermaid/evals/shared-benchmark.json"])
+        self.assertTrue(any("extra top-level manifests" in b for b in written["blockers"]))
 
     def test_prepare_tier_runs_only_allowlisted_manifest(self):
         tmp = tempfile.TemporaryDirectory(prefix="suite-prepare-")
@@ -135,18 +86,8 @@ class SuiteRunTests(unittest.TestCase):
         pins = self._pins(root, "allowed")
         out = root / "out"
 
-        code = sb.suite_run(argparse.Namespace(
-            suite_file=str(suite),
-            workspace_root=str(root),
-            pins=str(pins),
-            out_dir=str(out),
-            tier="prepare",
-            split="tune",
-            runs_per_variant=1,
-            include_ablations=False,
-            allow_extra_manifests=False,
-            skip_pin_check=False,
-        ))
+        code, _, _ = run_cli("suite-run", suite, "--workspace-root", root, "--pins", pins,
+                             "--out-dir", out, "--tier", "prepare")
 
         self.assertEqual(code, 0)
         scope = json.loads((out / "RUN_SCOPE.json").read_text(encoding="utf-8"))

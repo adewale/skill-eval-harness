@@ -1,12 +1,13 @@
 """The bundled offline example is executable documentation: prepare -> run (with the
 deterministic stub 'model') -> report, and the two materialized ablations each
 confirm a regression on a distinct assertion. Runs in CI with no model/API."""
-import argparse
 import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+from helpers import run_cli
 
 import skill_benchmark as sb
 
@@ -15,18 +16,26 @@ DEMO = ROOT / "examples" / "demo-skill"
 
 
 class DemoExampleTests(unittest.TestCase):
-    def _run(self):
-        mp = DEMO / "evals" / "shared-benchmark.json"
+    """One offline pipeline run shared by every assertion about its report."""
+
+    MANIFEST = DEMO / "evals" / "shared-benchmark.json"
+
+    @classmethod
+    def setUpClass(cls):
+        mp = cls.MANIFEST
         manifest = sb.validate_manifest(mp)
         tmp = tempfile.TemporaryDirectory(prefix="demo-eval-")
-        self.addCleanup(tmp.cleanup)
+        cls.addClassCleanup(tmp.cleanup)
         td = Path(tmp.name)
         # 6 matched runs per arm clear the two-sided paired sign-flip floor
         # (2/2^6 = 0.03125); fewer unanimous pairs stay INDETERMINATE.
         rows = sb.prepared_task_rows(mp, manifest, include_ablations=True, ablation_dir=str(td / "abl"), runs_per_variant=6)
         (td / "tasks.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
         stub = f"{sys.executable} {DEMO / 'stub_runner.py'}"
-        sb.run_codex(argparse.Namespace(tasks=str(td / "tasks.jsonl"), runs=str(td / "runs"), codex_cmd=stub, timeout=120))
+        code, _, stderr = run_cli("run-codex", "--tasks", td / "tasks.jsonl", "--runs", td / "runs",
+                                  "--codex-cmd", stub, "--timeout", "120")
+        if code != 0:
+            raise AssertionError(f"run-codex exited {code}: {stderr}")
         variants = sorted({r["variant"] for r in rows})   # include the ablation arms, not just the manifest variants
         # The example declares one judge assertion, so an executable end-to-end
         # report must also materialize its verdicts. Leaving them deferred would
@@ -41,14 +50,14 @@ class DemoExampleTests(unittest.TestCase):
             "\n".join(json.dumps(verdict) for verdict in verdicts) + "\n",
             encoding="utf-8",
         )
-        return sb.build_benchmark_report(
+        cls.runs_dir, cls.judge_results = td / "runs", judge_results
+        cls.report = sb.build_benchmark_report(
             mp, td / "runs", variants_arg=variants,
             judge_results_path=str(judge_results),
         )
 
     def test_materialized_ablations_confirm_offline(self):
-        rep = self._run()
-        regs = {e["id"]: e for e in rep["ablation_regressions"]}
+        regs = {e["id"]: e for e in self.report["ablation_regressions"]}
         for aid, assertion in (("no-severity", "severity-label"), ("no-checklist", "cite-checklist")):
             entry = regs[aid]
             self.assertEqual(entry["status"], "measured", f"{aid} should be measured")
@@ -56,11 +65,45 @@ class DemoExampleTests(unittest.TestCase):
             confirmed = [r for r in entry["regressions"] if r.get("expected_regression_confirmed")]
             self.assertTrue(confirmed, f"{aid} should confirm a regression")
 
+    def test_token_overhead_joins_lift_once_judge_verdicts_are_supplied(self):
+        # docs/is-my-skill-worth-its-tokens.md: before --judge-results existed the
+        # judged demo could only report partial coverage, and a RunNumber pair
+        # key crashed judge_task_id.
+        partial = sb.paired_token_overhead_report(self.MANIFEST, runs=self.runs_dir)
+        complete = sb.paired_token_overhead_report(
+            self.MANIFEST, runs=self.runs_dir, judge_results_path=str(self.judge_results))
+        self.assertEqual(partial["summary"]["availability"], "partial")
+        self.assertEqual(len(complete["pairs"]), 12)
+        self.assertEqual(complete["summary"]["objective_delta"]["mean"], 1.0)
+
     def test_with_skill_beats_without_on_the_demo(self):
-        rep = self._run()
-        s = rep["summary"]
+        s = self.report["summary"]
         self.assertEqual(s["with_skill"]["objective_pass_rate"]["mean"], 1.0)      # skill present -> both assertions pass
         self.assertEqual(s["without_skill"]["objective_pass_rate"]["mean"], 0.0)   # no skill -> both fail
+
+    def test_audit_rates_the_marks_on_runs_only_with_the_judge_verdicts(self):
+        # The demo declares a judge assertion. Without its verdicts the audit's
+        # benchmark is partial: readiness names that as a blocker and the marks
+        # measured on runs read unavailable, instead of passing on empty lists.
+        partial = sb.audit_manifest_report(self.MANIFEST, runs=str(self.runs_dir))
+        complete = sb.audit_manifest_report(
+            self.MANIFEST, runs=str(self.runs_dir), judge_results_path=str(self.judge_results))
+        self.assertEqual([b["kind"] for b in partial["readiness"]["blocker_findings"]],
+                         ["benchmark-incomplete"])
+        self.assertEqual(complete["readiness"]["blocker_findings"], [])
+        status = {mark["id"]: mark["status"] for mark in complete["eval_health"]["marks"]}
+        partial_status = {mark["id"]: mark["status"] for mark in partial["eval_health"]["marks"]}
+        for mark in ("baseline-headroom", "noise-below-min-lift", "arms-differ-only-in-skill"):
+            with self.subTest(mark=mark):
+                self.assertEqual(partial_status[mark], "unavailable")
+                self.assertNotEqual(status[mark], "unavailable")
+        # Two cases cannot move six the same way: the noise mark says so.
+        self.assertEqual(status["noise-below-min-lift"], "concern")
+        # The partial audit says what is missing: the judge verdicts, not --runs.
+        noise_notes = next(mark["notes"] for mark in partial["eval_health"]["marks"]
+                           if mark["id"] == "noise-below-min-lift")
+        self.assertEqual(noise_notes, [
+            "the benchmark is incomplete: judge assertions have no verdicts; pass --judge-results"])
 
 
 class DemoJudgeTests(unittest.TestCase):
@@ -87,8 +130,10 @@ class DemoJudgeTests(unittest.TestCase):
         rows = sb.prepared_task_rows(mp, manifest, include_ablations=True, ablation_dir=str(td / "abl"))
         rows = [r for r in rows if r["variant"] in self.VARIANTS]
         (td / "tasks.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
-        sb.run_codex(argparse.Namespace(tasks=str(td / "tasks.jsonl"), runs=str(td / "runs"),
-                                        codex_cmd=f"{sys.executable} {DEMO / 'stub_runner.py'}", timeout=120))
+        code, _, stderr = run_cli("run-codex", "--tasks", td / "tasks.jsonl", "--runs", td / "runs",
+                                  "--codex-cmd", f"{sys.executable} {DEMO / 'stub_runner.py'}",
+                                  "--timeout", "120")
+        self.assertEqual(code, 0, stderr)
         tasks = sb.collect_judge_tasks(mp, td / "runs", variants=self.VARIANTS)
         self.assertEqual(len(tasks), 4)   # one actionable-review task per c-review arm
         cmd = f"{sys.executable} {DEMO / 'stub_judge.py'}" + (" --lenient" if lenient else "")
@@ -124,6 +169,7 @@ class DemoJudgeTests(unittest.TestCase):
         self.assertEqual(robust["summary"]["control_leak_rate"], 1.0)
         kinds = {f["kind"] for f in robust["findings"]}
         self.assertEqual(kinds, {"passes-empty-control", "passes-master-key-control"})
+
 
 
 if __name__ == "__main__":
