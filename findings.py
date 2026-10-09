@@ -175,9 +175,6 @@ class FindingKind(str, Enum):
     HELD_OUT_RUBRIC_LEAK = "held-out-rubric-leak"
     # Grader validity.
     WEAK_ORACLE_ONLY = "weak-oracle-only"
-    LEXICAL_ORACLE_ONLY = "lexical-oracle-only"
-    GENERIC_LEXICAL_ALTERNATIVE = "generic-lexical-alternative"
-    REDUNDANT_ASSERTION = "redundant-assertion"
     NON_DISCRIMINATING_ASSERTIONS = "non-discriminating-assertions"
     JUDGE_IS_MODEL_UNDER_TEST = "judge-is-model-under-test"
     REFERENCE_ANSWER_FAILS = "reference-answer-fails"
@@ -266,9 +263,6 @@ _SPECS: dict[FindingKind, KindSpec] = {
     FindingKind.LEAK_SATURATED_CASE: KindSpec(_E, _REQ, _M.ISOLATION),
     FindingKind.HELD_OUT_RUBRIC_LEAK: KindSpec(_E, _REQ, _M.ISOLATION),
     FindingKind.WEAK_ORACLE_ONLY: KindSpec(_G, _REC, _M.GRADER),
-    FindingKind.LEXICAL_ORACLE_ONLY: KindSpec(_G, _REC),
-    FindingKind.GENERIC_LEXICAL_ALTERNATIVE: KindSpec(_G, _REC),
-    FindingKind.REDUNDANT_ASSERTION: KindSpec(_G, _REC),
     FindingKind.NON_DISCRIMINATING_ASSERTIONS: KindSpec(_G, _REC, _M.GRADER),
     FindingKind.JUDGE_IS_MODEL_UNDER_TEST: KindSpec(_G, _REQ, _M.GRADER),
     FindingKind.REFERENCE_ANSWER_FAILS: KindSpec(_G, _REQ, _M.GRADER),

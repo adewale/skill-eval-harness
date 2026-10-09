@@ -18,7 +18,7 @@ are arriving from another framework's suite, that is a different journey:
 | Area | New surface | Default if absent |
 |---|---|---|
 | Severity (spec 2.2) | `severity: critical\|gate\|soft` (or `critical`/`gate`/`soft`/`atLeast` shorthands) per assertion | objective types are `gate`, judge/similarity are `soft` — exactly version-1 behavior |
-| Oracle tiers (spec 1.7) | `oracle: strong\|lexical\|demo\|live` per assertion | by type: keyword/regex text checks `lexical`, other deterministic text/process/efficiency `strong`, `script` `demo`, judge `live` |
+| Oracle tiers (spec 1.7) | `oracle: strong\|demo\|live` per assertion | by type: deterministic text/process/efficiency `strong`, `script` `demo`, judge `live` |
 | Graded judge shapes (spec 2.2) | `graded_dimensions` (anchored 1-5) and `dynamic_rubric` on judge assertions; `score_scale: [low, high]` for a plain judge scoring on its own scale | plain binary verdict; a plain score is kept as returned |
 | Reference floors (spec 2.2) | `reference_score` (0-1) / `reference_graded_score` (1-5) per case | no floor |
 | New assertion types | `golden_output`, `similarity` (ratio or opt-in embedding), `structured_output`, `tool_call`, `factuality` preset | n/a — new capabilities |

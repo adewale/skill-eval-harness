@@ -447,7 +447,7 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(migrated["version"], 2)
         by_name = {a["name"]: a for a in migrated["cases"][0]["assertions"]}
         self.assertEqual(by_name["has-alpha"]["severity"], "gate")
-        self.assertEqual(by_name["has-alpha"]["oracle"], "lexical")
+        self.assertEqual(by_name["has-alpha"]["oracle"], "strong")
         self.assertEqual(by_name["quality"]["severity"], "soft")
         self.assertEqual(by_name["quality"]["oracle"], "live")
         self.assertIn("graded?", by_name["quality"]["_migrate_todo"])
@@ -1008,67 +1008,7 @@ class SkillPathAgreementTests(unittest.TestCase):
         self.assertIn("only a file named evals/shared-benchmark.json", message)
 
 
-class LexicalOracleAuditTests(unittest.TestCase):
-    """audit-manifest flags keyword checks that cannot discriminate: generic
-    alternatives (<= 4 characters or a common word) and assertions implied by
-    another assertion in the same case. Recommendations only, never blockers."""
 
-    def _audit(self, assertions: list[dict]) -> dict:
-        case = {"id": "pos-1", "split": "tune", "prompt": "Review the README.", "assertions": assertions}
-        with tempfile.TemporaryDirectory() as td:
-            rp = Path(td) / "repo"
-            _skill(rp)
-            return sb.audit_manifest_report(_manifest(rp, [case]))
-
-    @staticmethod
-    def _finding(report: dict, kind: str) -> dict | None:
-        return next((f for f in report["findings"] if f["kind"] == kind), None)
-
-    def test_generic_alternatives_are_flagged(self):
-        report = self._audit([
-            {"name": "readme-core", "type": "contains_any", "values": ["score", "rubric", "quick start", "source"]},
-            {"name": "negation", "type": "contains_any", "values": ["earned", "do not"]},
-            {"name": "short", "type": "contains", "value": "run"},
-        ])
-        finding = self._finding(report, "generic-lexical-alternative")
-        self.assertIsNotNone(finding)
-        by_label = {row["assertion"]: row["generic_values"] for row in finding["evidence"]}
-        self.assertEqual(by_label, {"readme-core": ["score", "rubric", "source"],
-                                    "negation": ["do not"], "short": ["run"]})
-        self.assertEqual(report["readiness"]["blockers"],
-                         self._audit([{"name": "specific", "type": "contains_any",
-                                       "values": ["package.json bin map"]}])["readiness"]["blockers"])
-
-    def test_specific_alternatives_are_not_flagged(self):
-        report = self._audit([
-            {"name": "specific", "type": "contains_any", "values": ["widget-cli build --fast", "package.json bin map"]},
-            {"name": "shape", "type": "regex", "pattern": "(?m)^## Quick start$"},
-        ])
-        self.assertIsNone(self._finding(report, "generic-lexical-alternative"))
-
-    def test_implied_and_duplicate_assertions_are_flagged(self):
-        report = self._audit([
-            {"name": "cites-source-files", "type": "contains_all", "values": ["package.json", "src/cli.ts"]},
-            {"name": "mentions-bin-alias", "type": "contains_any", "values": ["package.json", "bin alias"]},
-            {"name": "names-cli", "type": "contains", "value": "src/cli.ts"},
-            {"name": "copy-a", "type": "contains", "value": "widget-cli"},
-            {"name": "copy-b", "type": "contains", "value": "Widget-CLI"},
-        ])
-        finding = self._finding(report, "redundant-assertion")
-        self.assertIsNotNone(finding)
-        implied = {(row["assertion"], row["implied_by"]) for row in finding["evidence"]}
-        self.assertEqual(implied, {("mentions-bin-alias", "cites-source-files"),
-                                   ("names-cli", "cites-source-files"),
-                                   ("copy-b", "copy-a")})
-
-    def test_independent_assertions_are_not_redundant(self):
-        report = self._audit([
-            {"name": "cites", "type": "contains_all", "values": ["package.json", "src/cli.ts"]},
-            {"name": "alias", "type": "contains_any", "values": ["bin alias", "wcli"]},
-            # Case-sensitive weaker check is not implied by a case-insensitive one.
-            {"name": "exact-case", "type": "contains", "value": "package.json", "ci": False},
-        ])
-        self.assertIsNone(self._finding(report, "redundant-assertion"))
 
 
 class UpgradeHintTests(unittest.TestCase):

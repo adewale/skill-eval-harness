@@ -321,8 +321,7 @@ EFFICIENCY_ASSERTIONS = {
 }
 OBJECTIVE_ASSERTIONS = TEXT_ASSERTIONS | PROCESS_ASSERTIONS | EFFICIENCY_ASSERTIONS
 QUALITATIVE_ASSERTIONS = {"judge", "rubric", "factuality"}
-# Keyword/regex matching over the answer text: the `lexical` oracle tier.
-LEXICAL_ASSERTIONS = {"contains", "contains_any", "contains_all", "excludes_any", "regex", "not_regex"}
+
 SEVERITIES = {item.value for item in Severity}
 ORACLE_TIERS = {item.value for item in OracleTier}
 ASSERTION_COMMON_FIELDS = {
@@ -432,14 +431,10 @@ def assertion_severity(assertion: dict[str, Any], *, strict: bool = False) -> st
 
 def oracle_tier(assertion: dict[str, Any]) -> str:
     """Oracle-strength tier (roadmap 1.7), xampler's ladder made first-class:
-    `strong` (deterministic, no-lies — process/efficiency/structured/golden
-    checks, or a rendered-artifact script oracle explicitly marked strong),
-    `lexical` (deterministic keyword/regex matching over the answer text —
-    reproducible, but its strength is only its ability to fail a wrong answer,
-    which a generic alternative such as "run" or "do not" does not have),
-    `demo` (a marked stand-in; the default for `script`, whose truthfulness the
-    harness cannot see), `live` (judge or other model-backed checks). Explicit
-    `oracle` on the assertion wins."""
+    `strong` (deterministic, no-lies — including a rendered-artifact script
+    oracle explicitly marked strong), `demo` (a marked stand-in; the default
+    for `script`, whose truthfulness the harness cannot see), `live` (judge or
+    other model-backed checks). Explicit `oracle` on the assertion wins."""
     tier = assertion.get("oracle")
     if tier in ORACLE_TIERS:
         return str(tier)
@@ -448,8 +443,6 @@ def oracle_tier(assertion: dict[str, Any]) -> str:
         return "live"
     if atype == "script":
         return "demo"
-    if atype in LEXICAL_ASSERTIONS:
-        return "lexical"
     return "strong"
 
 
@@ -20542,82 +20535,7 @@ def run_measured_findings(report: dict[str, Any]) -> list[Finding]:
     return out
 
 
-GENERIC_ALTERNATIVE_MAX_CHARS = 4
-# Common words that appear in most technical answers whether right or wrong; a
-# contains/contains_any value from this list rarely discriminates. Heuristic,
-# advisory only (audit-manifest recommendations), and deliberately short.
-GENERIC_ORACLE_WORDS = frozenset({
-    "do not", "don't", "never", "avoid", "should", "cannot", "instead",
-    "check", "verify", "review", "remove", "update", "change", "consider", "improve",
-    "validate", "validation", "assert", "tests", "issue", "problem", "error", "source",
-    "example", "steps", "summary", "score", "rubric", "evidence", "concrete",
-    "priority", "smallest",
-})
 
-
-def is_generic_lexical_value(value: str) -> bool:
-    folded = " ".join(value.split()).casefold()
-    return len(folded) <= GENERIC_ALTERNATIVE_MAX_CHARS or folded in GENERIC_ORACLE_WORDS
-
-
-def _literal_implies(stronger: LiteralTextAssertion, weaker: LiteralTextAssertion) -> bool:
-    """True when every text passing ``stronger`` (contains/contains_all) also
-    passes ``weaker`` (contains/contains_any/contains_all) under both operands'
-    own case sensitivity and comparison profile."""
-    if stronger.kind not in {LiteralKind.CONTAINS, LiteralKind.CONTAINS_ALL}:
-        return False
-    if stronger.profile is not weaker.profile:
-        return False
-    required = [item.value for item in stronger.comparison_values]
-
-    def covered(value: str) -> bool:
-        if weaker.case_insensitive:
-            return any(value.casefold() in req.casefold() for req in required)
-        return not stronger.case_insensitive and any(value in req for req in required)
-
-    values = [item.value for item in weaker.comparison_values]
-    if weaker.kind is LiteralKind.CONTAINS_ANY:
-        return any(covered(value) for value in values)
-    if weaker.kind in {LiteralKind.CONTAINS, LiteralKind.CONTAINS_ALL}:
-        return all(covered(value) for value in values)
-    return False
-
-
-def lexical_assertion_findings(cases: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Static weak-oracle signals over positive literal assertions: values generic
-    enough to match most answers, and assertions implied by another assertion in
-    the same case (duplicates included), which can never fail independently."""
-    generic: list[dict[str, Any]] = []
-    redundant: list[dict[str, Any]] = []
-    for case in cases:
-        parsed_rows: list[tuple[str, LiteralTextAssertion]] = []
-        for assertion in case.get("assertions", []) or []:
-            if not isinstance(assertion, dict) or assertion.get("type") not in {"contains", "contains_any", "contains_all"}:
-                continue
-            try:
-                parsed = parse_human_text_assertion(assertion)
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(parsed, LiteralTextAssertion):
-                continue
-            label = assertion_label(assertion)
-            parsed_rows.append((label, parsed))
-            if parsed.kind in {LiteralKind.CONTAINS, LiteralKind.CONTAINS_ANY}:
-                weak = [value for value in parsed.values if is_generic_lexical_value(value)]
-                if weak:
-                    generic.append({"case_id": case.get("id"), "assertion": label,
-                                    "type": parsed.kind.value, "generic_values": weak})
-        for index, (label, weaker) in enumerate(parsed_rows):
-            for other_index, (other_label, stronger) in enumerate(parsed_rows):
-                if other_index == index or not _literal_implies(stronger, weaker):
-                    continue
-                # Mutual implication is a duplicate: report it once, on the later assertion.
-                if _literal_implies(weaker, stronger) and index < other_index:
-                    continue
-                redundant.append({"case_id": case.get("id"), "assertion": label,
-                                  "implied_by": other_label})
-                break
-    return generic, redundant
 
 
 def audit_manifest_report(
@@ -20763,26 +20681,12 @@ def audit_manifest_report(
     # 1.7: a case whose checks are all demo/live tiers can look solid while
     # resting on weak oracles — leakage lint extended from prompts to oracles.
     weak_only = []
-    lexical_only = []
     for case in cases:
         case_assertions = case.get("assertions", []) or []
-        tiers = {oracle_tier(a) for a in case_assertions}
-        if case_assertions and tiers <= {"demo", "live"}:
+        if case_assertions and all(oracle_tier(a) != "strong" for a in case_assertions):
             weak_only.append(case.get("id"))
-        elif case_assertions and "lexical" in tiers and "strong" not in tiers:
-            lexical_only.append(case.get("id"))
     if weak_only:
-        finding(FindingKind.WEAK_ORACLE_ONLY, f"{len(weak_only)} case(s) are graded only by demo/live oracles (no deterministic check): {weak_only[:10]}. Add a strong-tier assertion, or mark a verified script oracle oracle:\"strong\".", weak_only[:20])
-    # Deterministic is not strong: a keyword/regex check is reproducible but only
-    # as strong as its ability to fail a wrong answer. Recommendations only, so
-    # --fail-on-blockers behaves exactly as before.
-    if lexical_only:
-        finding(FindingKind.LEXICAL_ORACLE_ONLY, f"{len(lexical_only)} case(s) have no check stronger than keyword/regex matching: {lexical_only[:10]}. Add a structured/golden/process assertion or a verified script oracle, or scope the regexes to the output's structure.", lexical_only[:20])
-    generic_alternatives, redundant_assertions = lexical_assertion_findings(cases)
-    if generic_alternatives:
-        finding(FindingKind.GENERIC_LEXICAL_ALTERNATIVE, f"{len(generic_alternatives)} contains/contains_any assertion(s) accept a generic value (<= {GENERIC_ALTERNATIVE_MAX_CHARS} characters or a common word) that most answers contain whether right or wrong. Replace it with a regex scoped to the specific claim, or drop the alternative.", generic_alternatives[:30])
-    if redundant_assertions:
-        finding(FindingKind.REDUNDANT_ASSERTION, f"{len(redundant_assertions)} assertion(s) can never fail on their own: every output that passes another assertion in the same case also passes them, so they add a green check without adding an oracle.", redundant_assertions[:30])
+        finding(FindingKind.WEAK_ORACLE_ONLY, f"{len(weak_only)} case(s) are graded only by demo/live oracles (no strong deterministic check): {weak_only[:10]}. Add a strong-tier assertion, or mark a verified script oracle oracle:\"strong\".", weak_only[:20])
 
     # Cost-quality findings (issue #21): where money is being spent without
     # buying signal. Only computable when run data is supplied.

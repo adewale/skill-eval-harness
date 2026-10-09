@@ -475,9 +475,6 @@ Every finding the harness emits has a registered kind in `findings.FindingKind`,
 | `leak-saturated-case` | eval | required | readiness blocker |
 | `held-out-rubric-leak` | eval | required | `audit-manifest` |
 | `weak-oracle-only` | grader | recommended | `audit-manifest` |
-| `lexical-oracle-only` | grader | recommended | `audit-manifest` |
-| `generic-lexical-alternative` | grader | recommended | `audit-manifest` |
-| `redundant-assertion` | grader | recommended | `audit-manifest` |
 | `non-discriminating-assertions` | grader | recommended | `audit-manifest --runs` |
 | `judge-is-model-under-test` | grader | required | `audit-manifest` |
 | `reference-answer-fails` | grader | required | `audit-manifest` (known-answer check) |

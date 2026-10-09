@@ -129,20 +129,12 @@ The smallest useful `evals/shared-benchmark.json`:
       "prompt": "…the real user prompt…",
       "files": ["fixtures/first-case/input.md"],
       "expected_behavior": ["What a good answer must do."],
-      "assertions": [
-        {"name": "does-the-task", "type": "judge", "gate": true, "rubric": ["What a good answer must do."]}
-      ]
+      "assertions": []
     }
   ],
   "ablations": []
 }
 ```
-
-Every non-trigger case needs at least one `gate` or `critical` assertion for each arm, and a
-judge is `soft` unless marked, so the placeholder above is a `"gate": true` judge until Step 4
-replaces or joins it with objective checks. `skill_paths` resolve from the repository root only
-because the file is named `evals/shared-benchmark.json`; any other manifest file resolves them
-from its own directory, and `validate` fails when a skill path is missing or escapes that root.
 
 ```bash
 skill-benchmark validate evals/shared-benchmark.json

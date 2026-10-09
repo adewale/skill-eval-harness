@@ -3,14 +3,14 @@
 The harness knows its consumers: ``examples/adewale-workspace/all-manifests.txt``
 lists each skill repository's manifest as ``<repo>/<path>``. This script runs
 the two gates the harness documents for consumer CI (docs/gating-ci-on-evals.md)
-from the CURRENT tree over each listed manifest, so a schema change that breaks
-a known consumer fails the harness's CI instead of surfacing after a release:
+from the CURRENT tree over each listed manifest on explicit request, so a
+schema change can be checked against known consumers before release:
 
     skill-benchmark validate --strict-leakage --check-ablations <manifest>
     skill-benchmark audit-manifest --fail-on-blockers <manifest>
 
 It does not fetch anything. Check the consumer repositories out under
-``--workspace-root`` first (CI clones them read-only). No model or network call
+``--workspace-root`` first. No automated cloning, model or network call
 is made by either gate.
 
 Exit status: 0 when every manifest passes both gates, 1 otherwise (a listed

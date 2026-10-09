@@ -65,7 +65,7 @@ uvx --from skill-eval-harness==0.6.0 skill-benchmark audit-manifest --fail-on-bl
 uvx --from git+https://github.com/adewale/skill-eval-harness skill-benchmark validate --strict-leakage --check-ablations evals/shared-benchmark.json
 ```
 
-### Skill paths and oracle tiers
+### Skill paths
 
 - `validate`, `prepare` and `audit-manifest` fail when a `skill_paths`, `old_skill_paths`
   or ablation `target.skill_root` entry is missing or resolves outside the skill root.
@@ -73,10 +73,7 @@ uvx --from git+https://github.com/adewale/skill-eval-harness skill-benchmark val
   repository root; any other manifest file (including YAML) resolves them from its own
   directory. Write `skills/<name>/SKILL.md`, not `../skills/<name>/SKILL.md`, in
   `evals/shared-benchmark.json`.
-- Keyword and regex assertions report the `lexical` oracle tier instead of `strong`, so
-  `oracle_strength.strong_pass_share` falls for keyword-graded cases. `audit-manifest`
-  adds `lexical-oracle-only`, `generic-lexical-alternative` and `redundant-assertion`
-  recommendations; none is a blocker.
+
 
 ### Runtime dependency
 
