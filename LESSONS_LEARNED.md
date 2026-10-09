@@ -895,3 +895,28 @@ number built on it is about a different experiment.
   what breaks the contract (session content after the end), not whatever is unfamiliar.
 - Keep a runbook of live checks (`docs/live-verification.md`) for everything CI can only fake, and
   run it after any CLI upgrade.
+## 2026-08-31 — A test exists only if the configured runner collects it
+
+**Problem:** The telemetry suite contained standalone Hypothesis properties and a
+pytest-parametrized test, and the test dependencies were installed, but CI used
+`unittest discover`. The affected file reported zero tests under that runner while the build
+stayed green.
+
+**Resolution (2026-10-07):** Main now collects these properties as
+`unittest.TestCase` methods and runs `scripts/check_test_collection_parity.py`
+in both CI and release validation. The earlier proposal to migrate the full
+suite to pytest is superseded by that solution.
+
+**Lesson:** Source files, decorators, and installed test libraries are not evidence of executed
+coverage. Collection is part of the test contract, especially in this repository's mixed
+`unittest`/pytest suite.
+
+**Rule:**
+- Keep tests compatible with the configured `unittest discover` runner and use the
+  existing pytest/unittest collection-parity check to catch unreachable tests.
+- After adding a property, confirm its intended test ID appears under the actual CI
+  collector before relying on the full-suite result.
+- Keep CI, contributor guidance, and the PR template on the same full-suite command so local proof
+  cannot silently describe a different suite from the one that gates changes.
+- Audit executed test IDs, not decorator or file counts. A green runner that collected zero tests
+  is missing evidence, not passing evidence.
