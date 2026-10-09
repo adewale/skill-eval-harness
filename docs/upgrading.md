@@ -5,11 +5,75 @@ Each section covers one released-version boundary. Follow every section after yo
 ## 0.6.0 → unreleased (`main`)
 
 These changes merged after the 0.6.0 tag. This section becomes the next release's boundary when it
-is tagged; 0.6.0 users follow it before installing from `main`. No manifest or telemetry migration
-is needed and saved runs stay readable. What changes is which runs count, which pairs form, how a
+is tagged; 0.6.0 users follow it before installing from `main`. Manifests need the two edits
+under [Manifest migration](#manifest-migration); no telemetry migration is needed and saved runs
+stay readable. What changes is which runs count, which pairs form, how a
 few report and audit fields read, which saved trigger reports a comparison accepts, and which
 internal Python names still exist. The changelog's [Unreleased](../CHANGELOG.md#unreleased)
 section lists every change.
+
+### Manifest migration
+
+Two manifest rules on `main` reject manifests that 0.6.0 accepts. Both edits below are
+also valid on 0.6.0, so make them first, check them against your pinned 0.6.0, and only
+then upgrade.
+
+#### 1. Give every trigger case an explicit `should_trigger`
+
+0.6.0 inferred a trigger case's polarity from its text: a `NO_TRIGGER`, `not trigger` or
+`should not` marker in `expected_behavior` or an assertion pattern meant "must not
+trigger", anything else meant "must trigger". `main` refuses to guess:
+
+```text
+FAIL: trig-commit-message: trigger cases require an explicit boolean should_trigger; add "should_trigger": false (...)
+```
+
+Add the boolean the error names to each `kind: "trigger"` case:
+
+```json
+{"id": "trig-commit-message", "kind": "trigger", "should_trigger": false, "...": "..."}
+```
+
+The suggested value is the polarity 0.6.0 used, so adding it does not change what the
+case measured. Check that it is what you meant.
+
+#### 2. Mark the deciding judge of a judge-only case `"gate": true`
+
+Every non-trigger case now needs at least one `gate` or `critical` assertion that applies
+to each answer arm. `judge`, `rubric`, `factuality` and `similarity` assertions default to
+`soft`, which never moves a pass rate, so a case graded only by a judge (the usual
+holdout/holdback placeholder) fails:
+
+```text
+FAIL: holdout-fixture-01: answer variant 'with_skill' needs at least one applicable gate or critical grading oracle; its applicable assertions ['qualitative-review'] are all severity 'soft' (...)
+```
+
+Mark the judge that decides the case `"gate": true` (or add an objective assertion):
+
+```json
+{"name": "qualitative-review", "type": "judge", "gate": true, "rubric": ["Accuracy"]}
+```
+
+This changes grading on purpose: that judge's verdict now counts toward the qualitative
+and combined pass rates instead of feeding only the graded score.
+
+#### 3. Check both versions
+
+```bash
+uvx --from skill-eval-harness==0.6.0 skill-benchmark validate --strict-leakage --check-ablations evals/shared-benchmark.json
+uvx --from skill-eval-harness==0.6.0 skill-benchmark audit-manifest --fail-on-blockers evals/shared-benchmark.json > /dev/null
+uvx --from git+https://github.com/adewale/skill-eval-harness skill-benchmark validate --strict-leakage --check-ablations evals/shared-benchmark.json
+```
+
+### Skill paths
+
+- `validate`, `prepare` and `audit-manifest` fail when a `skill_paths`, `old_skill_paths`
+  or ablation `target.skill_root` entry is missing or resolves outside the skill root.
+  Only a file named exactly `evals/shared-benchmark.json` resolves these paths from the
+  repository root; any other manifest file (including YAML) resolves them from its own
+  directory. Write `skills/<name>/SKILL.md`, not `../skills/<name>/SKILL.md`, in
+  `evals/shared-benchmark.json`.
+
 
 ### Runtime dependency
 

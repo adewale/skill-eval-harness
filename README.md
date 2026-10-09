@@ -177,6 +177,8 @@ Everything under `docs/` is indexed once, in [`docs/README.md`](docs/README.md):
 
 Each skill repo owns an `evals/shared-benchmark.json` manifest. Add a `harness` block so readers know which external harness/version to install.
 
+`skill_paths` (and `old_skill_paths`, ablation `target.skill_root`) resolve from the repository root only because the file is literally `evals/shared-benchmark.json`; any other manifest file, including YAML, resolves them from its own directory. `validate`, `prepare` and `audit-manifest` fail when a skill path is missing or escapes that root, and name the rule that applied.
+
 ```json
 {
   "version": 1,

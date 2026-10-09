@@ -920,3 +920,7 @@ coverage. Collection is part of the test contract, especially in this repository
   cannot silently describe a different suite from the one that gates changes.
 - Audit executed test IDs, not decorator or file counts. A green runner that collected zero tests
   is missing evidence, not passing evidence.
+
+## 2026-10-09 — Fix validation without changing the experiment or expanding CI
+
+Missing skill mounts should fail consistently in validate, prepare and audit, with the existing filename-keyed root rule named in the diagnostic. Migration hints must describe the old rule, not silently decide a new label or gate policy. A local consumer check is useful on explicit request; cloning downstream repositories in every CI run and on a new schedule is separate recurring work. Keep the existing grading tiers and counts unchanged, and defer the proposed lexical tier and quadratic assertion lint rather than changing historical report meanings inside a validation repair.

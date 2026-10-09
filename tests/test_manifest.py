@@ -5,6 +5,7 @@ test_roadmap_features, test_followup_features, test_external_review_gaps,
 test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
+import argparse
 import contextlib
 import io
 import json
@@ -305,9 +306,11 @@ class NoCodeRegistryTests(unittest.TestCase):
 
     def write_yaml_repo(self, root: Path, prompt: str = "Name the river of {city}.") -> Path:
         repo = root / "repo"
-        (repo / "skill").mkdir(parents=True)
-        (repo / "skill" / "SKILL.md").write_text("---\nname: demo\ndescription: Demo\n---\n", encoding="utf-8")
-        (repo / "evals").mkdir()
+        # Only a file literally named evals/shared-benchmark.json resolves
+        # skill_paths from the repository root; eval.yaml resolves them from
+        # its own directory, so the skill lives where that rule points.
+        (repo / "evals" / "skill").mkdir(parents=True)
+        (repo / "evals" / "skill" / "SKILL.md").write_text("---\nname: demo\ndescription: Demo\n---\n", encoding="utf-8")
         (repo / "evals" / "rows.jsonl").write_text(
             '{"id": "paris", "city": "Paris", "river": "Seine"}\n{"id": "cairo", "city": "Cairo", "river": "Nile"}\n',
             encoding="utf-8")
@@ -928,6 +931,117 @@ class PerStepValidationTests(unittest.TestCase):
         self._dies({"name": "steps", "type": "judge", "per_step": True},
                    "turn #1 assertion #0 per_step is not supported in turn assertions",
                    in_turn=True)
+
+
+def _dies_with(test: unittest.TestCase, fn, *args, **kwargs) -> str:
+    """Run fn, require SystemExit, and return what die() printed."""
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr), test.assertRaises(SystemExit):
+        fn(*args, **kwargs)
+    return stderr.getvalue()
+
+
+def _validate_args(path: Path) -> argparse.Namespace:
+    return argparse.Namespace(manifest=str(path), strict_holdback=False, strict_leakage=False,
+                              leakage_min_chars=4, check_ablations=False)
+
+
+class SkillPathAgreementTests(unittest.TestCase):
+    """validate, prepare and audit-manifest share one skill-path check, so a
+    manifest whose with_skill arm would mount a nonexistent or out-of-repo path
+    fails all three instead of validating OK (the good-pr `../skills/...` trap:
+    evals/shared-benchmark.json resolves skill_paths from the repository root)."""
+
+    def _repo(self, root: Path, skill_paths: list[str], name: str = "shared-benchmark.json") -> Path:
+        rp = root / "repo"
+        _skill(rp)
+        manifest = {"version": 1, "skill_name": "good-pr", "skill_paths": skill_paths,
+                    "variants": ["with_skill", "without_skill"], "cases": [dict(CASE)]}
+        path = rp / "evals" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return path
+
+    def _all_three_fail(self, path: Path) -> list[str]:
+        manifest = sb.validate_manifest(path)
+        return [
+            _dies_with(self, sb.validate_cli_command, _validate_args(path)),
+            _dies_with(self, sb.prepared_task_rows, path, manifest, split="tune"),
+            _dies_with(self, sb.audit_manifest_report, path),
+        ]
+
+    def test_repo_escaping_path_fails_validate_prepare_and_audit_alike(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._repo(Path(td), ["../skills/good-pr/SKILL.md"])
+            messages = self._all_three_fail(path)
+        for message in messages:
+            self.assertIn("'../skills/good-pr/SKILL.md' resolves to", message)
+            self.assertIn("outside", message)
+            self.assertIn("resolve from the repository root", message)
+            self.assertIn("Did you mean 'skills/good-pr/SKILL.md'?", message)
+
+    def test_missing_path_fails_validate_prepare_and_audit_alike(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._repo(Path(td), ["skills/good-pr-typo/SKILL.md"])
+            messages = self._all_three_fail(path)
+        for message in messages:
+            self.assertIn("'skills/good-pr-typo/SKILL.md' does not exist", message)
+
+    def test_resolvable_path_passes_validate_prepare_and_audit(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._repo(Path(td), ["skills/good-pr/SKILL.md"])
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(sb.validate_cli_command(_validate_args(path)), 0)
+            rows = sb.prepared_task_rows(path, sb.validate_manifest(path), split="tune")
+            with_skill = [row for row in rows if row["variant"] == "with_skill"]
+            self.assertTrue(with_skill)
+            for row in with_skill:
+                self.assertTrue(row["skill_paths"])
+                self.assertTrue(all(Path(p).is_file() for p in row["skill_paths"]))
+            self.assertEqual(sb.audit_manifest_report(path)["skill_name"], "good-pr")
+
+    def test_other_manifest_names_resolve_from_their_own_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._repo(Path(td), ["skills/good-pr/SKILL.md"], name="visual-benchmark.json")
+            message = _dies_with(self, sb.validate_cli_command, _validate_args(path))
+        self.assertIn("resolve from the manifest's own directory", message)
+        self.assertIn("only a file named evals/shared-benchmark.json", message)
+
+
+
+
+
+class UpgradeHintTests(unittest.TestCase):
+    """The two manifest requirements added after 0.6.0 name their own fix."""
+
+    def _case_dies(self, case: dict) -> str:
+        with tempfile.TemporaryDirectory() as td:
+            rp = Path(td) / "repo"
+            _skill(rp)
+            path = _manifest(rp, [case])
+            return _dies_with(self, sb.validate_manifest, path)
+
+    def test_missing_should_trigger_suggests_the_polarity_0_6_0_inferred(self):
+        negative = {"id": "trig-no", "kind": "trigger", "split": "tune", "prompt": "q",
+                    "expected_behavior": ["Should return NO_TRIGGER for this skill."],
+                    "assertions": [{"name": "label", "type": "regex", "pattern": "(?m)^\\s*NO_TRIGGER\\b"}]}
+        positive = {"id": "trig-yes", "kind": "trigger", "split": "tune", "prompt": "q",
+                    "expected_behavior": ["Should return TRIGGER for this skill."],
+                    "assertions": [{"name": "label", "type": "regex", "pattern": "(?m)^\\s*TRIGGER\\b"}]}
+        self.assertIn('add "should_trigger": false', self._case_dies(negative))
+        self.assertIn('add "should_trigger": true', self._case_dies(positive))
+
+    def test_judge_only_case_names_the_gate_fix(self):
+        judge_only = {"id": "holdout-1", "kind": "behavior", "split": "tune", "prompt": "q",
+                      "assertions": [{"name": "qualitative-review", "type": "judge", "rubric": ["Accurate"]}]}
+        message = self._case_dies(judge_only)
+        self.assertIn("['qualitative-review'] are all severity 'soft'", message)
+        self.assertIn('"gate": true', message)
+        judge_only["assertions"][0]["gate"] = True
+        with tempfile.TemporaryDirectory() as td:
+            rp = Path(td) / "repo"
+            _skill(rp)
+            sb.validate_manifest(_manifest(rp, [judge_only]))
 
 
 if __name__ == "__main__":
