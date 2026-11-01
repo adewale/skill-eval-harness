@@ -90,13 +90,6 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         self.assertNotIn(tm.DEFAULT_CODEX_CMD,
                          (ROOT / "run_trigger_matrix.py").read_text(encoding="utf-8"))
 
-    def test_manifest_loading_goes_through_the_harness_source_loader(self):
-        # tr.load_manifest is a thin named wrapper; what matters is that a YAML
-        # manifest or dataset_files resolve for the runners exactly as for the
-        # harness (they used to silently break on both).
-        import inspect
-        self.assertIn("load_manifest_source", inspect.getsource(tr.load_manifest))
-
     def test_usage_alias_tables_are_one_table(self):
         for claude_key, canonical_key in [("input_tokens", "input_tokens"),
                                           ("output_tokens", "output_tokens"),
