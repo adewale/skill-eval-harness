@@ -90,13 +90,6 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         self.assertNotIn(tm.DEFAULT_CODEX_CMD,
                          (ROOT / "run_trigger_matrix.py").read_text(encoding="utf-8"))
 
-    def test_manifest_loading_goes_through_the_harness_source_loader(self):
-        # tr.load_manifest is a thin named wrapper; what matters is that a YAML
-        # manifest or dataset_files resolve for the runners exactly as for the
-        # harness (they used to silently break on both).
-        import inspect
-        self.assertIn("load_manifest_source", inspect.getsource(tr.load_manifest))
-
     def test_usage_alias_tables_are_one_table(self):
         for claude_key, canonical_key in [("input_tokens", "input_tokens"),
                                           ("output_tokens", "output_tokens"),
@@ -905,9 +898,23 @@ else:
 
 
 class ModuleBoundaryTests(unittest.TestCase):
-    """Moving code between modules must not silently change what a patch or a
-    lazy registry reference resolves to. Both guards hold for the single-module
-    harness and for any split of it."""
+    """Moving code between modules must not silently change what a patch, a
+    lazy registry reference, or an import resolves to. skill_benchmark.py is
+    the CLI over the harness modules, so nothing packaged may depend on it."""
+
+    def test_no_packaged_module_imports_the_cli_module(self):
+        """The CLI re-exports the harness; an import in the other direction
+        would re-enter a partially initialized module."""
+        importers = []
+        for path in sorted(ROOT.glob("*.py")):
+            if path.name == "skill_benchmark.py":
+                continue
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                names = ([alias.name for alias in node.names] if isinstance(node, ast.Import)
+                         else [node.module] if isinstance(node, ast.ImportFrom) else [])
+                if "skill_benchmark" in names:
+                    importers.append(f"{path.name}:{node.lineno}")
+        self.assertEqual(importers, [], "import the owning module instead")
 
     def test_patches_on_skill_benchmark_reach_the_code_under_test(self):
         """`patch.object(sb, "X")` replaces only skill_benchmark's binding of
@@ -965,6 +972,7 @@ class ModuleBoundaryTests(unittest.TestCase):
         self.assertGreater(len(refs), 20)
         for module, attribute in refs:
             with self.subTest(ref=f"{module}.{attribute}"):
+                self.assertNotEqual(module, "skill_benchmark")
                 owner = getattr(importlib.import_module(module), attribute)
                 if inspect.isclass(owner) or inspect.isfunction(owner):
                     self.assertEqual(owner.__module__, module)

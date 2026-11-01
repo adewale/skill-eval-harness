@@ -38,22 +38,23 @@ to make old artifacts pass the new constructors.
 
 ### Trigger harness identity
 
-Trigger `harness_identity` is now schema version 3 and names a conservative audited module-level
-inventory instead of every packaged module. Version-1 and version-2 trigger reports must be
+Trigger `harness_identity` is now schema version 4 and names exactly the local modules a trigger
+run can load: the import closure of `run_trigger_matrix.py` and `run_pi_trigger_eval.py`. Editing
+code that no trigger run executes (the `skill_benchmark` CLI, reports, judges, grading, Jetty, and
+`trigger-compare`'s own analysis) no longer invalidates trigger comparisons; editing anything a
+trigger run loads still does. That now includes four contract modules an earlier audit had left
+out although every trigger run loads them: `gemini_contracts`, `grading_contracts`,
+`runner_contracts`, and `text_contracts`. Trigger reports with an earlier identity version must be
 regenerated before a new causal comparison; this deliberate incompatibility refuses to guess
-equivalence with an older module set. Standalone report, judge, CLI, and unsupported-provider
-modules are excluded. `skill_benchmark.py` is being split into modules by subsystem, and the
-inventory names every module split out of `skill_benchmark.py` as well as the file itself, so an
-edit to any of that code still invalidates trigger identity, exactly as an edit to the single file
-did.
+equivalence with an older module set.
 
-### Code moving out of `skill_benchmark.py`
+### `skill_benchmark.py` is now the CLI
 
 `import skill_benchmark as sb` keeps working: `skill_benchmark` re-exports every name the split
 modules define, as the same objects. A re-export is a binding, not an owner, so code that
 monkeypatched `skill_benchmark.<name>` must patch the module that looks the name up instead (for
-example `harness_io.invoke_argv_with_timeout` for `run_argv_with_timeout`); a patch on
-`skill_benchmark` reaches only code still in that file.
+example `jetty_adapter.JettyClient` for `run_jetty`); a patch on `skill_benchmark` reaches only the
+CLI's own code.
 
 An editable install (`pip install -e .`) records the top-level modules that existed when it ran.
 After pulling a change that adds modules, run `pip install -e .` again; until then the

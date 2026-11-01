@@ -333,10 +333,18 @@ class NoCodeRegistryTests(unittest.TestCase):
         return repo / "evals" / "eval.yaml"
 
     def test_yaml_plus_jsonl_compiles_and_validates(self):
+        import run_pi_trigger_eval as tr
+        import run_trigger_matrix as tm
+
         with tempfile.TemporaryDirectory() as td:
             path = self.write_yaml_repo(Path(td))
             manifest = sb.validate_manifest(path)
             cases = sb.iter_cases(manifest)
+            for loader in (tr.load_manifest, tm.load_manifest):
+                with self.subTest(loader=loader.__module__):
+                    runner_cases = sb.iter_cases(loader(path))
+                    self.assertEqual([c["id"] for c in runner_cases], ["river-of-paris", "river-of-cairo"])
+                    self.assertEqual(runner_cases[1]["assertions"][0]["value"], "Nile")
         self.assertEqual([c["id"] for c in cases], ["river-of-paris", "river-of-cairo"])
         self.assertEqual(cases[1]["assertions"][0]["value"], "Nile")
 

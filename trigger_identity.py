@@ -20,43 +20,35 @@ from skill_ablations import (
     derived_population,
 )
 
-TRIGGER_HARNESS_IDENTITY_VERSION = 3
-# Conservative at module granularity: skill_benchmark.py and every module split
-# out of it are identified, so any edit to that code invalidates trigger
-# identity, exactly as an edit to the single-module harness did.
+TRIGGER_HARNESS_IDENTITY_VERSION = 4
+# Exactly the local modules a trigger run can load: the import closure of
+# run_trigger_matrix.py and run_pi_trigger_eval.py (tests/test_type_coverage.py
+# derives it and also checks a real offline run). Evidence is comparable only
+# when this code is identical; code no trigger run executes (the CLI, reports,
+# judges, grading, Jetty, trigger-compare's analysis) cannot change the
+# evidence, so editing it does not invalidate trigger comparisons.
 TRIGGER_IDENTITY_MODULES = (
     "ablation_model.py",
     "agent_capabilities.py",
     "agent_clis.py",
-    "answer_backends.py",
-    "benchmark_reports.py",
-    "blind_comparisons.py",
-    "eval_audits.py",
-    "eval_grading.py",
     "eval_manifests.py",
     "experimental_pairs.py",
+    "gemini_contracts.py",
+    "grading_contracts.py",
     "harness_io.py",
     "invocation_contracts.py",
-    "jetty_adapter.py",
     "json_contracts.py",
     "json_schema_subset.py",
-    "judge_execution.py",
-    "judge_tasks.py",
-    "lift_statistics.py",
     "manifest_contracts.py",
-    "prepared_tasks.py",
-    "run_artifacts.py",
     "run_pi_trigger_eval.py",
     "run_trigger_matrix.py",
+    "runner_contracts.py",
     "skill_ablations.py",
-    "skill_benchmark.py",
-    "subagent_runner.py",
-    "suite_runs.py",
     "telemetry.py",
     "telemetry_blocks.py",
+    "text_contracts.py",
     "trace_contracts.py",
     "trace_normalization.py",
-    "trigger_comparison.py",
     "trigger_contracts.py",
     "trigger_identity.py",
     "trigger_reporting.py",
