@@ -330,7 +330,9 @@ Extend `AgentCapabilities` beyond the current booleans:
 - `dollar_cost`: provider-reported / trace-normalized / estimated / missing / not-applicable.
 - `skill_mount`: forced-path / project-skill-dir / user-skill-dir / extension / mcp.
 - `tool_replay`: none / mcp / hosted-tools / native-log-only.
-- `config_isolation`: env-home / cli-flag / partial / none.
+- `config_isolation`: env-home / cli-flag / partial / none. Implemented as
+  `IsolationPosture`, which records config authority and, separately, how far
+  tool reach is contained; see "Containment posture" in `docs/agent-parity.md`.
 
 ### Command routing
 

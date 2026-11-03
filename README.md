@@ -452,7 +452,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 
 | Command | What it does |
 |---|---|
-| `skill-benchmark agent-capabilities` | List the unified backend registry, capability gates, trace dialect, smoke policy, and answer/trigger/judge surfaces as JSON. |
+| `skill-benchmark agent-capabilities` | List the unified backend registry, capability gates, isolation posture, trace dialect, smoke policy, and answer/trigger/judge surfaces as JSON. |
 | `skill-benchmark validate` | Check manifest shape, fixture paths, regex, oracle paths, and prompt-leakage. |
 | `skill-benchmark prepare` | Emit answer-key-safe task rows per case/variant/run (`--include-ablations` materializes ablated trees). |
 | `skill-benchmark materialize-ablations` | Write the declared ablated skill trees to disk without preparing tasks — inspect or diff an ablation before spending a run on it. |
@@ -466,7 +466,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 |---|---|
 | `skill-benchmark run-codex` | Drive prepared rows through isolated `codex exec --json --output-last-message`; save trace, events, metrics, answer. `--effort` sets `model_reasoning_effort`. |
 | `skill-benchmark run-claude` | Drive `claude -p --output-format stream-json`, capturing real per-run cost + token usage AND the full tool-use stream as the run's trace (`trace.jsonl`/`events.json`), so process assertions have evidence on Claude answer runs. Records the stop reason and served model; `--effort` passes `claude --effort`. |
-| `skill-benchmark run-agent` | Provider-neutral native runner over registered backends (`--agent claude`, `--agent codex`, `--agent gemini`, or `--agent vibe`); compatibility wrappers delegate here. `--effort` is refused for Gemini and Vibe, and for a level the backend's CLI does not accept (`minimal` on Claude). |
+| `skill-benchmark run-agent` | Provider-neutral native runner over registered backends (`--agent claude`, `--agent codex`, `--agent gemini`, `--agent agy`, or `--agent vibe`); compatibility wrappers delegate here. `--effort` is refused for Gemini and Vibe, and for a level the backend's CLI does not accept (`minimal` on Claude). |
 | `skill-benchmark run-subagent` | In-process backend seam: any provider via `--agent-cmd`, tool replay, multi-turn `turns`. |
 | `skill-benchmark import-trace` | Normalize a raw JSONL trace into `events.json`/`metrics.json` for process/efficiency checks. |
 
@@ -522,6 +522,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 
 - **Anthropic skill-creator**: use `grade --write-grading-files` and `export-anthropic` for compatible `grading.json`/`benchmark.json` shapes.
 - **Pi**: use `examples/adewale-workspace/run_pi_smoke.py` for the Adewale multi-repo smoke workflow and `skill-pi-trigger-eval` for autonomous trigger checks.
+- **Google Antigravity (`agy`)**: use `run-agent --agent agy` and `judge --judge-backend agy`. **Run these only on a disposable host.** agy cannot be contained at its CLI surface: it exposes no config-home override, so the invoking user's configuration is in play; `--sandbox` restricts terminal operations only; and `--dangerously-skip-permissions` auto-approves the sandbox-bypass prompt itself, so non-terminal tools such as `write_to_file` are outside the sandbox entirely. The registry records this as an explicit `uncontained_requires_disposable_host` posture, every run repeats it in `environment.json`, and agy is deliberately excluded from the all-CLIs smoke sweep; its live smoke is the separate `RUN_AGY_SMOKE=1`. `--agy-cmd` takes exactly one executable token, because a launcher prefix could add `--continue` and silently seed a run with prior conversation state. Token usage is provider-reported when a run actually reached a model; an all-zero counter block is treated as absent telemetry rather than a zero-cost measurement, and dollar cost stays explicit `missing`. Autonomous trigger and trigger ablation are deliberately not advertised until one live positive and one live negative activation have been observed.
 - **Gemini CLI**: use `run-agent --agent gemini` and `judge --judge-backend gemini`. Each call gets an isolated `GEMINI_CLI_HOME`, requests disabled provider usage statistics, uses strict official JSON/stream-JSON parsing, and installs a deny-by-default policy (read-only allowlist for answers, no tools for judges). Nested sandboxing is requested only when a supported host engine exists and the selected credential transport is proven portable; artifacts record the engine or disabled reason. Token usage is provider-reported when present; dollar cost stays explicit `missing`. Gemini autonomous trigger support is deliberately not advertised: the current `activate_skill` flow requires consent, and a live headless consent-free activation proof has not passed yet.
 - **Mistral Vibe**: use `run-agent --agent vibe`, `judge --judge-backend vibe`, and `skill-trigger-matrix --agent vibe`. The harness isolates `VIBE_HOME`, passes `--model` as `VIBE_ACTIVE_MODEL`, mounts trigger skills under `.agents/skills`, and requires `MISTRAL_API_KEY` (or a copied `.env` from the current `VIBE_HOME`, falling back to `~/.vibe/.env`) for live runs.
 - **Other runners**: use `prepare` JSONL as the import format and write results back to the run output contract.
@@ -589,6 +590,7 @@ skill-eval-harness/
 ├── judge_contracts.py          # the judge invocation boundary
 ├── text_contracts.py           # rendered human-text comparison views
 ├── gemini_contracts.py         # Gemini JSON and stream-JSON contracts
+├── agy_contracts.py            # Google Antigravity stream-json contracts
 ├── trigger_reporting.py        # complete/incomplete/empty trigger cohorts
 ├── docs/                       # architecture, abstractions, vocabulary, specs, guides (indexed in docs/README.md)
 ├── .github/

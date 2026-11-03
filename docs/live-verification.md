@@ -143,7 +143,28 @@ Right: each enabled smoke passes. A failure is a finding; report the CLI version
    final message. Then `RUN_VIBE_TRIGGER_SMOKE=1` (check 1) passes, a `run-agent --agent vibe` run
    reads `trace_observation_complete: true`, and a `judge --judge-backend vibe` verdict parses.
 
-## 8. Judges
+## 8. Antigravity (`agy`), on a disposable host only
+
+agy cannot be contained (see "Containment posture" in `docs/agent-parity.md`). Run these checks
+only in a throwaway VM or container with its own agy login, never on a machine whose own agy
+configuration matters. agy updates itself in place, so record `agy --version` after the first
+authenticated run, not before.
+
+1. `RUN_AGY_SMOKE=1 AGY_UNAUTHENTICATED_BIN=<agy with no credentials> python3 -m unittest discover -s tests -p 'test_smoke_agy.py' -v`,
+   where the unauthenticated binary is, for example, a wrapper that runs agy with an empty `HOME`.
+   - Right: all three tests pass. The answer run reports nonzero token usage; the signed-out run
+     fails as an authentication error and publishes no token counters.
+2. Any agy run prints unclassified advertised tools to stderr. Right if it names none. Otherwise
+   follow "Maintaining the agy tool vocabulary" in `docs/agent-parity.md`, refresh
+   `tests/fixtures/agy/advertised-tools.json`, and send the names.
+3. `skill-benchmark run-agent --agent agy --tasks /tmp/live/tasks.jsonl --runs /tmp/live/ra`
+   - Right: `metadata.json` records `agy_cli_version`, a stop reason of `unavailable` with
+     `stop_source` reading `agy stream-json carries no stop reason`, and the models agy reported
+     (none, today). `--effort high` must be refused before any run.
+4. `skill-benchmark judge … --judge-backend agy` on a case with a judge assertion.
+   - Right: the verdict parses, and the run was launched without `--dangerously-skip-permissions`.
+
+## 9. Judges
 
 1. On a soft judge with `score_scale: [1, 5], threshold: 4`, run `skill-benchmark judge … --judge-backend claude`
    and again with `--judge-backend codex`.
@@ -157,7 +178,7 @@ Right: each enabled smoke passes. A failure is a finding; report the CLI version
 3. On a real suite with a judge-only case, `case_flags` entries read `signal: combined`, and
    `readiness.floor_cases` is a subset of the cases flagged `floor`.
 
-## 9. The release workflow
+## 10. The release workflow
 
 On the next release, or a `workflow_dispatch` run of `publish.yml`, the job log must show the
 compile, Ruff, ty, unit-test and collection-parity steps passing before "Build distributions".

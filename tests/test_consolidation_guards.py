@@ -46,6 +46,11 @@ import run_trigger_matrix as tm
 import skill_benchmark as sb
 
 ROOT = Path(__file__).resolve().parents[1]
+# Every capability row must declare how far its backend can be contained.  The
+# doubles below are offline, so they take the posture an offline adapter has.
+OFFLINE_POSTURE = ac.IsolationPosture(
+    containment="contained", config_authority="not_applicable",
+    reason="offline test double; reaches no provider configuration")
 README = (ROOT / "README.md").read_text(encoding="utf-8")
 COMMAND_REFERENCE = (ROOT / "docs" / "commands.md").read_text(encoding="utf-8")
 OTEL_PLAN = (ROOT / "docs" / "otel-support-plan.md").read_text(encoding="utf-8")
@@ -129,6 +134,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
             "trigger_ablation": False, "trace_artifacts": False,
             "dollar_cost": "missing", "judge_backend": False,
             "tool_replay": False, "live_smoke_env": None,
+            "isolation": OFFLINE_POSTURE,
         }
         with self.assertRaisesRegex(ValueError, "usage_provenance"):
             ac.AgentCapabilities(
@@ -272,7 +278,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
             answer_runner=False, autonomous_trigger=False,
             trigger_ablation=False, trace_artifacts=True, token_usage=False,
             dollar_cost="missing", judge_backend=False, tool_replay=False,
-            live_smoke_env=None,
+            live_smoke_env=None, isolation=OFFLINE_POSTURE,
             elapsed_provenance="process_measured",
         )
         with self.assertRaisesRegex(ValueError, "trigger binding disagrees"):
@@ -287,7 +293,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
             answer_runner=True, autonomous_trigger=False,
             trigger_ablation=False, trace_artifacts=True, token_usage=False,
             dollar_cost="missing", judge_backend=False, tool_replay=False,
-            live_smoke_env=None,
+            live_smoke_env=None, isolation=OFFLINE_POSTURE,
             elapsed_provenance="process_measured",
         )
         native_entrypoint = ac.AnswerEntrypoint(
@@ -403,7 +409,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
             trigger_ablation=False, trace_artifacts=False, token_usage=False,
             dollar_cost="not_applicable", judge_backend=False,
             tool_replay=False, live_smoke_env=None,
-            usage_not_applicable=True,
+            usage_not_applicable=True, isolation=OFFLINE_POSTURE,
             elapsed_provenance="process_measured",
         )
         row = ac.BackendRegistration(
@@ -564,7 +570,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
             answer_runner=True, autonomous_trigger=False,
             trigger_ablation=False, trace_artifacts=True, token_usage=False,
             dollar_cost="missing", judge_backend=False, tool_replay=False,
-            live_smoke_env=None,
+            live_smoke_env=None, isolation=OFFLINE_POSTURE,
             elapsed_provenance="process_measured",
         )
         wrong_answer = ac.BackendRegistration(
@@ -605,6 +611,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
                 token_usage=False, dollar_cost="not_applicable",
                 judge_backend=False, tool_replay=False,
                 live_smoke_env=None, usage_not_applicable=True,
+                isolation=OFFLINE_POSTURE,
                 elapsed_provenance="process_measured",
             )
             return ac.BackendRegistration(
@@ -623,7 +630,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
                 trigger_ablation=False, trace_artifacts=True,
                 token_usage=False, dollar_cost="missing",
                 judge_backend=False, tool_replay=False,
-                live_smoke_env=None,
+                live_smoke_env=None, isolation=OFFLINE_POSTURE,
                 elapsed_provenance="process_measured",
             ),
             answer_route="none",
@@ -791,6 +798,7 @@ else:
             "Agent", "Answer runs", "Answer route", "Autonomous trigger",
             "Trigger ablation", "Trace artifacts", "Token usage",
             "Dollar cost", "Judge backend", "Tool replay", "Live smoke",
+            "Containment", "Config authority",
         ])
         rows = {cells(line)[0].strip("`"): cells(line)[1:] for line in lines[2:]}
         self.assertEqual(set(rows), set(ac.BACKENDS))
@@ -813,6 +821,9 @@ else:
                 f"`{registration.capabilities.dollar_cost}`", row[6], name)
             expected_smoke = registration.capabilities.live_smoke_env
             self.assertEqual(row[9], f"`{expected_smoke}`" if expected_smoke else "n/a")
+            posture = registration.capabilities.isolation
+            self.assertEqual(row[10], f"`{posture.containment}`", name)
+            self.assertEqual(row[11], f"`{posture.config_authority}`", name)
 
     def test_backend_abstraction_docs_name_every_shipped_answer_runner(self):
         abstractions = (

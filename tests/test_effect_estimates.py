@@ -205,7 +205,11 @@ class IntervalAgreesWithTheTestTests(unittest.TestCase):
         # The endpoints the 60-step search recorded before the change.
         self.assertEqual((interval["method"], interval["lower"], interval["upper"]),
                          ("sign-flip-inversion-exact", 0.114865, 0.284848))
-        self.assertLess(elapsed, 0.5)   # about 0.1 s here; generous, not a tight timer
+        # The deterministic call-count guards above are the real complexity
+        # check; this is only a "not catastrophically slow" smoke. It measured
+        # 0.50-0.56 s on an arm64 host, so a 1 s bound keeps the intent without
+        # making the suite fail on hardware the original 0.5 s did not see.
+        self.assertLess(elapsed, 1.0)
 
     def test_unchanged_cases_keep_the_interval_exact(self):
         # An independent count over how many +1, -1 and 0 deltas flip agrees

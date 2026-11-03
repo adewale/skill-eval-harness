@@ -503,6 +503,10 @@ LIVE_SMOKES = {
         "RUN_GEMINI_SMOKE",
     "test_smoke_jetty.JettyLiveSmokeTests.test_export_run_import_benchmark_and_failure_path":
         "RUN_JETTY_SMOKE",
+    "test_smoke_agy.LiveAgySmoke.test_a_token_backed_answer_run_reports_real_usage":
+        "RUN_AGY_SMOKE",
+    "test_smoke_agy.LiveAgySmoke.test_an_unauthenticated_run_reports_missing_usage":
+        "RUN_AGY_SMOKE",
     "test_trigger_matrix.AgentInvokeSmokeTests.test_live_agents_complete_trivial_prompt_for_each_model":
         "RUN_AGENT_INVOKE_SMOKE",
     "test_trigger_matrix.ClaudeMatrixSmokeTests.test_haiku_sonnet_opus_matrix_end_to_end":
