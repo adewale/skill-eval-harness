@@ -1,0 +1,47 @@
+name: Action pinning
+
+on:
+  pull_request:
+  push:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  action-pinning:
+    name: Check action pins
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install checksum-verified zizmor
+        run: |
+          echo 'zizmor==1.32.0 --hash=sha256:84a6acb975accc13408786a2bd274b572537ca19c933ebbc13e78f3988562071' > "$RUNNER_TEMP/zizmor-requirements.txt"
+          python3 -m pip install --disable-pip-version-check --no-deps --only-binary=:all: \
+            --require-hashes --target "$RUNNER_TEMP/zizmor" \
+            --requirement "$RUNNER_TEMP/zizmor-requirements.txt"
+          echo "$RUNNER_TEMP/zizmor/bin" >> "$GITHUB_PATH"
+      - name: Reject mutable action and reusable workflow references
+        run: |
+          # Audit only workflow pinning here; other security rules have separate scope.
+          # Disallow config/inline exclusions from weakening the blanket SHA policy.
+          zizmor --offline --strict-collection --no-config --no-ignores \
+            --format json --no-exit-codes .github/workflows > "$RUNNER_TEMP/action-pinning.json"
+          python3 - "$RUNNER_TEMP/action-pinning.json" <<'PY'
+          import json
+          import sys
+
+          findings = [f for f in json.load(open(sys.argv[1])) if f["ident"] == "unpinned-uses"]
+          for finding in findings:
+              for location in finding["locations"]:
+                  if location["symbolic"]["kind"] == "Primary":
+                      path = location["symbolic"]["key"]["Local"]["verbatim_path"]
+                      line = location["concrete"]["location"]["start_point"]["row"] + 1
+                      print(f"{path}:{line}: {finding['desc']}")
+          sys.exit(bool(findings))
+          PY
