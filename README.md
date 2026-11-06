@@ -452,7 +452,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 
 | Command | What it does |
 |---|---|
-| `skill-benchmark agent-capabilities` | List the unified backend registry, capability gates, trace dialect, smoke policy, and answer/trigger/judge surfaces as JSON. |
+| `skill-benchmark agent-capabilities` | List the unified backend registry, capability gates, isolation posture, trace dialect, smoke policy, and answer/trigger/judge surfaces as JSON. |
 | `skill-benchmark validate` | Check manifest shape, fixture paths, regex, oracle paths, and prompt-leakage. |
 | `skill-benchmark prepare` | Emit answer-key-safe task rows per case/variant/run (`--include-ablations` materializes ablated trees). |
 | `skill-benchmark materialize-ablations` | Write the declared ablated skill trees to disk without preparing tasks — inspect or diff an ablation before spending a run on it. |

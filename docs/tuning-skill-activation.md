@@ -226,7 +226,8 @@ class MyAgentAdapter(AgentAdapter):
         # _run_argv takes one frozen plan: argv, stdin, cwd, timeout and environment.
         return self._run_argv(ProcessInvocationPlan.from_values(
             argv, input_text="", cwd=workspace, timeout_s=timeout,
-            environment=os.environ.copy()))
+            environment={**os.environ,
+                         "MY_AGENT_HOME": str(workspace.parent / "my-agent-home")}))
 
 # Add as another argument to backend_registry(...), which builds BACKENDS:
 BackendRegistration(
@@ -237,12 +238,23 @@ BackendRegistration(
         token_usage=True, dollar_cost="trace_normalized",
         usage_provenance="trace_normalized", elapsed_provenance="process_measured",
         judge_backend=False, tool_replay=False, live_smoke_env=None,
+        isolation=IsolationPosture(
+            containment="config_isolated_only",
+            config_authority="isolated_home_enforced",
+            reason=("MY_AGENT_HOME is redirected beside the workspace; the "
+                    "adapter declares no tool allowlist."),
+        ),
     ),
     answer_route="none",
     trace=ObjectRef("skill_benchmark", "MY_AGENT_TRACE_DIALECT"),
     trigger=SurfaceBinding(ObjectRef("run_trigger_matrix", "MyAgentAdapter")),
 )
 ```
+
+`isolation` is required: it states how far the harness can contain the agent and
+why. A backend declared `uncontained_requires_disposable_host` cannot advertise
+autonomous trigger or trigger ablation; see "Containment posture" in
+`docs/agent-parity.md`.
 
 An adapter that copies credentials into a home outside the workspace (as Claude
 Code, Codex and Pi do) also overrides `secret_files(workspace)`, so tokens the agent
