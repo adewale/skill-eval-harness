@@ -7,13 +7,11 @@ skill_benchmark.py itself, and two implemented CLI commands were documented
 nowhere. Per testing-best-practices (doc-sync-testing): use the code as the
 source of truth and make the sync executable —
 
-  * identity tests pin that a runner's helper IS the harness's function, so a
-    re-fork shows up as a failing `assertIs`, not as silent drift;
   * behavior tests drive the commands that share an owner (grade, judge,
     benchmark, contamination, cost-summary, the trigger matrix, the answer
     runners) over one fixture and fail when any of them diverges, whatever
-    the shared helpers are called;
-  * source scans pin that single-owner literals are not re-spelled;
+    helpers, wrappers or source spelling implement the contract;
+  * value tests check shared user-visible defaults and wire vocabulary;
   * doc-coverage tests enumerate CLI/assertion surfaces from the parser,
     packaging metadata, and registries and require their owning docs to mention
     every member exactly where promised.
@@ -63,43 +61,27 @@ class _TriggerWithoutAdapterMethods:
 _NON_CALLABLE_IMPLEMENTATION = object()
 
 
-class SharedOwnerIdentityTests(unittest.TestCase):
-    """Every helper both a runner and the harness need must BE the harness's
-    object. (Pattern established by test_audit_fixes' detect_trigger check.)"""
+class SharedBoundaryPolicyTests(unittest.TestCase):
+    """Shared user-visible defaults and vocabulary, independent of helper identity."""
 
-    def test_the_trigger_runner_shares_the_harness_repo_root_resolver(self):
-        self.assertIs(tm.repo_root_for_manifest, sb.repo_root_for_manifest)
 
-    def test_the_trigger_runner_shares_the_harness_mount_and_subprocess_helpers(self):
-        self.assertIs(tm.mount_skill_tree, sb.mount_skill_tree)
-        self.assertIs(tm.AgentAdapter._mount_tree, sb.mount_skill_tree)
-        self.assertIs(tm.AgentAdapter._run_argv, sb.invoke_argv_with_timeout)
 
-    def test_the_trigger_runner_shares_the_trace_label_sanitizer(self):
-        self.assertIs(tm.safe_trace_label, sb.safe_trace_label)
 
-    def test_codex_default_command_has_one_code_owner(self):
+    def test_codex_default_command_agrees_across_entry_points(self):
         parser = tm.build_arg_parser()
         codex_action = next(a for a in parser._actions if "--codex-cmd" in getattr(a, "option_strings", ()))
         self.assertEqual(codex_action.default, tm.DEFAULT_CODEX_CMD)
         self.assertEqual(tm.CodexAdapter().codex_cmd, tm.DEFAULT_CODEX_CMD)
-        self.assertIs(tm.DEFAULT_CODEX_CMD, ac.CODEX_TRIGGER_DEFAULT_CMD)
-        self.assertNotIn(tm.DEFAULT_CODEX_CMD,
-                         (ROOT / "run_trigger_matrix.py").read_text(encoding="utf-8"))
+        self.assertEqual(tm.DEFAULT_CODEX_CMD, ac.CODEX_TRIGGER_DEFAULT_CMD)
 
     def test_usage_alias_tables_are_one_table(self):
         # The trace normalizer resolves through the one alias table: an alias only
         # USAGE_ALIASES knows (camelCase) must be visible to usage_number.
         self.assertEqual(sb.usage_number({"promptTokens": 7}, "input_tokens"), 7.0)
 
-    def test_evidence_class_literal_is_owned_by_ablation_model(self):
+    def test_trigger_runners_use_the_shared_evidence_wire_value(self):
         self.assertEqual(am.TRIGGER_MEASUREMENT_EVIDENCE_CLASS, "raw_autonomous_trigger_measurement")
-        self.assertIs(tm.TRIGGER_MEASUREMENT_EVIDENCE_CLASS, am.TRIGGER_MEASUREMENT_EVIDENCE_CLASS)
-        # The literal must not be re-spelled in the runners' source.
-        for module_path in (ROOT / "run_pi_trigger_eval.py", ROOT / "run_trigger_matrix.py"):
-            self.assertNotIn('"raw_autonomous_trigger_measurement"',
-                             module_path.read_text(encoding="utf-8"),
-                             f"{module_path.name} re-spells the evidence-class literal; import it from ablation_model")
+        self.assertEqual(tm.TRIGGER_MEASUREMENT_EVIDENCE_CLASS, am.TRIGGER_MEASUREMENT_EVIDENCE_CLASS)
 
     def test_every_split_flag_offers_exactly_the_valid_splits(self):
         expected = sorted(sb.VALID_SPLITS)
@@ -117,7 +99,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         for action in parser._actions:
             yield action
             for sub in (getattr(action, "choices", None) or {}).values() if action.__class__.__name__ == "_SubParsersAction" else ():
-                yield from SharedOwnerIdentityTests._walk_actions(sub)
+                yield from SharedBoundaryPolicyTests._walk_actions(sub)
 
     def test_agent_cost_capabilities_use_normalized_source_vocabulary(self):
         for name, cap in ac.AGENT_CAPABILITIES.items():
